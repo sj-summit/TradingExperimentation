@@ -228,15 +228,18 @@ The user's "memory section" is implemented as **in-context reflection with stati
 - **Input:**
   - all of today's signals, with A and B decisions, actual trade results, and shadow outcomes;
   - Claude's own verdicts and reasons;
+  - the **review targets** (§6.5), each with evidence for "why": the price path after the trigger and news stamped as published before or after the decision;
   - incidents;
   - rolling stats;
-  - current lessons (promoted and proposed) with their stats.
+  - current lessons (promoted and proposed) with their stats;
+  - **history** (§6.6): recent daily summaries, the epoch's factor tally, and open process issues and notes.
 - **Output:** `DailyReview`, containing:
   - `summary`;
-  - `decision_quality`: process quality given the information available at decision time, not outcomes;
-  - `process_issues`;
+  - `signal_reviews`: one per review target, covering what went well, what went badly, why, and (for Book B decisions) process quality given the information available at decision time, not outcomes (§6.5);
+  - `process_issues`, each new or linked to an open one;
   - up to 3 `lesson_proposals`, each with an `evidence_query`;
-  - `human_notes`: anything Claude thinks a human should consider, such as parameter changes. These are never applied automatically.
+  - `human_notes`: anything Claude thinks a human should consider, such as parameter changes, each new or linked to an open one. These are never applied automatically.
+- **Storage:** code writes each part to its own table (ARCHITECTURE.md §6), so reviews can be queried across days. When the review is missing or invalid, `daily_reviews.status` records that.
 
 ### 6.2 Evidence-query DSL (evaluated by code, never by the LLM)
 
@@ -279,6 +282,57 @@ Code regenerates `runtime/playbook.md` from promoted lessons only:
 
 The playbook goes into the pre-market and vet prompts as **soft guidance**. Lessons never modify rules, risk limits, or parameters.
 
+### 6.5 Review targets and signal reviews
+
+Code picks the review targets, so coverage doesn't depend on what Claude chooses to look at:
+
+- every signal either book traded, wins included;
+- every triggered signal Book B vetoed;
+- up to `notable_untraded` (default 5) other triggered signals with the largest |`shadow_r`|: big winners neither book took, and big losers both books avoided.
+
+All targets come from the day's top-20 signals, so there are at most 20. For each target the pack carries the evidence: `mfe_r`, `mae_r`, `minutes_held` and `exit_reason` from the shadow path (§7.2), SPY's move over the same window, and news with `published: before_decision | after_decision`.
+
+Each `signal_review` holds:
+
+| Field | Meaning |
+|---|---|
+| `went_well` | What worked, short and factual; empty if nothing did |
+| `went_badly` | What didn't work; empty if nothing. A winner can have entries here and a loser can have entries in `went_well`. |
+| `why` | The most likely cause, citing numbers from the pack. "The data doesn't explain it" is an acceptable answer. |
+| `factors` | 0–4 tags from the fixed `OutcomeFactor` enum below, so causes can be counted across days |
+| `knowable_at_decision` | `yes`, `partly`, or `no`: could the main cause have been seen with only the information available when the decision was made? |
+| `b_process` | For a Book B allow or veto: `good_process`, `bad_process`, or `unclear`, judged on the information available then, not on the outcome. Otherwise `not_applicable`. |
+| `b_note` | A short reason for `b_process` |
+
+`OutcomeFactor`:
+
+```
+# visible before the decision
+catalyst_strong, catalyst_weak_or_none, catalyst_stale, dilution_or_offering,
+extreme_gap, thin_liquidity, sympathy_only, event_day,
+# execution
+late_entry, entry_slippage, partial_fill,
+# during the trade
+trend_continuation, false_breakout, faded_gap, stopped_by_noise,
+news_after_entry, market_tailwind, market_headwind,
+other
+```
+
+**Factors are hindsight labels.** After a loss it's easy to call a breakout "false", or a catalyst "stale". Factor tallies help Claude and the human spot patterns worth testing, but factors are never DSL fields and never promote a lesson. A pattern becomes a lesson only by passing §6.3 on features recorded before the outcome.
+
+### 6.6 Recall: what the review sees from earlier days
+
+Code builds a `history` section for each review pack:
+
+- the last `history_days` (default 10) daily summaries, plus that period's `bad_process` signal reviews;
+- the **factor tally** for the current epoch: for each factor, how many targets carried it, their wins and losses, mean `shadow_r`, and how many were marked `knowable_at_decision: yes`;
+- open process issues, with first-seen and last-seen dates and how often each has recurred;
+- open human notes, with how often each has been raised.
+
+Claude uses this to notice repeats. When a process issue or note matches an open one, Claude links it by id instead of writing a new one, and code bumps its count and last-seen date. Only the human closes issues and notes (`trader followups set`, ARCHITECTURE.md §4.11), recording a response such as "fixed in commit …" or "rejected: …".
+
+A pattern that keeps showing up in the tally and carries `knowable_at_decision: yes` is what Claude should turn into a lesson proposal, written over the whitelisted pre-decision fields (§6.2).
+
 ---
 
 ## 7. Measurement
@@ -300,7 +354,7 @@ The playbook goes into the pre-market and vet prompts as **soft guidance**. Less
 3. **Walk the minute bars from the trigger minute:**
    - If a bar's low ≤ stop, exit at min(bar open, stop) − $0.01. In the trigger minute itself, assume the worst: a low at or below the stop counts as stopped.
    - Otherwise exit at the open of the `flatten_time` minute.
-4. **Record** `shadow_r`, `exit_reason`, and `path_source = sip_1min`.
+4. **Record** `shadow_r`, `exit_reason`, and `path_source = sip_1min`, plus path stats for the review (§6.5): `mfe_r` (best excursion in R before exit), `mae_r` (worst excursion), and `minutes_held`. Path stats are outcomes, so they are never DSL fields.
 5. **Shadow-only shorts** mirror these rules: trigger at `or_low − $0.01` (a bar's low ≤ trigger), stop at trigger + 0.10 × ATR14, the same slippage and worst-case conventions, and R with signs reversed.
 
 ### 7.3 Metrics (per book, per epoch, rolling)

@@ -84,7 +84,7 @@ This package contains a plan and specifications that Claude Code can ingest. It 
 7. has Claude review the day at 16:15;
 8. sends you a report.
 
-**Your daily job:** read the 16:35 summary (about 2 minutes). **Your weekly job:** read the weekly report and the lessons (about 15 minutes).
+**Your daily job:** read the 16:35 summary (about 2 minutes). **Your weekly job:** read the weekly report and the lessons, then close or answer Claude's open process issues and notes with `uv run trader followups list` (about 15 minutes).
 
 ## Costs
 

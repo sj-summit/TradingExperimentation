@@ -1,0 +1,100 @@
+[project]
+name = "ai-day-trader"
+version = "0.1.0"
+description = "Long-only opening-range-breakout day-trading experiment: rules-only Book A vs Claude-vetoed Book B (paper by default)."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "alpaca-py>=0.30",
+    "httpx>=0.27",
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "pyarrow>=15",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "pyyaml>=6.0",
+    "structlog>=24.1",
+    "tenacity>=8.2",
+    "typer>=0.12",
+    "tzdata>=2024.1",  # Windows has no IANA tz database; zoneinfo needs this (DECISIONS D-017)
+]
+
+[project.scripts]
+trader = "trader.cli:app"
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.100",
+    "mypy>=1.10",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-socket>=0.7",
+    "respx>=0.21",
+    "ruff>=0.6",
+    "types-PyYAML>=6.0",
+    "types-requests>=2.33.0.20261006",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/trader"]
+
+# ---------------------------------------------------------------- ruff
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+extend-exclude = ["*.md"]  # docs hold indicative signatures, not code to format
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "DTZ", "TID", "ASYNC", "PT", "T20"]
+
+# CLAUDE.md invariant 7: time comes from core/clock.py only.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"datetime.datetime.now".msg = "Use trader.core.clock (CLAUDE.md invariant 7)."
+"datetime.datetime.utcnow".msg = "Use trader.core.clock (CLAUDE.md invariant 7)."
+"datetime.datetime.today".msg = "Use trader.core.clock (CLAUDE.md invariant 7)."
+"datetime.date.today".msg = "Use trader.core.clock (CLAUDE.md invariant 7)."
+"time.time".msg = "Use trader.core.clock for wall time, time.monotonic() for durations."
+
+[tool.ruff.lint.per-file-ignores]
+"src/trader/core/clock.py" = ["TID251"]
+
+# ---------------------------------------------------------------- mypy
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+files = ["src"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+# ---------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Tests are offline (CLAUDE.md invariant 9). --allow-hosts blocks every non-loopback connect;
+# --disable-socket would also block the loopback socketpair asyncio needs on Windows (DECISIONS D-016).
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "-m", "not paper and not llm and not network",
+    "--allow-hosts=127.0.0.1,::1",
+]
+markers = [
+    "paper: places orders in an Alpaca paper account (HUMAN GATE only)",
+    "llm: calls the real claude CLI (HUMAN GATE only)",
+    "network: needs real network access",
+]
+filterwarnings = [
+    # alpaca-py 0.44 imports the deprecated websockets.legacy API; not ours to fix.
+    "ignore:websockets.legacy is deprecated:DeprecationWarning",
+]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

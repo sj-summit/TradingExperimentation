@@ -58,7 +58,7 @@ ai-day-trader/
 │   ├── risk/       caps.py gate.py ledger.py killswitch.py breakers.py
 │   ├── execution/  broker.py alpaca_broker.py sim_broker.py orders.py service.py reconcile.py
 │   ├── llm/        client.py claude_cli.py anthropic_api.py context.py schemas.py budget.py sanitize.py
-│   ├── memory/     journal.py migrations/0001_init.sql stats.py shadow.py lessons.py regime.py playbook.py
+│   ├── memory/     journal.py migrations/0001_init.sql stats.py shadow.py lessons.py regime.py playbook.py reviews.py
 │   ├── orchestrator/ day.py tasks.py watchdog.py
 │   ├── reports/    daily.py weekly.py evaluation.py templates/
 │   └── notify.py
@@ -93,7 +93,7 @@ Times are config defaults. On **early-close days**:
 | flatten (15:55) | Cancel all orders; close all positions; verify flat by close − 2 min | A, B | |
 | 16:05 | EOD reconcile: broker activities ↔ journal; ledger settlement entries; daily stats | A, B | |
 | 16:12 | Shadow outcomes (SIP 1-min bars; the 15:55 bar is > 15 min old from about 16:11; retry for up to 5 min) | — | STRATEGY.md §7.2 |
-| 16:15 | Claude post-close review → lesson proposals | B | 10 min first attempt; repair only if it can finish by 16:29, else the report marks the review missing |
+| 16:15 | Claude post-close review → signal reviews, process issues, notes, lesson proposals (each to its own table) | B | 10 min first attempt; repair only if it can finish by 16:29, else `daily_reviews.status = missing` and the report says so |
 | 16:30 | Reports (MD and HTML), notifications, DB backup, recordings finalized | — | then exit |
 
 ### Late start and partial days
@@ -278,6 +278,11 @@ class LLMResult(Generic[T]):
   - `event_day`.
 - **`stats.py`:** the metrics in STRATEGY.md §7.3, plus the bootstrap (seeded) and epoch handling.
 - **`lessons.py`:** evaluates the evidence-query DSL, plus promotion and demotion (STRATEGY.md §6). **`playbook.py`** renders `runtime/playbook.md`.
+- **`reviews.py`:** STRATEGY.md §6.5–6.6.
+  - Picks the day's review targets and gathers their evidence for the pack.
+  - Builds the review pack's `history` section, including the factor tally.
+  - Persists a `DailyReview` into `daily_reviews`, `signal_reviews`, `process_issues`, and `review_notes`. A linked issue or note gets its count and last-seen date bumped; it is never duplicated.
+  - Backs the `followups` CLI.
 
 ### 4.9 orchestrator
 
@@ -293,11 +298,14 @@ class LLMResult(Generic[T]):
 
 ### 4.10 reports and notify
 
-- **Daily report:** the signals table (symbol, rel_vol, rank, trigger, triggered?, shadow R, A action/result, B verdict/reason/action/result), book P&L, incidents, LLM calls, and the limitations footer.
+- **Daily report:** the signals table (symbol, rel_vol, rank, trigger, triggered?, shadow R, A action/result, B verdict/reason/action/result), book P&L, incidents, LLM calls, Claude's review (summary, then what went well, what went badly, and why for each target), new or recurring process issues and notes, and the limitations footer.
 - **Weekly report:**
   - equity curves A vs B vs SPY;
   - veto value V with CI;
   - lessons status;
+  - the factor tally (wins and losses per factor, with the hindsight caveat from STRATEGY.md §6.5);
+  - Book B `bad_process` reviews from the week;
+  - open process issues and notes, oldest and most-recurring first;
   - epoch info.
 - **`notify.py`:** providers `none | ntfy | discord`. Messages carry no secrets and no account numbers.
 
@@ -313,6 +321,7 @@ class LLMResult(Generic[T]):
 | `backtest --start --end` | Rules-only ORB on historical SIP | — |
 | `report daily\|weekly\|evaluation` | Reports | — |
 | `lessons evaluate [--promote]` | Weekly job | — |
+| `followups list [--all]` / `followups set issue\|note ID --status S [--response TEXT]` | Claude's open process issues and notes; only the human closes them (issue: `fixed`/`wontfix`; note: `accepted`/`rejected`/`done`) | — |
 | `halt`, `resume`, `flatten` | Kill switch | `resume` requires typed confirmation |
 | `watchdog` | Independent safety check | — |
 | `smoke paper` | Places and cancels a non-marketable 1-share OTO in paper | HUMAN GATE |
@@ -388,18 +397,31 @@ class LessonProposal(BaseModel):
     claimed_direction: Literal["subset_worse", "subset_better"]
     suggested_use: Literal["veto_hint", "caution_hint", "allow_hint"]
 
-class DecisionQuality(BaseModel):
-    signal_id: str; assessment: Literal["good_process", "bad_process", "unclear"]; note: str = Field(max_length=200)
+OutcomeFactor = Literal[ ...STRATEGY.md §6.5... ]
+
+class SignalReview(BaseModel):                       # one per review target (STRATEGY.md §6.5)
+    signal_id: str
+    went_well: str = Field(max_length=200); went_badly: str = Field(max_length=200)
+    why: str = Field(max_length=300)
+    factors: list[OutcomeFactor] = Field(max_length=4)
+    knowable_at_decision: Literal["yes", "partly", "no"]
+    b_process: Literal["good_process", "bad_process", "unclear", "not_applicable"]
+    b_note: str = Field(max_length=200)
 
 class ProcessIssue(BaseModel):
+    existing_issue_id: int | None = None             # links an open issue from the pack's history
     severity: Literal["info", "warn", "error"]; component: str = Field(max_length=40); description: str = Field(max_length=300)
+
+class HumanNote(BaseModel):
+    existing_note_id: int | None = None              # links an open note from the pack's history
+    note: str = Field(max_length=300)
 
 class DailyReview(BaseModel):
     summary: str = Field(max_length=2000)
-    decision_quality: list[DecisionQuality] = Field(max_length=40)
+    signal_reviews: list[SignalReview] = Field(max_length=20)
     process_issues: list[ProcessIssue] = Field(max_length=10)
     lesson_proposals: list[LessonProposal] = Field(max_length=3)
-    human_notes: list[str] = Field(max_length=5)
+    human_notes: list[HumanNote] = Field(max_length=5)
 ```
 
 ---
@@ -435,7 +457,8 @@ CREATE TABLE trades (id TEXT PRIMARY KEY, book TEXT, signal_id TEXT, symbol TEXT
   entry_ts TEXT, entry_price TEXT, stop_price TEXT, exit_ts TEXT, exit_price TEXT, exit_reason TEXT,
   pnl TEXT, r_multiple REAL, fees_est TEXT, entry_slippage TEXT, entry_delay_ms INTEGER, eval_epoch INTEGER);
 CREATE TABLE shadow_outcomes (signal_id TEXT PRIMARY KEY REFERENCES signals(id), entry_price TEXT,
-  exit_price TEXT, exit_reason TEXT, shadow_r REAL, path_source TEXT, computed_at TEXT);
+  exit_price TEXT, exit_reason TEXT, shadow_r REAL, mfe_r REAL, mae_r REAL, minutes_held INTEGER,
+  path_source TEXT, computed_at TEXT);
 CREATE TABLE llm_calls (id TEXT PRIMARY KEY, date TEXT, role TEXT, model_alias TEXT, model_resolved TEXT,
   prompt_sha256 TEXT, schema_sha256 TEXT, started_at TEXT, ended_at TEXT, duration_ms INTEGER,
   exit_code INTEGER, is_error INTEGER, num_turns INTEGER, cost_estimate_usd REAL, schema_valid INTEGER,
@@ -458,6 +481,17 @@ CREATE TABLE lessons (id TEXT PRIMARY KEY, created_at TEXT, source_call_id TEXT,
   rationale TEXT, evidence_query_json TEXT, claimed_direction TEXT, suggested_use TEXT, status TEXT,
   n_subset INTEGER, n_complement INTEGER, effect_r REAL, ci_low REAL, ci_high REAL,
   evaluated_at TEXT, promoted_at TEXT, demoted_at TEXT);
+CREATE TABLE daily_reviews (date TEXT PRIMARY KEY, status TEXT, summary TEXT,   -- status: ok | missing | invalid
+  llm_call_id TEXT REFERENCES llm_calls(id), eval_epoch INTEGER, created_at TEXT);
+CREATE TABLE signal_reviews (signal_id TEXT PRIMARY KEY REFERENCES signals(id), date TEXT, went_well TEXT,
+  went_badly TEXT, why TEXT, factors_json TEXT, knowable_at_decision TEXT, b_process TEXT, b_note TEXT,
+  llm_call_id TEXT REFERENCES llm_calls(id), eval_epoch INTEGER);
+CREATE TABLE process_issues (id INTEGER PRIMARY KEY, first_seen TEXT, last_seen TEXT, occurrences INTEGER,
+  severity TEXT, component TEXT, description TEXT, status TEXT, resolution TEXT, resolved_at TEXT,
+  last_llm_call_id TEXT);                                          -- status: open | fixed | wontfix
+CREATE TABLE review_notes (id INTEGER PRIMARY KEY, first_raised TEXT, last_raised TEXT, times_raised INTEGER,
+  note TEXT, status TEXT, human_response TEXT, decided_at TEXT,
+  last_llm_call_id TEXT);                                          -- status: open | accepted | rejected | done
 CREATE TABLE incidents (id INTEGER PRIMARY KEY, ts TEXT, severity TEXT, component TEXT, code TEXT,
   message TEXT, detail_json TEXT, resolved_at TEXT, acknowledged_by TEXT);
 CREATE TABLE book_state (book TEXT PRIMARY KEY, halted INTEGER, halt_reason TEXT, halted_at TEXT,
@@ -465,6 +499,7 @@ CREATE TABLE book_state (book TEXT PRIMARY KEY, halted INTEGER, halt_reason TEXT
 CREATE INDEX ix_signals_date ON signals(date);
 CREATE INDEX ix_decisions_signal ON decisions(signal_id);
 CREATE INDEX ix_trades_book_date ON trades(book, entry_ts);
+CREATE INDEX ix_signal_reviews_date ON signal_reviews(date);
 CREATE INDEX ix_news_created ON news(created_at);
 ```
 
@@ -536,12 +571,14 @@ claude -p \
 3. Post-validation filters:
    - drop assessments for symbols not in the pack;
    - de-duplicate by symbol, keeping the higher-confidence entry;
-   - clamp to the schema limits.
+   - clamp to the schema limits;
+   - review only: drop signal reviews for signals that aren't review targets, and log targets left unreviewed; treat an `existing_issue_id` or `existing_note_id` that isn't open in the pack as a new entry.
 4. Persist:
    - context pack → `runtime/llm/YYYY-MM-DD/<call_id>.input.json`
    - envelope → `<call_id>.output.json`
    - a row in `llm_calls`
-   - verdicts and day mode to their tables.
+   - verdicts and day mode to their tables;
+   - the review's parts to `daily_reviews`, `signal_reviews`, `process_issues`, `review_notes`, and `lessons` (via `memory/reviews.py` and `memory/lessons.py`).
 5. `total_cost_usd` is a client-side estimate. On a subscription it isn't a bill, but log it to watch usage trends.
 
 ### 7.4 Testing without the network
@@ -592,7 +629,7 @@ Per-role contents:
 |---|---|---|---|---|
 | `premarket` | ≤ 40 | ≤ 8 | — | 60–200 KB |
 | `vet` | ≤ 25 | ≤ 5 | — | 20–80 KB |
-| `review` | — | — | today's signals with A and B decisions, trades, shadow outcomes, B verdicts and reasons; incidents; rolling stats per epoch; current lessons and their stats; the DSL whitelist | — |
+| `review` | ≤ 20 review targets (S§6.5) | ≤ 5 per target, each marked `published: before_decision \| after_decision` | today's signals with A and B decisions, trades, shadow outcomes (with path stats), B verdicts and reasons; SPY's move over each target's trade window; incidents; rolling stats per epoch; current lessons and their stats; the DSL whitelist; `history` (S§6.6) | 50–150 KB |
 
 ---
 

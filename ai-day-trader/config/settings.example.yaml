@@ -102,6 +102,9 @@ llm:
       effort: high
       timeout_s: 600             # repair attempt only if it can finish by 16:29 (reports at 16:30)
       max_turns: 3
+      history_days: 10           # past daily summaries recalled into the review pack (STRATEGY.md §6.6)
+      notable_untraded: 5        # extra triggered signals reviewed: largest |shadow_r| that no book traded (§6.5)
+      max_news_per_target: 5
 
 lessons:
   min_n_per_side: 20
@@ -129,10 +132,10 @@ notify:
   discord_webhook_env: DISCORD_WEBHOOK_URL
   daily_summary: true
 
-fees:                            # estimates only; Alpaca is commission-free; verify current rates (DECISIONS Q5)
-  sec_fee_per_million_sold: 0.0
-  finra_taf_per_share_sold: 0.0
-  finra_taf_max_per_trade: 0.0
+fees:                            # sell-side estimates; Alpaca is commission-free but passes these through (DECISIONS D-019)
+  sec_fee_per_million_sold: 20.60      # SEC Section 31, effective 2026-04-04
+  finra_taf_per_share_sold: 0.000195   # FINRA TAF: paused (0) 2026-10-01..2026-12-31; this rate from 2027-01-01
+  finra_taf_max_per_trade: 9.79
 
 storage:
   db_path: runtime/trader.db

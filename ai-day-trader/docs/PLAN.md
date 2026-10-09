@@ -11,8 +11,8 @@
 ```
 STATUS
 current_phase: 0
-last_completed_task: —
-open_questions: —
+last_completed_task: P0.6
+open_questions: Phase 0 code done; final doctor run waits on H0.1–H0.3 (settings.yaml, risk.yaml, repo-root .env with paper keys + token)
 eval_epoch: 0
 ```
 
@@ -33,16 +33,16 @@ Specs referenced: ARCHITECTURE.md (A§), STRATEGY.md (S§), RISK.md (R§).
 
 ### Tasks
 
-- [ ] **P0.1** Create `pyproject.toml` (uv, Python 3.12) with the A§13 deps, the src layout from A§2, ruff, mypy, and pytest config (markers `paper`, `llm`, `network`, excluded by default; sockets disabled in tests). Add a `trader` CLI entry point with `--help`.
-- [ ] **P0.2** Write `config.py`, which loads `settings.yaml`, `risk.yaml`, and `.env` into pydantic models.
+- [x] **P0.1** Create `pyproject.toml` (uv, Python 3.12) with the A§13 deps, the src layout from A§2, ruff, mypy, and pytest config (markers `paper`, `llm`, `network`, excluded by default; sockets disabled in tests). Add a `trader` CLI entry point with `--help`.
+- [x] **P0.2** Write `config.py`, which loads `settings.yaml`, `risk.yaml`, and `.env` into pydantic models.
   - Reject unknown keys.
   - Enforce `risk/caps.py` and fail fast on any violation (R§1).
   - Add a secret-redaction helper; secrets never appear in `repr` or logs.
-- [ ] **P0.3** Write the core modules:
+- [x] **P0.3** Write the core modules:
   - `core/clock.py` (`RealClock`, `SimClock`, ET helpers; ban naive datetimes with a lint rule or test);
   - `core/logging.py` (structlog JSON + console);
   - `core/ids.py`.
-- [ ] **P0.4** Write `trader doctor`, which reports:
+- [x] **P0.4** Write `trader doctor`, which reports:
   - Python and uv versions; config validity;
   - required `.env` keys present (names only);
   - Alpaca A and B: authenticated, `is_paper`, equity ≈ $1,000, no positions;
@@ -51,8 +51,8 @@ Specs referenced: ARCHITECTURE.md (A§), STRATEGY.md (S§), RISK.md (R§).
   - `claude auth status` → `authMethod == oauth_token`, run under the isolated env (A§7.1);
   - runtime dirs writable; free disk space;
   - token age; `events.yaml` coverage.
-- [ ] **P0.5** Write the SQLite journal: migrations runner + `0001_init.sql` (A§6) + repository skeleton with a single-writer queue (WAL).
-- [ ] **P0.6** Create `.gitignore` coverage for `runtime/` and `.env`, plus a test asserting no secret values reach the logs.
+- [x] **P0.5** Write the SQLite journal: migrations runner + `0001_init.sql` (A§6) + repository skeleton with a single-writer queue (WAL).
+- [x] **P0.6** Create `.gitignore` coverage for `runtime/` and `.env`, plus a test asserting no secret values reach the logs.
 
 **Done when:**
 
@@ -122,7 +122,7 @@ Specs referenced: ARCHITECTURE.md (A§), STRATEGY.md (S§), RISK.md (R§).
 - [ ] **P3.3** Write `strategy/sizing.py` (S§3.5) as a pure function, with property tests: never over the settled cash, risk cap, or notional cap.
 - [ ] **P3.4** Write `books/base.py` and `books/baseline.py` (Book A), journaling decisions with the reason-code enum (A§4.4).
 - [ ] **P3.5** Write `orchestrator/day.py`: the state machine and timeline (A§3), early-close handling, late start, crash-restart recovery, and heartbeat. Add `trader run-day --books A [--sim]`.
-- [ ] **P3.6** Write `memory/shadow.py` (S§7.2) and `memory/regime.py`. Run them at 16:12.
+- [ ] **P3.6** Write `memory/shadow.py` (S§7.2, including the `mfe_r`, `mae_r`, and `minutes_held` path stats) and `memory/regime.py`. Run them at 16:12.
 - [ ] **P3.7** Write `reports/daily.py` (MD and HTML) and `notify.py` (providers: none, ntfy, discord).
 - [ ] **P3.8** Write `trader replay --date`: recorded day → `ReplayMarketData` + `SimClock` + `SimBroker`. Add a golden test on a synthetic fixture day.
 - [ ] **P3.9** Write `trader backtest`: the rules-only ORB on historical SIP data over a configurable range. Report:
@@ -151,6 +151,13 @@ Specs referenced: ARCHITECTURE.md (A§), STRATEGY.md (S§), RISK.md (R§).
 - [ ] **P4.7** Write `books/llm_filtered.py` (Book B): the VerdictStore (pre-market + vet), day-mode multiplier, the pending policy (wait up to 60 s, re-check the chase guard), and the failure and degradation rules (S§5.4).
 - [ ] **P4.8** Integrate with the orchestrator: pre-market scan at 09:00, brief at 09:05 (deadline 09:28), vet at 09:35:05, review at 16:15; the `--books A,B` flag; `--no-llm` to force Book B off.
 - [ ] **P4.9** Write FakeLLMClient end-to-end tests of a full simulated day with A and B, including: a veto, `neutral`, a timeout, invalid output, `no_trade` mode, and an entry delayed by a pending verdict.
+- [ ] **P4.10** Write `memory/reviews.py` (S§6.5–6.6, A§4.8):
+  - review-target selection (traded, B-vetoed, and notable untraded signals; at most 20) and their evidence for the pack;
+  - the review pack's `history` section, including the factor tally;
+  - persistence into `daily_reviews`, `signal_reviews`, `process_issues`, and `review_notes`, with linking of recurring issues and notes;
+  - the `trader followups list|set` CLI.
+
+  Write tests for: target selection; a linked issue bumping its count rather than duplicating; an unknown or closed `existing_issue_id` becoming a new issue; reviews for non-target signals being dropped; and a missing review recorded as `status = missing`.
 - [ ] 🛑 **HUMAN GATE G4b:** The human approves one supervised paper session with both books: `uv run trader run-day --books A,B`.
 
 **Done when:**
@@ -158,6 +165,7 @@ Specs referenced: ARCHITECTURE.md (A§), STRATEGY.md (S§), RISK.md (R§).
 - the supervised A+B session completed;
 - every LLM call is logged with its artifacts;
 - B's decisions are journaled with reasons;
+- that day's review is in its tables, with a signal review for every target;
 - a replay of that day (with recorded LLM outputs replayed, not re-queried) reproduces the decisions.
 
 ---
@@ -167,7 +175,7 @@ Specs referenced: ARCHITECTURE.md (A§), STRATEGY.md (S§), RISK.md (R§).
 - [ ] **P5.1** Write `memory/stats.py` (S§7.3): per-book and per-epoch metrics, a seeded bootstrap, veto value V with CI, and SPY buy-and-hold comparison.
 - [ ] **P5.2** Write `memory/lessons.py`: store proposals from the review, the DSL evaluator with a whitelist (unknown fields and ops rejected), and the promotion and demotion rules (S§6.3). Add the `trader lessons evaluate --promote` CLI. Write tests, including DSL injection attempts.
 - [ ] **P5.3** Write `memory/playbook.py`: render `runtime/playbook.md` (at most 15 lessons with evidence), plus the `matching_lessons` computation for context packs.
-- [ ] **P5.4** Write `reports/weekly.py`: equity curves A vs B vs SPY, trade stats, V with CI, lessons status, incidents, epoch, and the limitations footer.
+- [ ] **P5.4** Write `reports/weekly.py`: equity curves A vs B vs SPY, trade stats, V with CI, lessons status, the factor tally, the week's `bad_process` reviews, open process issues and notes, incidents, epoch, and the limitations footer (A§4.10).
 - [ ] **P5.5** Write `reports/evaluation.py`: the pre-registered evaluation memo (S§8), with every criterion shown as pass, fail, or insufficient data.
 
 **Done when:**
