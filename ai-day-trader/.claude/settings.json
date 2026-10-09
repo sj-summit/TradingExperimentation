@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(uv sync *)",
+      "Bash(uv run pytest *)",
+      "Bash(uv run ruff *)",
+      "Bash(uv run mypy *)",
+      "Bash(uv run trader --help *)",
+      "Bash(uv run trader doctor *)",
+      "Bash(uv run trader replay *)",
+      "Bash(uv run trader report *)"
+    ],
+    "ask": [
+      "Edit(/src/trader/risk/caps.py)",
+      "Edit(/config/risk.yaml)",
+      "Edit(/config/risk.example.yaml)",
+      "Edit(/config/settings.yaml)",
+      "Bash(uv run trader run-day *)",
+      "Bash(uv run trader smoke *)",
+      "Bash(uv run trader flatten *)",
+      "Bash(uv run trader resume *)",
+      "Bash(uv run trader schedule *)",
+      "Bash(claude *)",
+      "Bash(git push *)"
+    ],
+    "deny": [
+      "Read(/.env)",
+      "Read(/.env.*)",
+      "Read(/runtime/claude-config/**)",
+      "Edit(/config/LIVE_APPROVED)"
+    ]
+  }
+}

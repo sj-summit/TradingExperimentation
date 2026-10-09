@@ -1,0 +1,29 @@
+# --- secrets (never commit) ---
+.env
+.env.*
+
+# --- runtime state: DB, logs, recordings, LLM artifacts, isolated Claude config, kill file ---
+runtime/
+
+# --- python ---
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# --- editors / OS ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# --- Claude Code local (per-user) settings; project settings in .claude/settings.json ARE committed ---
+.claude/settings.local.json

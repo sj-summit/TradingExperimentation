@@ -1,0 +1,19 @@
+# events.yaml — high-impact scheduled US macro events (human-maintained; RISK.md R-021).
+# Used for: entry blackouts (risk.yaml event_blackout_*), the `event_day` regime tag, and LLM context packs.
+# Claude Code drafts entries in task P1.8 from official sources; the HUMAN verifies every date/time.
+# `trader doctor` warns when there are no events in the next 14 days.
+#
+# Official sources:
+#   FOMC meetings & statements: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm  (decision 14:00 ET)
+#   CPI, Employment Situation (jobs), PPI: https://www.bls.gov/schedule/  (08:30 ET)
+#   GDP, PCE: https://www.bea.gov/news/schedule  (08:30 ET)
+#
+# Format (times in America/New_York):
+# - date: 2026-12-09
+#   time: "14:00"
+#   name: FOMC rate decision
+#   impact: high          # high | medium (only `high` triggers blackouts by default)
+#   source: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+#   verified_by_human: false
+
+events: []
