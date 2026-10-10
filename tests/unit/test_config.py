@@ -227,6 +227,22 @@ def test_alpaca_credentials_follow_book_prefix(repo: Path) -> None:
     assert secret.get_secret_value() == FAKE_SECRETS["ALPACA_PAPER_B_SECRET_KEY"]
 
 
+def test_data_credentials_fall_back_to_book_b(repo: Path) -> None:
+    key, secret = load_config(repo).data_credentials()
+    assert key is not None
+    assert secret is not None
+    assert key.get_secret_value() == FAKE_SECRETS["ALPACA_PAPER_B_KEY_ID"]
+    assert secret.get_secret_value() == FAKE_SECRETS["ALPACA_PAPER_B_SECRET_KEY"]
+
+
+def test_dedicated_data_credentials_win(repo: Path) -> None:
+    extra = {"ALPACA_DATA_KEY_ID": "PKDATAKEY000000001", "ALPACA_DATA_SECRET_KEY": "data-secret-1"}
+    write_env(repo, {**FAKE_SECRETS, **extra})
+    key, _ = load_config(repo).data_credentials()
+    assert key is not None
+    assert key.get_secret_value() == "PKDATAKEY000000001"
+
+
 def test_redaction_map_lists_every_set_secret(repo: Path) -> None:
     assert load_config(repo).secrets.redaction_map() == FAKE_SECRETS
 

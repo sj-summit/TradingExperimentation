@@ -363,6 +363,15 @@ class AppConfig(_Model):
         prefix = self.settings.books.get(book).account_env_prefix
         return self.secrets.secret(f"{prefix}_KEY_ID"), self.secrets.secret(f"{prefix}_SECRET_KEY")
 
+    def data_credentials(self) -> tuple[SecretStr | None, SecretStr | None]:
+        """Market-data keys: ``data.credentials_env_prefix``, else Book B's (settings comment)."""
+        prefix = self.settings.data.credentials_env_prefix
+        key = self.secrets.secret(f"{prefix}_KEY_ID")
+        secret = self.secrets.secret(f"{prefix}_SECRET_KEY")
+        if key is None and secret is None:
+            return self.alpaca_credentials("B")
+        return key, secret
+
 
 def load_config(root: Path) -> AppConfig:
     """Load and cross-check all configuration under ``root``.

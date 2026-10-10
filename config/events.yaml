@@ -15,5 +15,87 @@
 #   impact: high          # high | medium (only `high` triggers blackouts by default)
 #   source: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
 #   verified_by_human: false
+#
+# Draft of 2026-10-09 (P1.8), covering 2026-10-09 .. 2027-01-09. Every entry is unverified
+# until the human checks it against the source and sets verified_by_human: true.
+#   - The 14:30 FOMC press conferences are listed as high impact by the human's choice (blackout
+#     14:25-14:40 on top of 13:55-14:10 around the statement).
+#   - FOMC minutes are medium: recorded for context, no blackout.
+#   - The 08:30 BLS releases come before the open, so they never block entries; they set the
+#     event_day tag and feed the context packs.
+#   - Federal funding runs through 2026-12-11 (H.R. 6500). If it lapses, BLS reschedules or
+#     cancels releases (as in the 2025 shutdown): re-check the January dates in December.
 
-events: []
+events:
+  - date: 2026-10-14
+    time: "08:30"
+    name: CPI (September)
+    impact: high
+    source: https://www.bls.gov/schedule/2026/10_sched.htm
+    verified_by_human: false
+  - date: 2026-10-28
+    time: "14:00"
+    name: FOMC statement (meeting Oct 27-28)
+    impact: high
+    source: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+    verified_by_human: false
+  - date: 2026-10-28
+    time: "14:30"
+    name: FOMC press conference
+    impact: high
+    source: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+    verified_by_human: false
+  - date: 2026-11-06
+    time: "08:30"
+    name: Employment Situation (October)
+    impact: high
+    source: https://www.bls.gov/schedule/news_release/empsit.htm
+    verified_by_human: false
+  - date: 2026-11-10
+    time: "08:30"
+    name: CPI (October)
+    impact: high
+    source: https://www.bls.gov/schedule/news_release/cpi.htm
+    verified_by_human: false
+  - date: 2026-11-18
+    time: "14:00"
+    name: FOMC minutes (October meeting)
+    impact: medium
+    source: https://www.federalreserve.gov/newsevents/2026-november.htm
+    verified_by_human: false
+  - date: 2026-12-04
+    time: "08:30"
+    name: Employment Situation (November)
+    impact: high
+    source: https://www.bls.gov/schedule/news_release/empsit.htm
+    verified_by_human: false
+  - date: 2026-12-09
+    time: "14:00"
+    name: FOMC statement and projections (meeting Dec 8-9)
+    impact: high
+    source: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+    verified_by_human: false
+  - date: 2026-12-09
+    time: "14:30"
+    name: FOMC press conference
+    impact: high
+    source: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+    verified_by_human: false
+  - date: 2026-12-10
+    time: "08:30"
+    name: CPI (November)
+    impact: high
+    source: https://www.bls.gov/schedule/news_release/cpi.htm
+    verified_by_human: false
+  - date: 2026-12-30
+    time: "14:00"
+    name: FOMC minutes (December meeting)
+    impact: medium
+    source: https://www.federalreserve.gov/newsevents/2026-december.htm
+    verified_by_human: false
+  - date: 2027-01-08
+    time: "08:30"
+    name: Employment Situation (December); at risk if funding lapses after 2026-12-11
+    impact: high
+    source: https://www.bls.gov/schedule/news_release/empsit.htm
+    verified_by_human: false

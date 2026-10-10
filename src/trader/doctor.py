@@ -4,6 +4,7 @@ Output names .env keys, never their values, and every detail line passes through
 redaction. Each check is isolated: one that crashes reports FAIL and the others still run.
 """
 
+import asyncio
 import json
 import os
 import platform
@@ -32,7 +33,18 @@ from requests.adapters import HTTPAdapter
 from trader.config import AppConfig, BookName, ConfigError, load_config
 from trader.core.clock import Clock, RealClock, ensure_et
 from trader.core.events import EVENTS_FILE, load_events
+from trader.core.models import Bar, Mover
 from trader.core.redact import redact_text
+from trader.data.alpaca_rest import (
+    Adjustment,
+    AlpacaAuthError,
+    AlpacaError,
+    AlpacaForbiddenError,
+    AlpacaRest,
+    Feed,
+    Timeframe,
+)
+from trader.data.ratelimit import RateLimiter
 from trader.llm.claude_cli import build_claude_env
 from trader.memory.journal import open_database
 
@@ -47,6 +59,7 @@ EVENTS_HORIZON_DAYS = 14  # ARCHITECTURE.md §9
 MIN_FREE_DISK_BYTES = 2 * 1024**3
 SUBPROCESS_TIMEOUT_S = 30.0
 ALPACA_TIMEOUT_S = 10.0
+SIP_LOOKBACK_DAYS = 14
 EDGAR_PLACEHOLDER = "Your Name your-email@example.com"  # the config/env.example value
 
 
@@ -97,10 +110,28 @@ class Runner(Protocol):
     ) -> RunResult: ...
 
 
+class MarketDataProbe(Protocol):
+    """The slice of AlpacaRest that doctor uses."""
+
+    async def bars(
+        self,
+        symbols: Sequence[str],
+        timeframe: Timeframe,
+        start: datetime,
+        end: datetime | None = None,
+        *,
+        feed: Feed,
+        adjustment: Adjustment = "raw",
+    ) -> dict[str, list[Bar]]: ...
+    async def movers(self, top: int = 50) -> list[Mover] | None: ...
+    async def aclose(self) -> None: ...
+
+
 @dataclass(frozen=True)
 class DoctorDeps:
     clock: Clock
     alpaca: Callable[[str, str], AccountProbe]  # (key_id, secret_key) -> probe
+    market_data: Callable[[str, str], MarketDataProbe]  # (key_id, secret_key) -> probe
     run: Runner
     which: Callable[[str], str | None]
     free_bytes: Callable[[Path], int]
@@ -137,6 +168,12 @@ def run_doctor(root: Path, deps: DoctorDeps, *, quick: bool = False) -> list[Che
         add("alpaca.clock", lambda: _clock_skew(deps, probe))
     else:
         checks.append(_skip("alpaca.clock", "no Alpaca account reachable"))
+    try:
+        sip, movers = _market_data(cfg, deps)
+    except Exception as exc:  # one broken check must not hide the others
+        sip = movers = ("FAIL", f"{type(exc).__name__}: {exc}")
+    add("data.sip_history", lambda: sip)
+    add("data.movers", lambda: movers)
     add("runtime.dirs", lambda: _runtime_dirs(cfg))
     add("journal", lambda: _journal(cfg))
     add("disk", lambda: _disk(root, deps))
@@ -205,7 +242,7 @@ def _uv(root: Path, deps: DoctorDeps) -> Result:
 def _mode(cfg: AppConfig) -> Result:
     if cfg.settings.mode == "paper":
         return "PASS", "paper"
-    return "FAIL", "mode is live, which needs the Phase 7 live gate (RISK.md §7)"
+    return "FAIL", "mode is live, which needs the Phase 7 live gate (RISK.md section 7)"
 
 
 def _required_env_names(cfg: AppConfig) -> list[str]:
@@ -317,6 +354,48 @@ def _clock_skew(deps: DoctorDeps, probe: AccountProbe) -> Result:
     return ("PASS" if skew < MAX_CLOCK_SKEW_S else "FAIL"), detail
 
 
+def _market_data(cfg: AppConfig, deps: DoctorDeps) -> tuple[Result, Result]:
+    """Can these keys read SIP history (Q7), and does the plan include the screener (Q1)?"""
+    key, secret = cfg.data_credentials()
+    if key is None or secret is None:
+        skipped: Result = ("SKIP", "no market-data keys (ALPACA_DATA_* or Book B's)")
+        return skipped, skipped
+    probe = deps.market_data(key.get_secret_value(), secret.get_secret_value())
+    return asyncio.run(_probe_market_data(probe, deps.clock))
+
+
+async def _probe_market_data(probe: MarketDataProbe, clock: Clock) -> tuple[Result, Result]:
+    try:
+        return await _sip_history(probe, clock), await _screener(probe)
+    finally:
+        await probe.aclose()
+
+
+async def _sip_history(probe: MarketDataProbe, clock: Clock) -> Result:
+    start = clock.now() - timedelta(days=SIP_LOOKBACK_DAYS)
+    try:
+        bars = (await probe.bars(["SPY"], "1Day", start, feed="sip")).get("SPY", [])
+    except AlpacaAuthError:
+        return "FAIL", "the market-data keys were rejected (HTTP 401)"
+    except AlpacaForbiddenError as exc:
+        return "FAIL", f"this account can't read SIP history ({exc.message}): see DECISIONS Q7"
+    except AlpacaError as exc:
+        return "FAIL", str(exc)
+    if not bars:
+        return "WARN", f"no SPY daily SIP bars in the last {SIP_LOOKBACK_DAYS} days"
+    return "PASS", f"SPY: {len(bars)} daily SIP bars, latest {bars[-1].ts.date()}"
+
+
+async def _screener(probe: MarketDataProbe) -> Result:
+    try:
+        movers = await probe.movers(top=10)
+    except AlpacaError as exc:
+        return "WARN", f"screener check failed: {exc}"
+    if movers is None:
+        return "WARN", "no screener on this plan (Q1); the 09:00 scan uses snapshots anyway (D-024)"
+    return "PASS", f"screener available ({len(movers)} gainers)"
+
+
 def _runtime_dirs(cfg: AppConfig) -> Result:
     s = cfg.settings
     dirs = [
@@ -344,7 +423,9 @@ def _runtime_dirs(cfg: AppConfig) -> Result:
     leftovers = sorted(p.name for p in sandbox.iterdir()) if sandbox.is_dir() else []
     if leftovers:
         where = s.llm.sandbox_dir.as_posix()
-        problems.append(f"{where} must be empty (A§7.1) but holds: {', '.join(leftovers)}")
+        problems.append(
+            f"{where} must be empty (ARCHITECTURE.md 7.1) but holds: {', '.join(leftovers)}"
+        )
     if problems:
         return "FAIL", "; ".join(problems)
     return "PASS", f"{len(dict.fromkeys(dirs))} dirs writable; llm sandbox empty"
@@ -470,7 +551,7 @@ def _events(root: Path, deps: DoctorDeps) -> Result:
     now = deps.clock.now()
     upcoming = events.between(now, now + timedelta(days=EVENTS_HORIZON_DAYS))
     if not upcoming:
-        return "WARN", f"no events in the next {EVENTS_HORIZON_DAYS} days (filled in P1.8)"
+        return "WARN", f"no events in the next {EVENTS_HORIZON_DAYS} days: extend events.yaml"
     unverified = sum(not e.verified_by_human for e in upcoming)
     detail = f"{len(upcoming)} in the next {EVENTS_HORIZON_DAYS} days; next {upcoming[0].name}"
     if unverified:
@@ -572,10 +653,22 @@ def run_subprocess(
     return RunResult(returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
 
+def _alpaca_market_data(key_id: str, secret_key: str) -> MarketDataProbe:
+    clock = RealClock()
+    return AlpacaRest(
+        key_id,
+        secret_key,
+        clock=clock,
+        data_limiter=RateLimiter(60),
+        trading_limiter=RateLimiter(60),
+    )
+
+
 def default_deps() -> DoctorDeps:
     return DoctorDeps(
         clock=RealClock(),
         alpaca=AlpacaAccountProbe,
+        market_data=_alpaca_market_data,
         run=run_subprocess,
         which=shutil.which,
         free_bytes=lambda path: shutil.disk_usage(path).free,

@@ -12,6 +12,14 @@ from tests.helpers import FAKE_SECRETS, set_yaml, write_env
 from trader import doctor
 from trader.cli import app
 from trader.core.clock import ET, SimClock
+from trader.core.models import Bar, Mover
+from trader.data.alpaca_rest import (
+    Adjustment,
+    AlpacaAuthError,
+    AlpacaForbiddenError,
+    Feed,
+    Timeframe,
+)
 from trader.doctor import (
     AccountInfo,
     Check,
@@ -99,18 +107,62 @@ class FakeRunner:
         raise AssertionError(f"unexpected command {argv}")
 
 
+class FakeMarketData:
+    """Stands in for AlpacaRest: SPY daily SIP bars and a screener, unless told otherwise."""
+
+    def __init__(
+        self,
+        *,
+        error: Exception | None = None,
+        sip_bars: int = 9,
+        movers: list[Mover] | None = None,
+        has_screener: bool = True,
+    ) -> None:
+        self.error, self.sip_bars, self.has_screener = error, sip_bars, has_screener
+        default = Mover(symbol="XYZ", percent_change=12.5, change=Decimal("1"), price=Decimal("9"))
+        self.screener = movers if movers is not None else [default]
+        self.closed = False
+        self.requests: list[tuple[list[str], str, str]] = []
+
+    async def bars(
+        self,
+        symbols: Sequence[str],
+        timeframe: Timeframe,
+        start: datetime,
+        end: datetime | None = None,
+        *,
+        feed: Feed,
+        adjustment: Adjustment = "raw",
+    ) -> dict[str, list[Bar]]:
+        self.requests.append((list(symbols), timeframe, feed))
+        if self.error:
+            raise self.error
+        one = Decimal(1)
+        day = Bar(ts=NOW, open=one, high=one, low=one, close=one, volume=1)
+        return {"SPY": [day] * self.sip_bars} if self.sip_bars else {}
+
+    async def movers(self, top: int = 50) -> list[Mover] | None:
+        return self.screener if self.has_screener else None
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
 def make_deps(
     *,
     probes: Mapping[str, FakeProbe] | None = None,
+    market_data: FakeMarketData | None = None,
     runner: FakeRunner | None = None,
     which: Callable[[str], str | None] | None = None,
     free_bytes: int = 100 * 1024**3,
     environ: Mapping[str, str] | None = None,
 ) -> DoctorDeps:
     known = dict(probes or {})
+    data = market_data or FakeMarketData()
     return DoctorDeps(
         clock=SimClock(NOW),
         alpaca=lambda key_id, _secret: known.get(key_id, FakeProbe()),
+        market_data=lambda _key_id, _secret: data,
         run=runner or FakeRunner(),
         which=which or (lambda name: f"C:/fake/bin/{name}.exe"),
         free_bytes=lambda _path: free_bytes,
@@ -152,6 +204,8 @@ def test_everything_green(green: Path) -> None:
         "alpaca.A": "PASS",
         "alpaca.B": "PASS",
         "alpaca.clock": "PASS",
+        "data.sip_history": "PASS",
+        "data.movers": "PASS",
         "runtime.dirs": "PASS",
         "journal": "PASS",
         "disk": "PASS",
@@ -266,6 +320,47 @@ def test_clock_skew(green: Path, offset_s: float, expected: str) -> None:
     assert check(run_doctor(green, make_deps(probes=probes)), "alpaca.clock").status == expected
 
 
+# ---------------------------------------------------------------- market data (Q1, Q7)
+
+
+def test_sip_history_probe_asks_for_daily_sip_bars(green: Path) -> None:
+    data = FakeMarketData()
+    run_doctor(green, make_deps(market_data=data))
+    assert data.requests == [(["SPY"], "1Day", "sip")]
+    assert data.closed
+
+
+def test_account_without_sip_history_fails_and_points_at_q7(green: Path) -> None:
+    denied = AlpacaForbiddenError(403, "subscription does not permit querying SIP data", "/bars")
+    deps = make_deps(market_data=FakeMarketData(error=denied))
+    result = check(run_doctor(green, deps), "data.sip_history")
+    assert result.status == "FAIL"
+    assert "Q7" in result.detail
+
+
+def test_rejected_data_keys_fail(green: Path) -> None:
+    rejected = AlpacaAuthError(401, "401 Authorization Required", "/bars")
+    data = FakeMarketData(error=rejected)
+    assert (
+        check(run_doctor(green, make_deps(market_data=data)), "data.sip_history").status == "FAIL"
+    )
+
+
+def test_no_screener_on_the_plan_warns(green: Path) -> None:
+    data = FakeMarketData(has_screener=False)
+    result = check(run_doctor(green, make_deps(market_data=data)), "data.movers")
+    assert result.status == "WARN"
+    assert "Q1" in result.detail
+
+
+def test_market_data_checks_skip_without_keys(green: Path) -> None:
+    keep = {k: v for k, v in FAKE_SECRETS.items() if not k.startswith("ALPACA_PAPER_B")}
+    write_env(green, {**keep, "CLAUDE_TOKEN_CREATED": "2026-10-01"})
+    checks = run_doctor(green, make_deps())
+    assert check(checks, "data.sip_history").status == "SKIP"
+    assert check(checks, "data.movers").status == "SKIP"
+
+
 # ---------------------------------------------------------------- claude CLI
 
 
@@ -354,9 +449,10 @@ def test_low_disk_warns(green: Path) -> None:
 
 
 def test_empty_events_file_warns(repo: Path) -> None:
+    (repo / "config" / "events.yaml").write_text("events: []\n", encoding="utf-8")
     result = check(run_doctor(repo, make_deps()), "events")
     assert result.status == "WARN"
-    assert "P1.8" in result.detail
+    assert "extend events.yaml" in result.detail
 
 
 def test_unverified_event_warns(green: Path) -> None:

@@ -433,7 +433,7 @@ SQLite in WAL mode, with `PRAGMA foreign_keys=ON`. Timestamps are ISO-8601 with 
 ```sql
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);            -- schema_version, eval_epoch
 CREATE TABLE trading_days (date TEXT PRIMARY KEY, open_ts TEXT, close_ts TEXT, is_early_close INTEGER,
-  run_status TEXT, notes TEXT);
+  run_status TEXT, notes TEXT, settlement_date TEXT);   -- settlement_date: Alpaca's, from 0002
 CREATE TABLE universe_daily (date TEXT, symbol TEXT, name TEXT, exchange TEXT, prev_close TEXT,
   atr14 TEXT, adv14 INTEGER, or_vol_avg14 REAL, eligible INTEGER, exclusion_reason TEXT,
   PRIMARY KEY (date, symbol));

@@ -1,0 +1,57 @@
+"""Async token-bucket rate limiter, one per REST host (ARCHITECTURE.md §4.2)."""
+
+import asyncio
+import time
+from collections.abc import Awaitable, Callable
+
+# Refill arithmetic leaves float dust (0.9999999…); treat that as a whole token, and never wait
+# less than a millisecond, so the bucket can't spin on near-zero sleeps.
+_EPSILON = 1e-9
+_MIN_WAIT_S = 0.001
+
+
+class RateLimiter:
+    """At most ``capacity`` requests in a burst, refilled at ``rate_per_min`` per minute.
+
+    Any 60-second window therefore sees at most ``capacity + rate_per_min`` requests: keep that
+    under the server's limit. Waiters are served in arrival order. ``pause_for`` holds every
+    caller, e.g. after a 429.
+    """
+
+    def __init__(
+        self,
+        rate_per_min: float,
+        *,
+        capacity: int = 10,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        if rate_per_min <= 0 or capacity < 1:
+            raise ValueError("rate_per_min must be > 0 and capacity >= 1")
+        self._per_s = rate_per_min / 60.0
+        self._capacity = float(capacity)
+        self._tokens = float(capacity)
+        self._monotonic, self._sleep = monotonic, sleep
+        self._updated = monotonic()
+        self._paused_until = 0.0
+        self._lock = asyncio.Lock()  # FIFO: one waiter at a time owns the refill wait
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            while True:
+                now = self._monotonic()
+                if now < self._paused_until:
+                    await self._sleep(self._paused_until - now)
+                    continue
+                self._tokens = min(
+                    self._capacity, self._tokens + (now - self._updated) * self._per_s
+                )
+                self._updated = now
+                if self._tokens >= 1 - _EPSILON:
+                    self._tokens -= 1
+                    return
+                await self._sleep(max(_MIN_WAIT_S, (1 - self._tokens) / self._per_s))
+
+    def pause_for(self, seconds: float) -> None:
+        """Hold every caller for ``seconds`` from now (extends, never shortens, a pause)."""
+        self._paused_until = max(self._paused_until, self._monotonic() + seconds)

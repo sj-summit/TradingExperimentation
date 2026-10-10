@@ -275,14 +275,177 @@ Append-only. Each entry records context, the decision, its consequences, and sou
   - Check the `~/.claude.json` question at G4a, together with the rest of Q4.
 - **Sources:** https://code.claude.com/docs/en/cli-reference · https://code.claude.com/docs/en/authentication · https://code.claude.com/docs/en/env-vars
 
+## D-022 — The calendar keeps Alpaca's settlement date (raises Q8)
+- **Date:** 2026-10-09 · **Status:** Accepted
+- **Context:**
+  - Alpaca's `GET /v2/calendar` returns `date`, `open`/`close` as Eastern wall-clock "HH:MM", `session_open`/`session_close`, and `settlement_date`. It lists trading days only, for 1970–2029.
+  - Settlement skips bank holidays on which NYSE trades: Columbus Day and Veterans Day. Example: a Friday 2026-10-09 trade settles Tuesday 2026-10-13, but "T+1 trading days" (RISK.md §4, A§4.1) gives Monday 2026-10-12. On such days that rule would let the ledger reuse sale proceeds a day early, which is a good-faith violation in a real cash account.
+  - The v2 calendar is labelled "Legacy" but carries no deprecation notice; alpaca-py still uses it. A v3 calendar exists with RFC-3339 offsets.
+- **Decision:**
+  - Migration `0002` adds `trading_days.settlement_date`, and A§6 is updated to match.
+  - `TradingCalendar.settlement_date(d)` returns Alpaca's date. `add_trading_days` stays pure trading-day arithmetic.
+  - Each sync reports how many sessions don't settle on the next trading day. A sudden jump would signal a settlement-cycle change.
+  - Queries outside the synced range raise `CalendarRangeError`, so the calendar fails closed.
+  - A day Alpaca stops listing (an unscheduled closure, like 2025-01-09) is deleted on resync, unless it already has a run status; that is refused as a data conflict.
+- **Consequences:** Which settlement rule the ledger uses is a human decision at P2.3 (Q8). Nothing uses settlement dates yet.
+- **Sources:** https://docs.alpaca.markets/us/reference/legacycalendar · https://docs.alpaca.markets/us/reference/calendar-2 · NYSE/ICE 2025–2027 holiday calendars · https://www.nyse.com/markets/hours-calendars
+
+## D-023 — Market-data REST client: httpx, not alpaca-py
+- **Date:** 2026-10-09 · **Status:** Accepted (human approved in the Phase 1 plan)
+- **Context:**
+  - A§4.2 says `AlpacaMarketData` wraps alpaca-py, but P1.2 asks for respx-mocked tests. alpaca-py uses blocking `requests` with no timeout (D-020).
+  - Verified API behavior:
+    - **Bars:** a bar's `t` is its start; daily bars are stamped 00:00 ET. `limit` (max 10,000) is a total across all symbols, so pagination follows `next_page_token`.
+    - **SIP on the free plan:** an `end` within the last 15 minutes gets HTTP 403 "subscription does not permit querying recent SIP data". Omitting `end` defaults it to 15 minutes ago.
+    - **Failed auth:** an **HTML** 401 page, not JSON.
+    - **Rate limiting:** a 429 response carries `X-RateLimit-Reset` (UNIX epoch) and **no `Retry-After`**.
+    - **Corporate actions:** come from `GET data/v1/corporate-actions`; the old trading-API endpoint is deprecated. Splits carry `ex_date` (effective) and `old_rate`/`new_rate`.
+    - **Assets:** `GET /v2/assets` can't filter on tradability server-side.
+- **Decision:**
+  - **`data/alpaca_rest.py`** uses `httpx.AsyncClient`:
+    - one `RateLimiter` per host, 180/min with a burst of 10 (at most 190 in any 60 s, against a limit of 200);
+    - symbols in batches of `rest_batch_symbols`, at most 4 batches in flight;
+    - prices parsed exactly with `json.loads(parse_float=Decimal)`;
+    - retries: up to 3 with jittered backoff for 429, 5xx and transport errors. A 429 waits until `X-RateLimit-Reset` and pauses the whole host.
+  - **Errors:** `AlpacaAuthError` (401), `AlpacaForbiddenError` (403), and its subclass `SipRecentError`, matched on the message text because the documented error codes disagree.
+  - **SIP queries omit `end`.**
+  - **The limiter treats float dust as a whole token** and never waits under 1 ms. A fake-clock test spun forever on 1e-17 s waits before this fix.
+  - **`pytest-timeout`** is now a dev dependency (60 s per test), so a hang fails instead of stalling the suite.
+- **Consequences:** alpaca-py remains only for trading (P2.1). Tests mock Alpaca at the HTTP layer with respx.
+- **Sources:** https://docs.alpaca.markets/us/reference/stockbars · https://docs.alpaca.markets/us/docs/market-data-faq · https://docs.alpaca.markets/us/reference/corporateactions-1 · https://docs.alpaca.markets/us/reference/get-v2-assets-1 · https://docs.alpaca.markets/us/docs/about-market-data-api
+
+## D-024 — The movers screener can't drive the 09:00 scan (bears on Q1)
+- **Date:** 2026-10-09 · **Status:** Accepted
+- **Context:**
+  - **The screener lags until the open.** Alpaca's movers screener (`GET data/v1beta1/screener/stocks/movers`) "resets at market open and shows the previous day's movers until then". At the 09:00 pre-market scan (A§3) it would therefore list *yesterday's* movers.
+  - **Plan access is undocumented:** whether the free plan includes the screener isn't stated.
+  - **Snapshots behave similarly before the open:** in Alpaca's doc example, a snapshot's `dailyBar` is still the previous session's bar.
+- **Decision:**
+  - `AlpacaRest.movers()` exists and returns `None` on 403/404.
+  - Doctor's `data.movers` check reports whether the plan has it.
+  - The pre-market candidate scan (Phase 4) will rank gaps from snapshots (pre-market latest trade against the previous close), whatever the screener's availability. It must take the previous close from the right bar: `dailyBar` before the open, `prevDailyBar` after it.
+- **Consequences:** A§3's "movers endpoint if available" is superseded for the 09:00 scan. Q1 now only needs doctor's answer for the record.
+- **Sources:** https://docs.alpaca.markets/us/reference/movers-1 · https://docs.alpaca.markets/us/reference/stocksnapshots-1
+
+## D-025 — Indicator definitions (ATR14 and the opening-range features)
+- **Date:** 2026-10-09 · **Status:** Accepted (human chose the ATR definition in the Phase 1 plan)
+- **Context:** S§3.1 says "Wilder ATR over the 14 sessions before t". Wilder's recursive smoothing depends on how much history it starts from, so the phrase is ambiguous. The feature formulas (A§5, A§8) were never written down.
+- **Decision** (`data/indicators.py`; days t−14…t−1 are the 14 sessions before t):
+
+  | Feature | Definition |
+  |---|---|
+  | `ATR14` | Mean of the 14 Wilder true ranges of t−14…t−1, each against the previous session's close (needs 15 daily bars). This equals Wilder's ATR at its seed. Quantized to $0.0001, half-even. |
+  | `ADV14` | Floor of the mean daily volume of t−14…t−1 |
+  | `or_vol_avg14` | Mean opening-range volume of t−14…t−1 (live feed) |
+  | `rel_vol` | `or_volume / or_vol_avg14`; `None` when the baseline is 0 |
+  | `or_range_atr` | `(or_high − or_low) / ATR14` |
+  | `or_return_pct` | `(or_close − or_open) / or_open × 100` |
+  | `gap_pct` | `(or_open − prev_close) / prev_close × 100` |
+  | `atr_pct` | `ATR14 / prev_close × 100` |
+
+- **Consequences:**
+  - Values are reproducible from exactly 15 daily bars and can differ slightly from charting platforms, which smooth over longer history.
+  - Changing the definition during an evaluation epoch would start a new epoch (S§9).
+
+## D-026 — How the universe is built (S§3.1 details the spec left open)
+- **Date:** 2026-10-09 · **Status:** Accepted (human approved in the Phase 1 plan)
+- **Decision** (`data/universe.py`, `trader universe build|or-baseline`):
+  - **Split-adjusted history.** Daily SIP bars and live-feed opening-range bars are requested with `adjustment=split`, so a split inside the window doesn't distort ATR14, ADV14 or relative volume.
+    - Cached `or_bars` for a symbol with a split anywhere from t−15 to t are refetched on every build until the split leaves the window.
+    - The S§3.1 exclusion still applies to splits on t or t−1, where t−1 is the previous session.
+  - **No prints counts as zero.** A session with no live-feed 09:30–09:35 bar is stored with volume 0 and no prices. Bars only exist when trades happened, so that session's IEX opening-range volume really was 0, and it still counts as history.
+  - **Exclusion order.** Asset-level failures are counted but not stored: asset class, not tradable, exchange, symbol characters. Each remaining candidate gets one row in `universe_daily` with its first failing reason, in this order:
+    - `split`
+    - `stale_prev_close` (no SIP bar on t−1)
+    - `insufficient_history` (fewer than 15 daily bars)
+    - `adv` (ADV14 < 1,000,000)
+    - `atr` (ATR14 ≤ $0.50)
+    - `insufficient_or_history`
+
+    `stale_prev_close` comes before `insufficient_history` because it is the more specific cause.
+  - **Baselines only where needed.** OR baselines are fetched only for symbols that passed the daily filters, with one 5Min request per missing session and batch, keeping the bar stamped 09:30.
+  - **Calendar refresh.** `universe build` syncs the trading calendar first (one request).
+- **Known risk (late corporate actions):** Alpaca says corporate actions "may show up late", and which date its filter uses is undocumented. The split query is widened a week past both ends of the window. Even so, a split taking effect on t may be missing at build time. The 09:35 scan (P3.1) should treat an implausible gap against `prev_close` as suspect rather than trust it.
+- **Sources:** https://docs.alpaca.markets/us/reference/corporateactions-1 · https://docs.alpaca.markets/us/reference/stockbars · https://docs.alpaca.markets/us/docs/market-data-faq
+
+## D-027 — Our own asyncio WebSocket client (partly answers Q2)
+- **Date:** 2026-10-09 · **Status:** Accepted (human approved in the Phase 1 plan)
+- **Context:**
+  - **Problems with alpaca-py's stream classes (0.44.0):**
+    - `run()` calls `asyncio.run()`, so it can't be used inside our event loop.
+    - Subscribing from a coroutine deadlocks: it blocks on `run_coroutine_threadsafe(...).result()`.
+    - Error messages that arrive mid-stream (e.g. 405) are logged but never surfaced.
+    - Startup busy-waits on `asyncio.sleep(0)`.
+    - It still uses the deprecated `websockets.legacy` client.
+  - **Protocol, verified in Alpaca's docs:**
+    - **Handshake:** the server greets with `connected`, and the client must authenticate within 10 s. Every message is a JSON array, and data messages are dispatched on `T`.
+    - **Subscriptions:** an ack always echoes the full current set. A 405 rejects the whole request and keeps the old set.
+    - **Error codes:** 400–410 and 500, including 402 (auth failed), 405 (symbol limit), 406 (connection limit) and 409 (wrong plan).
+    - **Connections:** one connection per endpoint on most plans. Half-dead sessions are cleared after about 90 s, so a quick reconnect can hit 406.
+    - **Bars:** a minute bar arrives just after its minute ends and is skipped when there were no trades. `updatedBars` correct earlier bars that had late trades.
+    - **Test stream:** `/v2/test` streams the fake symbol `FAKEPACA` at all hours.
+- **Decision:**
+  - **`data/ws.py: AlpacaStream`** wraps `websockets` 17 (now a declared dependency). It handles:
+    - authentication;
+    - subscribe/unsubscribe that waits for the ack (unsubscribes first, so the set never briefly exceeds the plan limit);
+    - replaying subscriptions after every reconnect;
+    - backoff of 1, 2, 4 … 30 s, and at least 30 s after a 406;
+    - stopping for good on 402 or 409;
+    - a silence watchdog that reconnects after 60 s without a message while the market is open and symbols are subscribed, because sockets can stay open but stop delivering.
+  - **`data/stream.py: MarketDataHub`** subscribes trades, quotes and bars for at most `stream_symbol_limit` symbols, checked locally first. It fans events out to consumer queues and keeps the latest trade and quote plus event ages for R-016. After a reconnect it backfills missed minute bars over REST, tagged `source="backfill"`.
+  - **`trader stream --feed test`** makes the stream verifiable outside market hours.
+- **Still unconfirmed (Q2):**
+  - whether the 30-symbol limit counts trades and quotes separately;
+  - whether IEX sends `statuses` (trading halts);
+  - whether the news stream may run alongside the stock stream.
+
+  The hub surfaces a 405 as an exception and the news hub falls back to polling on 406. Running `trader stream` with real keys answers the first question from the logged ack.
+- **Sources:** https://docs.alpaca.markets/us/docs/streaming-market-data · https://docs.alpaca.markets/us/docs/real-time-stock-pricing-data · https://docs.alpaca.markets/us/docs/streaming-real-time-news · https://docs.alpaca.markets/us/docs/market-data-faq · alpaca-py issues #491, #618, #740, #762
+
+## D-028 — News and SEC filings
+- **Date:** 2026-10-09 · **Status:** Accepted (human approved in the Phase 1 plan)
+- **Context:**
+  - **Alpaca news** (Benzinga) has a REST endpoint (`limit` ≤ 50, paginated) and a WebSocket at `/v1beta1/news`. Whether that WebSocket may run alongside the stock stream on the free plan is unconfirmed (Q2).
+  - **EDGAR's `company_tickers.json`** maps tickers to numeric CIKs and writes class shares with a hyphen (`BRK-B`). One CIK can have several tickers.
+  - **Submissions JSON:** `acceptanceDateTime` in the submissions JSON is wrong by the UTC offset for many filings. The `.hdr.sgml` header's `<ACCEPTANCE-DATETIME>` is Eastern time and reliable.
+  - **SEC fair access:** at most 10 requests/s per user and a declared User-Agent. SEC answers **403** both for rate blocks and for a missing or bad User-Agent, then expects about 10 minutes of quiet.
+- **Decision:**
+  - **`data/news.py: NewsHub`** has three modes:
+    - **Startup:** backfills over REST, then streams `["*"]` and upserts each article into `news`. A correction updates the text but keeps the first `received_at`.
+    - **Fallback:** after the stream is refused with 406 twice (one 30 s retry), it switches to REST polling every 60 s with a 5-minute overlap.
+    - **Lookups:** `recent(symbols, since)` over-selects by 2 hours and filters exactly in Python. ISO strings with different UTC offsets don't sort chronologically across a DST change.
+  - **`data/edgar.py: EdgarClient`**:
+    - **Requests:** sends the User-Agent from `.env` and refuses the env.example placeholder. One limiter at `edgar.max_rps` covers both SEC hosts.
+    - **Errors:** retries 5xx and transport errors. A 403 or 429 refuses every EDGAR call locally for 10 minutes.
+    - **Ticker map:** cached once a day under `runtime/edgar/`.
+    - **Filings:** keeps flagged forms whose `filingDate` is inside the lookback window. Acceptance times come from `.hdr.sgml`, fetched once per accession and cached in `filings`.
+  - **Dev commands:** `trader news --symbols X` and `trader filings --symbol X` serve the done-when lookups. `trader stream --news` runs both streams at once and reports which mode news ended in, which answers part of Q2.
+- **Sources:** https://docs.alpaca.markets/us/reference/news-3 · https://docs.alpaca.markets/us/docs/streaming-real-time-news · https://www.sec.gov/search-filings/edgar-application-programming-interfaces · https://www.sec.gov/search-filings/edgar-search-assistance/accessing-edgar-data
+
+## D-029 — Daily recordings: gzip JSON lines that survive a crash, Parquet tables
+- **Date:** 2026-10-09 · **Status:** Accepted
+- **Decision** (`data/recorder.py`, per A§4.2):
+  - **Layout:** `runtime/recordings/YYYY-MM-DD/` holds four files:
+    - `stream.jsonl.gz`: every hub event, tagged `kind`: trade, quote or bar;
+    - `news.jsonl.gz`;
+    - `or_scan.parquet` (written from P3.1);
+    - `universe.parquet` (written by `trader universe build`).
+  - **Encoding:** records are the models' JSON dumps, so Decimals and timestamps are exact strings and the models re-validate them unchanged.
+  - **Feeding:** the recorder is fed as a hub consumer (`consume`), so the hubs don't know it exists.
+  - **Appending:** JSON-lines files are opened in append mode, which adds one gzip member per open, e.g. after a restart. They are flushed with a sync point every 100 records and on close.
+  - **Atomic tables:** Parquet files are written to `*.partial` and then renamed into place.
+- **Finding:** Python's `gzip.open` cannot read a member that lacks its trailer, which is exactly what a crash leaves. Its buffered reader raises `EOFError` and discards output it had already decompressed. `read_jsonl` therefore decompresses with `zlib` (`wbits=31`) member by member. It keeps everything up to the last sync point and skips a torn final line. Tests cover an unclosed file and one with its tail cut off.
+- **Consequences:** a crash loses at most the last 100 stream events. Replay (P3.8) reads with `read_jsonl` and `read_table`.
+
 ---
 
 ## Open questions to resolve during the build (record answers as new entries)
 
-- **Q1 (P1.2):** Is Alpaca's `movers` (top market movers) endpoint available on the free plan? If not, use the IEX snapshot gap scan.
+- **Q1 (P1.2):** Is Alpaca's `movers` (top market movers) endpoint available on the free plan? If not, use the IEX snapshot gap scan. **Partly answered: D-024** (the 09:00 scan uses snapshots either way); doctor's `data.movers` check records availability once keys exist.
 - **Q2 (P1.5):** The concurrent market-data WebSocket connection limit on the free plan, and whether a trading-status/halts channel is available on the IEX feed.
 - **Q3 (P2.1):** Exact alpaca-py request classes for OTO with a `stop_loss` leg; confirm that close-position cancels the related open orders.
 - **Q4 (G4a):** Does `--tools ""` work with `--json-schema`? What are the envelope fields and the exit codes on usage-limit or auth errors?
 - **Q5 (P0.2):** Current SEC Section 31 fee rate and FINRA TAF per share, for fee estimates (set in `fees:`). **Answered: D-019.**
 - **Q6 (P1.4):** Typical count of eligible symbols, and the IEX OR-volume distribution, to sanity-check the liquidity guards.
-- **Q7 (P1.2):** Can the human's Alpaca account type fetch SIP historical bars (older than 15 min)? If not: open a regular account, or record a new decision to fall back to IEX history with rescaled ADV thresholds and IEX-based shadow outcomes (noisier).
+- **Q7 (P1.2):** Can the human's Alpaca account type fetch SIP historical bars (older than 15 min)? If not: open a regular account, or record a new decision to fall back to IEX history with rescaled ADV thresholds and IEX-based shadow outcomes (noisier). **Doctor's `data.sip_history` check answers this once keys exist.**
+- **Q8 (P2.3):** Should the cash ledger settle on Alpaca's `settlement_date`, which skips bank holidays (D-022), or on T+1 trading days as RISK.md §4 says? Alpaca's date matches real cash-account behavior; the human decides.

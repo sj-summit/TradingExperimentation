@@ -15,6 +15,7 @@ from trader.memory.journal import (
     Migration,
     MigrationError,
     apply_migrations,
+    bundled_migrations,
     connect,
     db_to_dec,
     db_to_ts,
@@ -61,9 +62,11 @@ def test_fresh_database_is_migrated_in_wal_mode(tmp_path: Path) -> None:
     assert len(tables) == 25
     assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    latest = len(bundled_migrations())
+    assert latest >= 2
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == latest
     meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
-    assert meta["schema_version"] == "1"
+    assert meta["schema_version"] == str(latest)
     assert meta["eval_epoch"] == "0"
 
 

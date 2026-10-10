@@ -10,9 +10,9 @@
 
 ```
 STATUS
-current_phase: 0
-last_completed_task: P0.6
-open_questions: Phase 0 code done; final doctor run waits on H0.1–H0.3 (settings.yaml, risk.yaml, repo-root .env with paper keys + token)
+current_phase: 1
+last_completed_task: P1.7
+open_questions: P1.8 drafted, awaiting human date check (config/events.yaml); Phase 0 doctor + Phase 1 done-checks need H0.1–H0.3 keys; Q2 partly open (D-027); Q8 for P2.3
 eval_epoch: 0
 ```
 
@@ -64,16 +64,16 @@ Specs referenced: ARCHITECTURE.md (A§), STRATEGY.md (S§), RISK.md (R§).
 
 ## Phase 1 — Market data, calendar, universe, news
 
-- [ ] **P1.1** Write `core/calendar.py`: Alpaca calendar → `trading_days` cache, sessions, early closes, `add_trading_days`. Use fixture tests: DST weeks (March and November), the day after Thanksgiving, Christmas Eve, and July 3.
-- [ ] **P1.2** Write `data/ratelimit.py` and `data/alpaca_rest.py`: bars (multi-symbol, batching, pagination, feed param), snapshots, assets, corporate actions, and `movers` (return `None` if the plan lacks it). Write respx-mocked tests.
-- [ ] **P1.3** Write `data/indicators.py`: Wilder ATR14, ADV14, OR features (`or_range_atr`, `or_return_pct`), `rel_vol`. Check against hand-computed fixtures.
-- [ ] **P1.4** Write `data/universe.py` (S§3.1): `trader universe build` and `trader universe or-baseline`.
+- [x] **P1.1** Write `core/calendar.py`: Alpaca calendar → `trading_days` cache, sessions, early closes, `add_trading_days`. Use fixture tests: DST weeks (March and November), the day after Thanksgiving, Christmas Eve, and July 3.
+- [x] **P1.2** Write `data/ratelimit.py` and `data/alpaca_rest.py`: bars (multi-symbol, batching, pagination, feed param), snapshots, assets, corporate actions, and `movers` (return `None` if the plan lacks it). Write respx-mocked tests.
+- [x] **P1.3** Write `data/indicators.py`: Wilder ATR14, ADV14, OR features (`or_range_atr`, `or_return_pct`), `rel_vol`. Check against hand-computed fixtures.
+- [x] **P1.4** Write `data/universe.py` (S§3.1): `trader universe build` and `trader universe or-baseline`.
   - Daily features come from SIP daily bars.
   - OR baselines come from the live feed.
   - Log counts: total assets, eligible, excluded by reason.
-- [ ] **P1.5** Write `data/stream.py` (`MarketDataHub`): one WebSocket; subscription limit enforced; consumer fan-out; reconnect, resubscribe and backfill; staleness metrics. Add the dev command `trader stream`. Write fake-WS tests.
-- [ ] **P1.6** Write `data/news.py` (`NewsHub`: stream + REST backfill) and `data/edgar.py` (user agent, rate limit, ticker→CIK cache, recent-filing flags). Write mocked tests.
-- [ ] **P1.7** Write `data/recorder.py`: daily recordings per A§4.2.
+- [x] **P1.5** Write `data/stream.py` (`MarketDataHub`): one WebSocket; subscription limit enforced; consumer fan-out; reconnect, resubscribe and backfill; staleness metrics. Add the dev command `trader stream`. Write fake-WS tests.
+- [x] **P1.6** Write `data/news.py` (`NewsHub`: stream + REST backfill) and `data/edgar.py` (user agent, rate limit, ticker→CIK cache, recent-filing flags). Write mocked tests.
+- [x] **P1.7** Write `data/recorder.py`: daily recordings per A§4.2.
 - [ ] **P1.8** Fill `config/events.yaml` for the next 3 months. Claude Code drafts it from the official Federal Reserve FOMC calendar and the BLS release schedule (CPI, Employment Situation), with source URLs. **The human verifies the dates.**
 
 **Done when:**
