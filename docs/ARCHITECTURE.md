@@ -28,7 +28,7 @@ Design rules:
   - `BrokerAdapter` → `AlpacaBroker` / `SimBroker`
   - `MarketData` → `AlpacaMarketData` / `ReplayMarketData`
   - `LLMClient` → `ClaudeCliClient` / `FakeLLMClient`
-- **If alpaca-py's stream clients run their own event loop,** run each in a dedicated thread and bridge events into asyncio through `loop.call_soon_threadsafe`. Never block the main loop.
+- **If alpaca-py's stream clients run their own event loop,** run each in a dedicated thread and bridge events into asyncio through `loop.call_soon_threadsafe`. Never block the main loop. (Moot: both streams use our own asyncio clients, DECISIONS D-027 and D-030.)
 
 ---
 
@@ -226,14 +226,14 @@ class BrokerAdapter(Protocol):
     async def submit_entry_oto(self, intent: OrderIntent) -> Order: ...    # limit buy + stop_loss leg, tif=day
     async def submit_stop(self, symbol: str, qty: int, stop: Decimal) -> Order: ...  # standalone protection
     async def cancel(self, order_id: str) -> None: ...
-    async def close_position(self, symbol: str) -> Order: ...   # cancels symbol's open orders first
+    async def close_position(self, symbol: str) -> Order: ...   # replaced by service.flatten_account (D-036)
     async def order_by_client_id(self, client_order_id: str) -> Order | None: ...
     def trade_updates(self) -> AsyncIterator[TradeUpdate]: ...  # Alpaca trading stream
 ```
 
 - **`AlpacaBroker`** uses `order_class=oto` with `stop_loss.stop_price`.
   - Price rounding follows Alpaca sub-penny rules (2 decimals at or above $1).
-  - Verify the alpaca-py request classes against the docs (`/us/docs/orders-at-alpaca.md`).
+  - It calls the trading API through httpx, not alpaca-py, and runs its own trade-updates stream (DECISIONS D-030).
 - **`SimBroker`:**
   - A marketable limit buy fills at `min(limit, ask_or_last + sim_slippage)` once a quote or trade at or below the limit is seen.
   - Stop legs trigger when a trade is at or below the stop and fill at `min(stop, trade) − sim_slippage`.
@@ -450,7 +450,8 @@ CREATE TABLE risk_checks (id INTEGER PRIMARY KEY, signal_id TEXT, book TEXT, app
   violations_json TEXT, state_json TEXT, checked_at TEXT);
 CREATE TABLE orders (client_order_id TEXT PRIMARY KEY, broker_order_id TEXT, book TEXT, signal_id TEXT,
   symbol TEXT, side TEXT, type TEXT, order_class TEXT, qty INTEGER, limit_price TEXT, stop_price TEXT,
-  parent_client_order_id TEXT, status TEXT, submitted_at TEXT, updated_at TEXT, raw_json TEXT);
+  parent_client_order_id TEXT, status TEXT, submitted_at TEXT, updated_at TEXT, raw_json TEXT,
+  group_id TEXT);   -- group_id: from 0003, ties an OTO leg to its entry (D-030)
 CREATE TABLE fills (id TEXT PRIMARY KEY, broker_order_id TEXT, book TEXT, symbol TEXT, side TEXT,
   qty INTEGER, price TEXT, filled_at TEXT, raw_json TEXT);
 CREATE TABLE trades (id TEXT PRIMARY KEY, book TEXT, signal_id TEXT, symbol TEXT, qty INTEGER,
@@ -495,7 +496,13 @@ CREATE TABLE review_notes (id INTEGER PRIMARY KEY, first_raised TEXT, last_raise
 CREATE TABLE incidents (id INTEGER PRIMARY KEY, ts TEXT, severity TEXT, component TEXT, code TEXT,
   message TEXT, detail_json TEXT, resolved_at TEXT, acknowledged_by TEXT);
 CREATE TABLE book_state (book TEXT PRIMARY KEY, halted INTEGER, halt_reason TEXT, halted_at TEXT,
-  peak_equity TEXT, consecutive_losing_days INTEGER, updated_at TEXT);
+  peak_equity TEXT, consecutive_losing_days INTEGER, updated_at TEXT);   -- halted/halt_reason: a summary of halts
+CREATE TABLE halts (id INTEGER PRIMARY KEY, book TEXT NOT NULL, reason TEXT NOT NULL,    -- from 0003 (D-036)
+  scope TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL, expires_at TEXT,           -- scope: until_resume | session | marker
+  cleared_at TEXT, cleared_by TEXT);
+CREATE INDEX ix_halts_book ON halts(book, cleared_at);
+CREATE UNIQUE INDEX ux_ledger_entries_ref ON ledger_entries(book, ref) WHERE ref IS NOT NULL;  -- one row per fill (D-034)
+CREATE INDEX ix_orders_book_symbol ON orders(book, symbol);
 CREATE INDEX ix_signals_date ON signals(date);
 CREATE INDEX ix_decisions_signal ON decisions(signal_id);
 CREATE INDEX ix_trades_book_date ON trades(book, entry_ts);
@@ -651,7 +658,7 @@ Per-role contents:
 | Operation | Policy |
 |---|---|
 | REST GET (data, account) | Retry up to 3× with jittered backoff on 429/5xx/timeouts; respect `Retry-After` |
-| Order submit | Never blind-retry. On a timeout or 5xx, `order_by_client_id`. If absent, resubmit with `attempt+1` (logged). If present, adopt it. |
+| Order submit | Never blind-retry. On a timeout or 5xx, `order_by_client_id`. If present, adopt it. If absent: an **entry** is never resubmitted; it stays pending until resolved or marked lost (D-033). An exit or stop is resubmitted with the next attempt number. |
 | Cancel | Retry until the order is terminal; treat 422 "not cancelable" as terminal after re-reading the order |
 | WebSocket | Reconnect with backoff (1, 2, 4 … 30 s), resubscribe, backfill bars; incident if down for more than 60 s during regular hours |
 | `claude -p` | No automatic retry except the single schema-repair call; fall back per role |

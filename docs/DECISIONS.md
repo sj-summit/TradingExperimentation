@@ -437,15 +437,197 @@ Append-only. Each entry records context, the decision, its consequences, and sou
 - **Finding:** Python's `gzip.open` cannot read a member that lacks its trailer, which is exactly what a crash leaves. Its buffered reader raises `EOFError` and discards output it had already decompressed. `read_jsonl` therefore decompresses with `zlib` (`wbits=31`) member by member. It keeps everything up to the last sync point and skips a torn final line. Tests cover an unclosed file and one with its tail cut off.
 - **Consequences:** a crash loses at most the last 100 stream events. Replay (P3.8) reads with `read_jsonl` and `read_table`.
 
+## D-030 — Trading API: httpx plus our own trade-updates stream (answers Q3)
+- **Date:** 2026-10-09 · **Status:** Accepted (human chose it in the Phase 2 plan). Supersedes D-023's "alpaca-py remains only for trading" and A§4.6's alpaca-py note.
+- **Context:**
+  - **alpaca-py resends order submits.** It retries 429 and 504 responses on every method, order submits included (`common/rest.py`: 3 tries, 3 s apart). A 504 can arrive after Alpaca accepted the order, so it can submit twice; Alpaca says never to resend before confirming. It also sends prices as floats, and its trade stream has the event-loop problems in D-027.
+  - **Verified Alpaca behavior** (docs fetched 2026-10-09):
+    - **OTO:** a limit entry plus `stop_loss {stop_price}`; tif day or gtc; no extended hours. The stop must be at least $0.01 below the "base price", which means both the entry limit and the current price.
+    - **Legs** get Alpaca-generated client_order_ids. `group_id` and `group_role` (`entry`, `stop_loss`) tie them to the entry; the stream doesn't fill in `legs`.
+    - **The stop leg is inactive until the entry fills completely**, and cancelling any order in the group cancels the rest (D-032). OTO legs can't be replaced; we never move stops.
+    - **Sub-penny:** at or above $1.00 two decimals, below $1.00 four; anything else gets 422 code 42210000.
+    - **client_order_id:** up to 128 characters now (48 in older docs and the FIX spec; we keep 48). A duplicate gets 422 code 40010001. Lookup: `GET /v2/orders:by_client_order_id`.
+    - **A 403 can mean** insufficient buying power or shares (code 40310000), a wash trade, or bad keys, so errors are classified by the body's code and message.
+    - **Wash-trade protection** (paper too): an open buy blocks any market or stop sell on the symbol, and an open stop sell blocks any buy. OTO orders are exempt.
+    - **A working stop holds its shares** (`qty_available`). Selling them fails with 403 "insufficient qty" until the stop is confirmed cancelled; a cancel's 204 only means requested.
+    - **`DELETE /v2/positions/{symbol}` does not cancel open orders first** (Q3).
+    - **After 16:00** day orders, stop legs included, have expired, and a new regular order is queued for the next open.
+    - **Rate limit:** 200 requests/min per account. The trading API's rate headers are undocumented.
+    - **Trade stream:** `wss://paper-api.alpaca.markets/stream`. Auth `{"action":"auth","key","secret"}` gets `{"stream":"authorization","data":{"status":"authorized"}}`; `{"action":"listen","data":{"streams":["trade_updates"]}}` gets a `listening` ack. Paper sends binary frames. Fill events carry `execution_id`, `qty` (this execution), `price` and `position_qty`. Errors are `{"action":"error"}` followed by a close. Nothing is replayed after a reconnect. alpaca-py sends an older auth form; G2 confirms the docs' form.
+- **Decision:**
+  - **`data/alpaca_rest.AlpacaHttp`** holds the request policy for both clients. GET and DELETE retry 429, 5xx and transport errors. A POST is resent only after a 429, which Alpaca refuses before acting. A timeout, transport error or 5xx on a POST raises `AlpacaUncertainError`.
+  - **`execution/alpaca_broker.AlpacaBroker`**, one per book, paper host only, 180 requests/min per account.
+    - Prices and quantities go out as exact strings and come back as Decimal. A fractional quantity is an anomaly (`BrokerDataError`).
+    - Submit errors: `AlpacaUncertainError` → `SubmitUncertain`; 422 code 40010001 → `DuplicateClientOrderId` (look it up and adopt it); any other 4xx → `OrderRejected` with Alpaca's code; 401 → `BrokerAuthError`.
+  - **`execution/trade_stream.AlpacaTradeStream`** follows the docs' protocol and accepts text or binary frames. It reconnects with 1…30 s backoff, stops for good on an `unauthorized` reply, and announces every connection, the first included, so the owner resyncs over REST. The broker turns an unreadable update into a resync rather than dropping it.
+- **Consequences:**
+  - alpaca-py is left only in doctor's read-only account probe (D-020). Tests mock Alpaca with respx and a fake trade-stream server.
+  - `execution/sim_broker.SimBroker` (P2.2) models these rules for the scenario tests. It also treats a held OTO leg as an open stop sell for the wash-trade check, which the docs leave open. That choice is conservative and never matters in practice, because R-008 allows one entry per symbol per day.
+- **Sources:** https://docs.alpaca.markets/us/docs/orders-at-alpaca · https://docs.alpaca.markets/us/reference/postorder · https://docs.alpaca.markets/us/reference/getallorders-1 · https://docs.alpaca.markets/us/reference/getallopenpositions · https://docs.alpaca.markets/us/docs/user-protection · https://docs.alpaca.markets/us/docs/websocket-streaming · https://alpaca.markets/learn/how-to-fix-common-trading-api-errors-at-alpaca · https://alpaca.markets/support/usage-limit-api-calls · alpaca-py 0.44.0 `common/rest.py`, `trading/stream.py`
+
+## D-031 — No PDT limit; under $2,000 an account has 1x buying power; Alpaca has no cash accounts
+- **Date:** 2026-10-09 · **Status:** Accepted (extends D-003)
+- **Context:**
+  - **PDT is gone.** FINRA replaced the pattern-day-trader rule with intraday margin standards, effective 2026-06-04 (Regulatory Notice 26-10; SEC approval 2026-04-14). Alpaca no longer rejects orders for PDT. On 2026-07-06 it removed `pattern_day_trader`, `daytrade_count`, `daytrading_buying_power` and the `pdt_check`/`dtbp_check` settings.
+  - **Under $2,000 equity** an account gets 1x buying power (`buying_power = cash`) and can't short. Open buys reserve buying power; sells free it only once they fill.
+  - **Alpaca offers no cash accounts.** Every account is a margin account, and `cash` rises as soon as a sale fills, so the broker lets unsettled proceeds be spent.
+  - **Paper fills** are simulated against the NBBO, with random partial fills on about 10% of orders and no fees, slippage or queue position.
+- **Decision:**
+  - Nothing counts day trades or reads the removed fields.
+  - Only our ledger enforces settlement (D-034), as D-003 intended.
+  - G7's "live cash account" will really be an Alpaca limited-margin account under $2,000, with 1x buying power. Revisit the wording at G7.
+- **Sources:** https://www.finra.org/rules-guidance/notices/26-10 · https://docs.alpaca.markets/us/docs/the-intraday-margin-rule · https://docs.alpaca.markets/us/docs/understanding-the-new-intraday-margin-rule · https://docs.alpaca.markets/us/changelog/2026-06-03-pdt-651df23 · https://docs.alpaca.markets/us/docs/margin-and-short-selling · https://docs.alpaca.markets/us/docs/account-plans · https://docs.alpaca.markets/us/docs/paper-trading
+
+## D-032 — Partial fills: one protection routine for every position without a stop
+- **Date:** 2026-10-09 · **Status:** Accepted (human approved in the Phase 2 plan; implemented in P2.6)
+- **Context:**
+  - An OTO stop leg protects nothing until its entry has filled completely. Partially filled shares are unprotected while the entry is open, and cancelling the entry cancels its legs. Paper partially fills about 10% of orders at random.
+  - Wash-trade protection rejects a stop sell while the buy is open, so no stop can be added before the entry is final.
+  - R-020 allows at most `unprotected_position_max_s` (5 s) without a stop; S§3.3's entry timeout is 10 s.
+  - A leg's status after its entry fills is undocumented; Alpaca staff once said it "remains held".
+- **Decision:**
+  - **Protected** means our working sell stops cover the broker's position quantity. Working statuses are new, accepted, pending_new and partially_filled. A `held` leg counts only once its entry has completely filled (`execution/broker.stop_is_working`).
+  - **One routine covers every unprotected position,** whatever cancelled its entry: timeout, late attempt, recovery, last_entry or a halt. Its clock starts at the broker's first-fill time, so after a restart it acts at once.
+  - **Sequence:**
+    1. Give a partially filled entry 1 s to finish, then cancel the remainder.
+    2. Wait until every buy on the symbol is final, then re-read the position.
+    3. If the last price is at or below the planned stop, sell now (R§5 step 1).
+    4. Otherwise place a standalone stop for the position at the planned stop.
+  - **Fallback:** if no stop is working 5 s after the first fill, cancel the symbol's orders, wait until they are final, re-read the position, and market-sell `qty_available`. Raise a P1, and keep trying until flat.
+  - **Polling:** open entries are polled every 1 s, so a half-dead stream can't hide a fill.
+  - **Severity:** a partial fill that ends up protected is a P3 note; P1 is for a protection failure.
+- **Consequences:**
+  - S§3.3's 10 s timeout is shortened for partially filled entries only.
+  - G2's `--marketable` smoke run records a leg's real status after a fill.
+
+## D-033 — Uncertain submits: an entry is never resent
+- **Date:** 2026-10-09 · **Status:** Accepted (human approved in the Phase 2 plan). Supersedes A§10's resubmit rule for entries.
+- **Context:** A§10 resubmits an uncertain order with `attempt+1` when a lookup finds nothing. But the slowdown that caused the timeout can also delay attempt 1, which then fills. With a marketable limit, cancelling it on sight can't undo that fill, and the book would hold the position twice, spending settled cash it doesn't have.
+- **Decision:**
+  - **An uncertain entry is never resubmitted.** It stays pending, holding its cash and counting in R-006, R-007 and R-008, until a lookup or a reconciliation resolves it.
+    - Still unknown after `entry_timeout_s` plus one reconcile, it is marked `lost`.
+    - If it appears later anyway, it is adopted, then cancelled or protected.
+  - **Exits and stops are resubmitted** once two lookups, at once and 1 s later, find nothing. That is safe: the account can't short, and a working stop holds the shares, so a second sell is rejected.
+  - **Exit and stop attempt numbers come from the journal.** `DuplicateClientOrderId` means "look it up and adopt it", never a rejection.
+
+## D-034 — Ledger rules: Alpaca's settlement date, buys counted on their trade date (answers Q8)
+- **Date:** 2026-10-09 · **Status:** Accepted (the human chose Alpaca's settlement date in the Phase 2 plan)
+- **Context:**
+  - **RISK.md §4 read literally** counts "settled entries up to and including that day" on a T+1 basis. A Friday buy would then count only once it settles. Across a bank holiday (Fri 10-09 settles Tue 10-13), Monday would show the whole $1,000 as available, though Friday's buy had already spent half of it.
+  - **Paper charges no fees.** Broker cash therefore drifts away from a ledger that books fee estimates, past the $1 tolerance within a few weeks.
+  - **Seeding on a trading morning** must still give that day a start-of-day equity.
+- **Decision** (`risk/ledger.py`, migration 0003):
+  - **Settlement dates** are Alpaca's `settlement_date` (D-022), which skips bank holidays.
+  - **Buys** use up settled cash on their trade date.
+  - **Sales** add their proceeds, net of estimated fees, on the settlement date. The fee row settles with the sale, which keeps R§4's own example exact.
+  - **Deposits and adjustments** count from the start of their own day.
+  - **available** = start-of-day settled cash − today's buys − the unfilled part of open entries at their limit.
+  - **Start-of-day equity E** = earlier trades, plus deposits and adjustments up to today. The book is flat at the open, so that is its cash.
+  - **Fee estimates** are SEC plus TAF, rounded up to the cent per sale, and carry a `fee-est:` ref. Paper's EOD cash check leaves them out; a live check would compare everything.
+  - **Seeding:** a book's ledger is seeded once, from a flat broker account with no open orders, and refuses to answer until then.
+  - **Booking a fill twice is impossible:** a unique `(book, ref)` index enforces it.
+- **Consequences:**
+  - Around Columbus Day and Veterans Day, a book waits a day longer for its proceeds.
+  - A hypothesis test across Oct–Nov 2026 holidays shows that available cash never goes negative, and that a day's buys never exceed that day's start-of-day settled cash.
+
+## D-035 — Risk-gate conventions (details RISK.md §3 left open)
+- **Date:** 2026-10-09 · **Status:** Accepted (human approved in the Phase 2 plan)
+- **Decision** (`risk/gate.py`):
+  - **One snapshot, every rule.** `RiskGate.check(intent, state)` judges one frozen `GateState` and lists every violation in rule order.
+    - Only R-009 changes anything: it lowers the quantity to fit the settled cash, and the later rules judge the lowered quantity.
+    - If not even one share fits, R-009 rejects alone, and the other rules judge the requested quantity.
+  - **Atomic per book.** The caller builds the state, runs the check, and journals the check and the pending order under one per-book lock (P2.6). R-005 reads halts fresh from the journal. Two signals in the same second therefore can't both pass.
+  - **What counts as an entry:**
+    - R-006: distinct symbols with a position or an open or uncertain entry.
+    - R-007: today's entries that filled, are open, or are uncertain. An entry cancelled without any fill doesn't count.
+    - R-008: any entry the broker accepted today, or an uncertain one, refuses the symbol. This backs up S§3.3's one-shot trigger.
+    - Smoke-test entries (`smoke-…` signals) are left out of R-007, R-008 and every statistic.
+  - **R-002** needs `OrderIntent.side` (default buy). Exits never pass through the gate.
+  - **R-015:**
+    - realized loss is today's net realized P&L, fee estimates included, when it is negative;
+    - open risk is each position's quantity × (entry − stop), plus each open entry's unfilled quantity × (limit − stop).
+  - **R-019:** ledger equity is ledger cash before fee estimates plus marked positions, which is comparable to broker equity. An unknown broker equity fails.
+  - **R-001** passes paper. Live needs a live-gate flag that nothing sets before Phase 7.
+  - **Defense in depth:** every limit is `min(config, cap)` from risk/caps.py, and the day's size multiplier is clamped to at most 1.
+  - **R-016** fails when the symbol has no trade or quote at all. **R-017** passes an unknown halt status, since there is no status feed yet (Q2).
+  - **Day times** (`core/calendar.day_times`): last entry = min(15:30, close − 30 min); flatten = min(15:55, close − 5 min); flat by close − 2 min.
+  - **Coverage:** pytest-cov (a dev dependency) enforces 100% branch coverage of `gate.py`:
+    `uv run pytest tests/unit/test_gate.py --cov=trader.risk.gate --cov-branch --cov-fail-under=100`
+
+## D-036 — One flatten routine, halts as rows, and the kill switch
+- **Date:** 2026-10-09 · **Status:** Accepted (human approved in the Phase 2 plan)
+- **Context:**
+  - **Alpaca's behavior (D-030):** a stop holds its shares; a cancel's 204 only means requested; `DELETE /v2/positions` doesn't cancel orders; and after 16:00 day orders have expired and new sells only queue for the next open.
+  - **Flatten logic in three places** (the adapter's `close_position`, the CLI, the engine) would drift apart. The CLI and a running engine could also fight: the engine's protection loop would re-place a stop the CLI had just cancelled.
+  - **A single `book_state.halt_reason` loses halts.** A manual halt overwriting a daily-loss halt would let `resume` lift both.
+- **Decision:**
+  - **`execution/service.flatten_account` is the only flatten.** It replaces A§4.6's adapter-level `close_position`. The kill switch, `trader flatten`, `trader halt --flatten`, and later the engine and the watchdog all use it. It works over REST alone, so it runs without the engine:
+    1. Cancel every open order and wait until each is final. Open orders are listed with `nested=false`, so a working leg of a filled entry shows up.
+    2. Re-read the positions and market-sell `qty_available` with the next `exit` id from the journal. A rejection is journaled, and the next loop tries again with a new id.
+    3. Journal every order it touched until each is final, since there is no stream. A stop that fills during a slow cancel is booked this way.
+    4. Repeat until flat or the deadline.
+  - **Outside regular hours it sells nothing,** because a sell would only queue, and it cancels nothing that protects. Each position keeps or gets a GTC stop at its planned stop, the caller raises a P1, and the next boot flattens at 09:30:05 (A§3). This keeps invariant 3 overnight.
+  - **Halts are rows** in a `halts` table (migration 0003), each with a scope:
+    - `until_resume`;
+    - `session`: daily loss and LLM degradation, which expire at the next open;
+    - `marker`: `flattening`, a 30 s flag.
+    Any active halt rejects entries (R-005). `book_state.halted` and `halt_reason` become a summary.
+  - **`trader resume`** lifts only the `until_resume` halts. It needs typed confirmation (`RESUME A`), refuses while `runtime/KILL` exists, and needs `--ack-drawdown` for a drawdown halt.
+  - **`trader flatten`** halts the book (manual) before flattening, and keeps a `flattening` marker alive while it works. A running engine therefore stands down its protection loop (P2.6) instead of fighting. If the command dies, the marker lapses within 30 s. A book still not flat raises a P1 incident and the command exits 1.
+  - **The kill switch** (`risk/killswitch.py`) checks for `runtime/KILL` every second. When it appears, every book gets a `kill_switch` halt and the flatten runs, retried every 30 s while any book isn't flat. Deleting the file doesn't resume trading.
+  - **Incidents** (`memory/incidents.py`) are journaled and logged. Push alerts come with `notify.py` (P3.7).
+  - **The breaker checks** (daily loss, drawdown, losing streak, staleness) are pure functions in `risk/breakers.py`. The EOD drawdown and losing-streak wiring moves to Phase 3, which writes `daily_stats`.
+
+## D-037 — ExecutionService: protection, reconciliation and incidents
+- **Date:** 2026-10-09 · **Status:** Accepted (human approved in the Phase 2 plan)
+- **Decision** (`execution/service.py`, `execution/reconcile.py`):
+  - **One monitoring loop per book,** on the injected clock. It:
+    - polls open entries every second over REST, whatever the stream says;
+    - re-reads positions, then open orders, every second while anything is in flux and every 5 s otherwise;
+    - runs the protection routine (D-032) and checks the daily loss;
+    - reconciles every 60 s and after every stream resync.
+    It logs any error and keeps going, so one bad payload can't end protection.
+  - **The stream journals only our orders:** those the journal already knows by id, and their legs by group. Someone else's order is never adopted; it triggers a reconcile instead.
+  - **Reconciliation:**
+    1. Catch up on the day's orders through `records.py`, ours only.
+    2. Compare positions and open orders with the journal.
+    3. Act only if the difference shows again on a pass 5 s later; a resync can't shortcut this.
+    4. Then halt both books. Positions that differ are a P1; differing orders alone are a P2.
+  - **Every P1** (a protection failure, a position mismatch) records an incident, halts the book until resumed (`p1_incident`), and flattens it, then keeps flattening while shares remain.
+  - **The daily-loss breaker** halts the book until the next open (`daily_loss`), records a P2, and flattens.
+  - **After a restart** the service adopts journaled entries the broker knows and keeps chasing the uncertain ones. Shares never seen under a stop count as bare since their first fill, so a naked partial found after a restart is handled at once: here, past the 5 s limit, a P1 and a flatten.
+  - **Moved to Phase 3** (noted under P3.4 and P3.5 in PLAN.md):
+    - `trades` rows;
+    - the EOD drawdown and losing-streak wiring;
+    - a `broker_rejected` reason code for the books.
+- **Consequences:**
+  - Scenario tests run the real journal, SimBroker and the gate under SimClock.
+  - The test harness moves simulated time only once journal reads and writes are idle and the stream queue is empty. That made the scenarios deterministic and about 50× faster than fixed real-time waits, which cost about 15 ms each on Windows.
+
+## D-038 — `trader smoke paper` goes through the real gate and service
+- **Date:** 2026-10-09 · **Status:** Accepted (human approved in the Phase 2 plan)
+- **Decision** (`execution/smoke.py`):
+  - **The real path.** The 1-share order in Book A's account goes through `RiskGate` and `ExecutionService`, like any entry, so invariant 1 holds literally and G2 tests the whole path. The command only reads from the broker directly.
+  - **Prices:**
+    - default: a limit at 95% of the bid, which rests;
+    - `--marketable`: the ask + 0.2%;
+    - the stop: 2% under the limit;
+    - the symbol must trade under $50 (default `F`).
+  - **When it runs:** inside the entry window (09:35:03–15:30 ET) on a trading day.
+  - **Ids:** the entry's client order id uses a `smoke` leg (`A-YYYYMMDD-SYM-smoke-N`), so it can never take a strategy entry's id. Its signal id starts `smoke-`, so it never counts as a strategy entry or in stats (D-035).
+  - **First use** seeds Book A's ledger from the broker's cash, and only from a flat account (D-034).
+  - **What G2 records:** the stop leg's status after a fill (`held` or `new`), the stream's frames, and the auth reply.
+- **Consequences:** tests drive both flows against SimBroker. The real command is never run by Claude Code.
+
 ---
 
 ## Open questions to resolve during the build (record answers as new entries)
 
 - **Q1 (P1.2):** Is Alpaca's `movers` (top market movers) endpoint available on the free plan? If not, use the IEX snapshot gap scan. **Partly answered: D-024** (the 09:00 scan uses snapshots either way); doctor's `data.movers` check records availability once keys exist.
 - **Q2 (P1.5):** The concurrent market-data WebSocket connection limit on the free plan, and whether a trading-status/halts channel is available on the IEX feed.
-- **Q3 (P2.1):** Exact alpaca-py request classes for OTO with a `stop_loss` leg; confirm that close-position cancels the related open orders.
+- **Q3 (P2.1):** Exact alpaca-py request classes for OTO with a `stop_loss` leg; confirm that close-position cancels the related open orders. **Answered: D-030** (the trading client uses httpx, not alpaca-py; `DELETE /v2/positions/{symbol}` does not cancel open orders, so flattening cancels first).
 - **Q4 (G4a):** Does `--tools ""` work with `--json-schema`? What are the envelope fields and the exit codes on usage-limit or auth errors?
 - **Q5 (P0.2):** Current SEC Section 31 fee rate and FINRA TAF per share, for fee estimates (set in `fees:`). **Answered: D-019.**
 - **Q6 (P1.4):** Typical count of eligible symbols, and the IEX OR-volume distribution, to sanity-check the liquidity guards.
 - **Q7 (P1.2):** Can the human's Alpaca account type fetch SIP historical bars (older than 15 min)? If not: open a regular account, or record a new decision to fall back to IEX history with rescaled ADV thresholds and IEX-based shadow outcomes (noisier). **Doctor's `data.sip_history` check answers this once keys exist.**
-- **Q8 (P2.3):** Should the cash ledger settle on Alpaca's `settlement_date`, which skips bank holidays (D-022), or on T+1 trading days as RISK.md §4 says? Alpaca's date matches real cash-account behavior; the human decides.
+- **Q8 (P2.3):** Should the cash ledger settle on Alpaca's `settlement_date`, which skips bank holidays (D-022), or on T+1 trading days as RISK.md §4 says? Alpaca's date matches real cash-account behavior; the human decides. **Answered: D-034** (the human chose Alpaca's settlement date).

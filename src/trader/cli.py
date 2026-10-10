@@ -4,7 +4,7 @@ import asyncio
 import datetime as dt
 from collections.abc import Coroutine
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import typer
 
@@ -22,6 +22,10 @@ universe_app = typer.Typer(
     help="Daily universe and opening-range baselines (STRATEGY.md 3.1).", no_args_is_help=True
 )
 app.add_typer(universe_app, name="universe")
+smoke_app = typer.Typer(
+    help="End-to-end checks against real accounts. HUMAN GATES only.", no_args_is_help=True
+)
+app.add_typer(smoke_app, name="smoke")
 
 DateOption = Annotated[
     str | None,
@@ -289,18 +293,276 @@ async def _stream(
             typer.echo(f"news: {news_hub.mode} mode, {news_hub.stored} articles stored")
 
 
+# ---------------------------------------------------------------- kill switch (RISK.md 6)
+
+BookChoice = Annotated[str, typer.Option("--book", help="A, B or all.")]
+FLATTEN_TIMEOUT_S = 60.0
+FLATTENING_MARKER_TTL_S = 30.0
+
+
+@app.command()
+def halt(
+    ctx: typer.Context,
+    book: BookChoice = "all",
+    flatten: Annotated[
+        bool, typer.Option("--flatten", help="Also cancel every order and close every position.")
+    ] = False,
+) -> None:
+    """Halt new entries for a book until `trader resume`. Works without the engine."""
+    _run(_halt(ctx.obj, _books(book), flatten=flatten, source="trader halt"))
+
+
+@app.command("flatten")
+def flatten_command(ctx: typer.Context, book: BookChoice) -> None:
+    """Halt the book, then cancel every order and close every position through the broker.
+    Works without the engine. Outside market hours nothing is sold: positions keep GTC stops."""
+    _run(_halt(ctx.obj, _books(book), flatten=True, source="trader flatten"))
+
+
+@app.command()
+def resume(
+    ctx: typer.Context,
+    book: Annotated[str, typer.Option("--book", help="A or B.")],
+    ack_drawdown: Annotated[
+        bool, typer.Option("--ack-drawdown", help="Acknowledge a drawdown halt (RISK.md 5).")
+    ] = False,
+) -> None:
+    """Lift a book's halts after you type RESUME <book>. Refuses while runtime/KILL exists.
+    Daily-loss and LLM halts still end only at the next session."""
+    _run(_resume(ctx.obj, book, ack_drawdown=ack_drawdown))
+
+
+def _books(choice: str) -> list[Literal["A", "B"]]:
+    picked = choice.strip().upper()
+    if picked == "ALL":
+        return ["A", "B"]
+    if picked == "A":
+        return ["A"]
+    if picked == "B":
+        return ["B"]
+    raise ValueError(f"--book must be A, B or all, not {choice!r}")
+
+
+async def _halt(root: Path, books: list[Literal["A", "B"]], *, flatten: bool, source: str) -> None:
+    from trader.core.calendar import CalendarRangeError, NotATradingDayError
+    from trader.execution.alpaca_broker import AlpacaBroker
+    from trader.execution.records import Records
+    from trader.execution.service import MarketHours, flatten_account
+    from trader.memory.incidents import record_incident
+    from trader.risk.breakers import Halts
+    from trader.runtime import open_local, open_runtime
+
+    if not flatten:
+        async with open_local(root) as local:
+            halts = Halts(local.journal, local.clock)
+            for book in books:
+                await halts.halt(book, "manual", detail=source)
+                typer.echo(f"Book {book}: halted. `trader resume --book {book}` lifts it.")
+        return
+    async with open_runtime(root) as rt:
+        halts = Halts(rt.journal, rt.clock)
+        for book in books:
+            await halts.halt(book, "manual", detail=source)
+        calendar = await rt.calendar()
+        hours: MarketHours | None
+        try:
+            session = calendar.session(rt.clock.now().date())
+            hours = (session.open, session.close)
+        except (CalendarRangeError, NotATradingDayError):
+            hours = None
+        failed: list[str] = []
+        marker = dt.timedelta(seconds=FLATTENING_MARKER_TTL_S)
+        for book in books:
+            records = Records(
+                rt.journal, book=book, calendar=calendar, fees=rt.cfg.settings.fees, clock=rt.clock
+            )
+            broker = AlpacaBroker.from_config(rt.cfg, book, rt.clock)
+
+            async def beat(book: Literal["A", "B"] = book) -> None:
+                # Tells a running engine to leave this book's stops alone while we work.
+                await halts.renew_marker(book, "flattening", marker)
+
+            try:
+                result = await flatten_account(
+                    broker,
+                    records,
+                    clock=rt.clock,
+                    deadline=rt.clock.now() + dt.timedelta(seconds=FLATTEN_TIMEOUT_S),
+                    hours=hours,
+                    heartbeat=beat,
+                )
+            finally:
+                await halts.clear(book, ["flattening"], by=source)
+                await broker.aclose()
+            if result.flat:
+                typer.echo(f"Book {book}: flat and halted.")
+                continue
+            held = ", ".join(f"{s} {q}" for s, q in sorted(result.remaining.items()))
+            if result.market_closed:
+                stops = ", ".join(f"{s} @ {p}" for s, p in sorted(result.protected.items()))
+                typer.echo(f"Book {book}: market closed, nothing sold. Still held: {held}. "
+                           f"GTC stops: {stops or 'none placed'}.")  # fmt: skip
+            else:
+                typer.echo(f"Book {book}: NOT flat after {FLATTEN_TIMEOUT_S:.0f} s: {held}.")
+            failed.append(book)
+            await record_incident(
+                rt.journal,
+                at=rt.clock.now(),
+                severity="P1",
+                component="flatten",
+                code="not_flat",
+                message=f"Book {book} not flat after {source}: {held}",
+                detail={"remaining": result.remaining, "protected": result.protected},
+            )
+        if failed:
+            raise typer.Exit(code=1)
+
+
+async def _resume(root: Path, choice: str, *, ack_drawdown: bool) -> None:
+    from trader.risk.breakers import Halts
+    from trader.risk.killswitch import KILL_FILE
+    from trader.runtime import open_local
+
+    books = _books(choice)
+    if len(books) != 1:
+        raise ValueError("resume one book at a time: --book A or --book B")
+    book = books[0]
+    if (root / KILL_FILE).exists():
+        raise ValueError(
+            f"{KILL_FILE.as_posix()} exists. Delete it first; deleting it alone doesn't resume."
+        )
+    async with open_local(root) as local:
+        halts = Halts(local.journal, local.clock)
+        active = await halts.active(book)
+        lasting = [h for h in active if h.scope == "until_resume"]
+        for h in active:
+            note = "lifted by resume" if h.scope == "until_resume" else f"ends {h.expires_at}"
+            since = f"{h.created_at:%Y-%m-%d %H:%M}"
+            typer.echo(f"  {h.reason:<18} since {since}  {h.detail}  ({note})")
+        if not lasting:
+            typer.echo(f"Book {book} has no halt that resume lifts.")
+            return
+        if any(h.reason == "drawdown" for h in lasting) and not ack_drawdown:
+            raise ValueError("a drawdown halt needs --ack-drawdown after you review the drawdown")
+        typed = typer.prompt(f"Type RESUME {book} to lift these halts")
+        if typed.strip() != f"RESUME {book}":
+            raise ValueError("confirmation did not match; nothing changed")
+        cleared = await halts.resume(book, by="trader resume", ack_drawdown=ack_drawdown)
+        typer.echo(f"Book {book}: lifted {', '.join(h.reason for h in cleared)}.")
+
+
+# ---------------------------------------------------------------- smoke (HUMAN GATE G2)
+
+
+@smoke_app.command("paper")
+def smoke_paper(
+    ctx: typer.Context,
+    marketable: Annotated[
+        bool, typer.Option("--marketable", help="Buy 1 share (paper), then flatten it.")
+    ] = False,
+    symbol: Annotated[str, typer.Option("--symbol", help="A liquid stock under $50.")] = "F",
+) -> None:
+    """HUMAN GATE G2: a 1-share OTO in Book A's paper account, through the risk gate. By
+    default it rests and is cancelled; --marketable fills and flattens. Prints the journal."""
+    _run(_smoke_paper(ctx.obj, symbol=symbol.strip().upper(), marketable=marketable))
+
+
+async def _smoke_paper(root: Path, *, symbol: str, marketable: bool) -> None:
+    from trader.core.calendar import day_times
+    from trader.core.clock import ET
+    from trader.core.events import EVENTS_FILE, load_events
+    from trader.execution.alpaca_broker import AlpacaBroker
+    from trader.execution.records import Records
+    from trader.execution.service import ExecutionService, TradingDay
+    from trader.execution.smoke import NoPrices, SmokeDeps, ensure_seeded, run_smoke
+    from trader.risk.breakers import Halts
+    from trader.risk.gate import RiskGate
+    from trader.risk.killswitch import KILL_FILE
+    from trader.risk.ledger import SettlementLedger
+    from trader.runtime import open_runtime
+
+    async with open_runtime(root) as rt:
+        cfg, clock = rt.cfg, rt.clock
+        calendar = await rt.calendar()
+        today = clock.now().date()
+        session = calendar.session(today)  # not a trading day: a one-line error
+        times = day_times(
+            session,
+            entry_window_start=cfg.risk.entry_window_start,
+            last_entry=cfg.settings.schedule.last_entry,
+            flatten=cfg.settings.schedule.flatten,
+        )
+        day = TradingDay(times=times, next_open=calendar.session(calendar.next_session(today)).open)
+        midnight = dt.datetime.combine(today, dt.time(0), ET)
+        events = load_events(root / EVENTS_FILE).between(midnight, midnight + dt.timedelta(days=1))
+        broker = AlpacaBroker.from_config(cfg, "A", clock)
+        try:
+            records = Records(
+                rt.journal, book="A", calendar=calendar, fees=cfg.settings.fees, clock=clock
+            )
+            halts = Halts(rt.journal, clock)
+            await ensure_seeded(SettlementLedger(rt.journal, "A", clock), broker, typer.echo)
+            service = ExecutionService(
+                book="A",
+                broker=broker,
+                journal=rt.journal,
+                records=records,
+                halts=halts,
+                gate=RiskGate(cfg.risk, cfg.settings.strategy.universe),
+                prices=NoPrices(),
+                clock=clock,
+                risk=cfg.risk,
+                day=day,
+            )
+            await service.start()
+            try:
+                deps = SmokeDeps(
+                    service=service,
+                    broker=broker,
+                    records=records,
+                    halts=halts,
+                    journal=rt.journal,
+                    clock=clock,
+                    market=rt.rest,
+                    day=day,
+                    mode=cfg.settings.mode,
+                    feed=cfg.settings.data.feed,
+                    events=tuple(events),
+                    kill_file=root / KILL_FILE,
+                )
+                ok = await run_smoke(deps, symbol=symbol, marketable=marketable, echo=typer.echo)
+            finally:
+                await service.stop()
+        finally:
+            await broker.aclose()
+    if not ok:
+        raise typer.Exit(code=1)
+
+
 def _run(job: Coroutine[Any, Any, None]) -> None:
     """Run an async command; expected failures print one line and exit 1, never a traceback."""
     from trader.config import ConfigError
     from trader.core.calendar import CalendarRangeError, NotATradingDayError
     from trader.data.alpaca_rest import AlpacaError
     from trader.data.edgar import EdgarError
+    from trader.execution.broker import BrokerError
+    from trader.risk.breakers import HaltError
+    from trader.risk.ledger import LedgerError
 
     try:
         asyncio.run(job)
     except ConfigError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from None
-    except (AlpacaError, EdgarError, CalendarRangeError, NotATradingDayError, ValueError) as exc:
+    except (
+        AlpacaError,
+        BrokerError,
+        EdgarError,
+        CalendarRangeError,
+        NotATradingDayError,
+        HaltError,
+        LedgerError,
+        ValueError,
+    ) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from None

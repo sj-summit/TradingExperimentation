@@ -10,9 +10,9 @@
 
 ```
 STATUS
-current_phase: 1
-last_completed_task: P1.7
-open_questions: P1.8 drafted, awaiting human date check (config/events.yaml); Phase 0 doctor + Phase 1 done-checks need H0.1–H0.3 keys; Q2 partly open (D-027); Q8 for P2.3
+current_phase: 2
+last_completed_task: P2.7
+open_questions: 🛑 G2 awaits the human (smoke paper in market hours; first chance Mon 2026-10-12); H0.1 + H0.3 done (doctor 2026-10-10: Alpaca, data, journal green); H0.2 open (`claude` not on PATH, CLAUDE_TOKEN_CREATED missing); P1.8 drafted, awaiting human date check (config/events.yaml); Phase 1 done-checks pending; Q2 partly open (D-027); after G2 record the OTO leg status after a fill (D-032, D-038)
 eval_epoch: 0
 ```
 
@@ -24,10 +24,10 @@ Specs referenced: ARCHITECTURE.md (A§), STRATEGY.md (S§), RISK.md (R§).
 
 ### Human prerequisites (the human does these; Claude Code verifies them in 0.4)
 
-- [ ] **H0.1** Create an Alpaca account. In the dashboard, create **two paper accounts with a $1,000 starting balance each**: click the paper account number → "Open New Paper Account". Generate API keys for each.
+- [x] **H0.1** Create an Alpaca account. In the dashboard, create **two paper accounts with a $1,000 starting balance each**: click the paper account number → "Open New Paper Account". Generate API keys for each.
   - **Data note:** Alpaca says *paper-only* accounts are entitled to IEX data only. The plan uses free 15-minute-delayed SIP *history* (ADV/ATR filters, shadow outcomes), which the free plan gives regular accounts. So prefer a regular brokerage account (identity check; no deposit needed to start) and create the paper accounts under it. P1.2 verifies access (DECISIONS Q7).
 - [ ] **H0.2** Install Claude Code ≥ 2.1.268. Run `claude setup-token`, then copy the printed token into `.env` as `CLAUDE_CODE_OAUTH_TOKEN`, with `CLAUDE_TOKEN_CREATED=<today>`.
-- [ ] **H0.3** Copy `config/env.example` → `.env`, `config/settings.example.yaml` → `config/settings.yaml`, and `config/risk.example.yaml` → `config/risk.yaml`. Fill in `.env`, including `SEC_EDGAR_USER_AGENT` with your name and email.
+- [x] **H0.3** Copy `config/env.example` → `.env`, `config/settings.example.yaml` → `config/settings.yaml`, and `config/risk.example.yaml` → `config/risk.yaml`. Fill in `.env`, including `SEC_EDGAR_USER_AGENT` with your name and email.
 - [ ] **H0.4** Pick the machine that will run the bot: always on, awake 08:15–16:45 ET on weekdays, with a stable network. A desktop, mini PC, or small VPS all work.
 - [ ] **H0.5** (Optional) Pick a notification channel (ntfy topic or Discord webhook).
 
@@ -88,20 +88,20 @@ Specs referenced: ARCHITECTURE.md (A§), STRATEGY.md (S§), RISK.md (R§).
 
 ## Phase 2 — Broker, ledger, risk gate, execution (no strategy yet)
 
-- [ ] **P2.1** Write `execution/broker.py` (protocol), `execution/orders.py`, and `execution/alpaca_broker.py`.
+- [x] **P2.1** Write `execution/broker.py` (protocol), `execution/orders.py`, and `execution/alpaca_broker.py`.
   - `orders.py` covers OTO construction (limit entry plus a `stop_loss` leg), sub-penny rounding, and `client_order_id`.
   - Verify the request classes against Alpaca docs (`/us/docs/orders-at-alpaca.md`). Whole shares only.
-- [ ] **P2.2** Write `execution/sim_broker.py`: deterministic fills (A§4.6), partial-fill option, rejections, and a trade-updates stream.
-- [ ] **P2.3** Write `risk/caps.py` (🛑 the human approves the file contents; the `.claude/settings.json` ask rule will prompt) and `risk/ledger.py` (R§4), with unit tests and hypothesis tests.
-- [ ] **P2.4** Write `risk/gate.py` implementing R-001…R-021, with pass and fail tests for every rule. Target 100% branch coverage of `gate.py`.
-- [ ] **P2.5** Write `risk/breakers.py` and `risk/killswitch.py`, plus the `halt`, `resume` (typed confirmation), and `flatten` CLI commands. `flatten` must work without the engine running.
-- [ ] **P2.6** Write `execution/service.py` and `execution/reconcile.py`:
+- [x] **P2.2** Write `execution/sim_broker.py`: deterministic fills (A§4.6), partial-fill option, rejections, and a trade-updates stream.
+- [x] **P2.3** Write `risk/caps.py` (🛑 the human approves the file contents; the `.claude/settings.json` ask rule will prompt) and `risk/ledger.py` (R§4), with unit tests and hypothesis tests. (`caps.py` was created and approved in P0.2 and is unchanged, D-014.)
+- [x] **P2.4** Write `risk/gate.py` implementing R-001…R-021, with pass and fail tests for every rule. Target 100% branch coverage of `gate.py`.
+- [x] **P2.5** Write `risk/breakers.py` and `risk/killswitch.py`, plus the `halt`, `resume` (typed confirmation), and `flatten` CLI commands. `flatten` must work without the engine running.
+- [x] **P2.6** Write `execution/service.py` and `execution/reconcile.py`:
   - submit, track, entry timeout;
   - the R-020 unprotected-position loop;
   - flatten with verification;
   - a reconciliation diff.
   Run SimBroker scenario tests for: a happy path; a stop-out; an entry that never fills; a partial fill; a rejected stop leg (it must protect or flatten within 5 s); a submit timeout (it must look up by `client_order_id` and never double-submit).
-- [ ] **P2.7** Write `trader smoke paper`.
+- [x] **P2.7** Write `trader smoke paper`.
   - Place one **non-marketable** 1-share OTO buy (limit far below market) in paper account A, confirm it was accepted with the stop leg attached, cancel it, and confirm it's cancelled.
   - With `--marketable`, buy 1 share of a liquid sub-$50 stock, confirm the stop leg is live, then `flatten` it.
   - Print the journal rows.
@@ -121,7 +121,13 @@ Specs referenced: ARCHITECTURE.md (A§), STRATEGY.md (S§), RISK.md (R§).
 - [ ] **P3.2** Write `strategy/triggers.py` (S§3.3): one-shot triggers; entry window; chase guard; `missed_at_arm` handling.
 - [ ] **P3.3** Write `strategy/sizing.py` (S§3.5) as a pure function, with property tests: never over the settled cash, risk cap, or notional cap.
 - [ ] **P3.4** Write `books/base.py` and `books/baseline.py` (Book A), journaling decisions with the reason-code enum (A§4.4).
+  - Also, moved here from Phase 2 (D-037): add a `broker_rejected` reason code, for an entry the broker refused after the gate approved it; and write the `trades` rows (P&L, R, estimated fees, exit reason) from the journaled fills.
 - [ ] **P3.5** Write `orchestrator/day.py`: the state machine and timeline (A§3), early-close handling, late start, crash-restart recovery, and heartbeat. Add `trader run-day --books A [--sim]`.
+  - Also, from Phase 2 (D-036, D-037):
+    - seed each book's ledger from a flat account at the first boot;
+    - wire the EOD drawdown and losing-streak breakers, and the EOD cash check (`ledger.eod_check`, then an incident and a halt);
+    - run the kill switch's watch loop;
+    - call `ExecutionService.flatten` at the flatten time, and keep calling it until the book is flat or the close.
 - [ ] **P3.6** Write `memory/shadow.py` (S§7.2, including the `mfe_r`, `mae_r`, and `minutes_held` path stats) and `memory/regime.py`. Run them at 16:12.
 - [ ] **P3.7** Write `reports/daily.py` (MD and HTML) and `notify.py` (providers: none, ntfy, discord).
 - [ ] **P3.8** Write `trader replay --date`: recorded day → `ReplayMarketData` + `SimClock` + `SimBroker`. Add a golden test on a synthetic fixture day.

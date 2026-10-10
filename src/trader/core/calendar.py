@@ -128,6 +128,39 @@ class TradingCalendar:
             )
 
 
+LAST_ENTRY_BEFORE_CLOSE = dt.timedelta(minutes=30)
+FLATTEN_BEFORE_CLOSE = dt.timedelta(minutes=5)
+FLAT_BY_BEFORE_CLOSE = dt.timedelta(minutes=2)
+
+
+class DayTimes(BaseModel):
+    """One session's trading times (A§3). On an early close, last entry and flatten move up."""
+
+    model_config = ConfigDict(frozen=True)
+
+    open: dt.datetime
+    close: dt.datetime
+    entry_start: dt.datetime
+    last_entry: dt.datetime  # min(schedule last_entry, close - 30 min)
+    flatten: dt.datetime  # min(schedule flatten, close - 5 min)
+    flat_by: dt.datetime  # close - 2 min: every book must be flat (RISK.md §5)
+
+
+def day_times(
+    session: Session, *, entry_window_start: dt.time, last_entry: dt.time, flatten: dt.time
+) -> DayTimes:
+    """Apply A§3's early-close rules to the configured times for ``session``."""
+    day = session.date
+    return DayTimes(
+        open=session.open,
+        close=session.close,
+        entry_start=et_datetime(day, entry_window_start),
+        last_entry=min(et_datetime(day, last_entry), session.close - LAST_ENTRY_BEFORE_CLOSE),
+        flatten=min(et_datetime(day, flatten), session.close - FLATTEN_BEFORE_CLOSE),
+        flat_by=session.close - FLAT_BY_BEFORE_CLOSE,
+    )
+
+
 def parse_alpaca_calendar(rows: Iterable[Mapping[str, Any]]) -> list[Session]:
     """Alpaca v2 calendar rows ("date", "open" "09:30", "close" "16:00" in ET) -> sessions."""
     sessions = []

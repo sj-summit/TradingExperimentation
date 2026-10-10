@@ -6,7 +6,7 @@ Prices are Decimal; timestamps are tz-aware ET. Provider-specific parsing lives 
 import re
 from datetime import date, datetime, time
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict
 
@@ -111,6 +111,39 @@ class Mover(_Frozen):
     percent_change: float
     change: Decimal
     price: Decimal
+
+
+# ---------------------------------------------------------------- orders and the risk gate
+
+
+class OrderIntent(_Frozen):
+    """An entry a book wants to make: a whole-share limit buy with a protective stop (A§5).
+
+    Values are not validated here: the risk gate judges them (R-002, R-012..R-014), so a bad
+    intent is rejected with a reason instead of failing to construct. ``side`` exists so R-002
+    can reject anything but a buy; exits never pass through the gate.
+    """
+
+    book: Literal["A", "B"]
+    signal_id: str
+    symbol: str
+    side: Literal["buy", "sell"] = "buy"
+    qty: int
+    entry_limit: Decimal
+    stop_price: Decimal
+    take_profit: Decimal | None = None
+    client_order_id: str
+    day_size_multiplier: Decimal
+
+
+class RiskCheck(_Frozen):
+    """The gate's verdict. ``adjusted_qty`` is set when R-009 reduced the quantity to fit the
+    settled cash; ``state_digest`` is what the rules saw, journaled in ``risk_checks``."""
+
+    approved: bool
+    violations: tuple[str, ...]
+    adjusted_qty: int | None = None
+    state_digest: dict[str, Any]
 
 
 # ---------------------------------------------------------------- news and filings

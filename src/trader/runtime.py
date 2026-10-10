@@ -1,4 +1,4 @@
-"""Shared setup for CLI commands that use the journal and Alpaca REST."""
+"""Shared setup for CLI commands that use the journal and, optionally, Alpaca REST."""
 
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -14,10 +14,16 @@ from trader.memory.journal import Journal
 
 
 @dataclass(frozen=True)
-class Runtime:
+class Local:
+    """Config, clock and journal: enough for commands that never call Alpaca."""
+
     cfg: AppConfig
     clock: Clock
     journal: Journal
+
+
+@dataclass(frozen=True)
+class Runtime(Local):
     rest: AlpacaRest
 
     async def calendar(self) -> TradingCalendar:
@@ -28,10 +34,8 @@ class Runtime:
 
 
 @asynccontextmanager
-async def open_runtime(
-    root: Path, *, rest_factory: Callable[[AppConfig, Clock], AlpacaRest] | None = None
-) -> AsyncIterator[Runtime]:
-    """Load config, start redacting logs, open the journal and an Alpaca REST client."""
+async def open_local(root: Path) -> AsyncIterator[Local]:
+    """Load config, start redacting logs, and open the journal."""
     cfg = load_config(root)
     clock = RealClock()
     configure_logging(
@@ -39,10 +43,18 @@ async def open_runtime(
         secrets=cfg.secrets.redaction_map(),
         logs_dir=cfg.path(cfg.settings.storage.logs_dir),
     )
-    make_rest = rest_factory or AlpacaRest.from_config
     try:
-        db = cfg.path(cfg.settings.storage.db_path)
-        async with await Journal.open(db) as journal, make_rest(cfg, clock) as rest:
-            yield Runtime(cfg=cfg, clock=clock, journal=journal, rest=rest)
+        async with await Journal.open(cfg.path(cfg.settings.storage.db_path)) as journal:
+            yield Local(cfg=cfg, clock=clock, journal=journal)
     finally:
         shutdown_logging()
+
+
+@asynccontextmanager
+async def open_runtime(
+    root: Path, *, rest_factory: Callable[[AppConfig, Clock], AlpacaRest] | None = None
+) -> AsyncIterator[Runtime]:
+    """``open_local`` plus an Alpaca REST client."""
+    make_rest = rest_factory or AlpacaRest.from_config
+    async with open_local(root) as local, make_rest(local.cfg, local.clock) as rest:
+        yield Runtime(cfg=local.cfg, clock=local.clock, journal=local.journal, rest=rest)

@@ -175,6 +175,7 @@ class Journal:
         self._read_conn: sqlite3.Connection | None = None
         self._task: asyncio.Task[None] | None = None
         self._closed = False
+        self._busy = 0
 
     @classmethod
     async def open(cls, path: Path) -> Self:
@@ -217,10 +218,7 @@ class Journal:
 
     async def fetch_all(self, sql: str, params: SqlParams = ()) -> list[sqlite3.Row]:
         conn = self._live(self._read_conn)
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._reader, lambda: conn.execute(sql, params).fetchall()
-        )
+        return await self._on_reader(lambda: conn.execute(sql, params).fetchall())
 
     async def fetch_one(self, sql: str, params: SqlParams = ()) -> sqlite3.Row | None:
         rows = await self.fetch_all(sql, params)
@@ -229,6 +227,32 @@ class Journal:
     async def get_meta(self, key: str) -> str | None:
         row = await self.fetch_one("SELECT value FROM meta WHERE key = ?", (key,))
         return None if row is None else str(row["value"])
+
+    async def read[T](self, fn: Callable[[sqlite3.Connection], T]) -> T:
+        """Run ``fn`` on the reader inside one read transaction: a consistent snapshot of
+        everything committed when it starts."""
+        conn = self._live(self._read_conn)
+
+        def snapshot() -> T:
+            conn.execute("BEGIN")
+            try:
+                return fn(conn)
+            finally:
+                conn.execute("ROLLBACK")  # nothing to keep: the connection is query-only
+
+        return await self._on_reader(snapshot)
+
+    async def _on_reader[T](self, fn: Callable[[], T]) -> T:
+        self._busy += 1
+        try:
+            return await asyncio.get_running_loop().run_in_executor(self._reader, fn)
+        finally:
+            self._busy -= 1
+
+    @property
+    def idle(self) -> bool:
+        """No read or write is queued or running (tests wait for this before moving time)."""
+        return self._queue.empty() and not self._busy
 
     # -- lifecycle
 
@@ -251,6 +275,7 @@ class Journal:
     async def _drain(self) -> None:
         loop = asyncio.get_running_loop()
         while (op := await self._queue.get()) is not None:
+            self._busy += 1
             try:
                 result = await loop.run_in_executor(self._writer, self._transaction, op.fn)
             except Exception as exc:
@@ -259,6 +284,8 @@ class Journal:
             else:
                 if not op.future.done():
                     op.future.set_result(result)
+            finally:
+                self._busy -= 1
 
     def _transaction(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
         conn = self._live(self._write_conn)

@@ -43,7 +43,7 @@ def test_unknown_book_or_leg_rejected() -> None:
     book=st.sampled_from(["A", "B"]),
     day=st.dates(min_value=date(2000, 1, 1), max_value=date(2099, 12, 31)),
     symbol=st.from_regex(r"[A-Z]{1,6}", fullmatch=True),
-    leg=st.sampled_from(["entry", "stop", "exit"]),
+    leg=st.sampled_from(["entry", "stop", "exit", "smoke"]),
     attempt=st.integers(min_value=1, max_value=10**9),
 )
 def test_client_order_id_always_fits_alpaca_limits(

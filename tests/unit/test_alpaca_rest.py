@@ -18,7 +18,9 @@ from trader.data.alpaca_rest import (
     TRADING_PAPER_URL,
     AlpacaAuthError,
     AlpacaError,
+    AlpacaHttp,
     AlpacaRest,
+    AlpacaUncertainError,
     SipRecentError,
 )
 from trader.data.ratelimit import RateLimiter
@@ -210,6 +212,71 @@ async def test_non_json_success_is_an_error(rest: AlpacaRest, respx_mock: respx.
         await rest.bars(["SPY"], "1Day", NOW, feed="sip")
 
 
+# ---------------------------------------------------------------- AlpacaHttp: POST and DELETE
+
+ORDERS = f"{TRADING_PAPER_URL}/v2/orders"
+
+
+@pytest.fixture
+def http(fake_time: FakeTime) -> AlpacaHttp:
+    roomy = RateLimiter(
+        100_000, capacity=1_000, monotonic=fake_time.monotonic, sleep=fake_time.sleep
+    )
+    return AlpacaHttp(
+        KEY,
+        SECRET,
+        clock=SimClock(NOW),
+        limiters={TRADING_PAPER_URL: roomy},
+        sleep=fake_time.sleep,
+        rng=random.Random(0),
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [httpx.ReadTimeout("timed out"), httpx.ConnectError("reset"), httpx.Response(503, text="x")],
+)
+async def test_a_post_without_a_definite_answer_is_uncertain_and_never_resent(
+    http: AlpacaHttp, respx_mock: respx.MockRouter, failure: httpx.Response | Exception
+) -> None:
+    route = respx_mock.post(ORDERS).mock(side_effect=[failure])
+    with pytest.raises(AlpacaUncertainError, match="outcome unknown"):
+        await http.post(TRADING_PAPER_URL, "/v2/orders", {"symbol": "F"})
+    assert route.call_count == 1
+
+
+async def test_a_post_is_resent_after_a_429_which_alpaca_answers_before_acting(
+    http: AlpacaHttp, respx_mock: respx.MockRouter
+) -> None:
+    limited = httpx.Response(429, json={"message": "too many requests"})
+    route = respx_mock.post(ORDERS).mock(
+        side_effect=[limited, httpx.Response(200, json={"id": "o"})]
+    )
+    assert await http.post(TRADING_PAPER_URL, "/v2/orders", {"symbol": "F"}) == {"id": "o"}
+    assert route.call_count == 2
+
+
+async def test_a_rejected_post_carries_alpacas_error_code(
+    http: AlpacaHttp, respx_mock: respx.MockRouter
+) -> None:
+    body = {"code": 40310000, "message": "insufficient buying power"}
+    respx_mock.post(ORDERS).mock(return_value=httpx.Response(403, json=body))
+    with pytest.raises(AlpacaError) as info:
+        await http.post(TRADING_PAPER_URL, "/v2/orders", {"symbol": "F"})
+    assert (info.value.status, info.value.code) == (403, 40310000)
+    assert not isinstance(info.value, AlpacaUncertainError)
+
+
+async def test_delete_retries_and_204_has_no_body(
+    http: AlpacaHttp, respx_mock: respx.MockRouter
+) -> None:
+    route = respx_mock.delete(f"{ORDERS}/o1").mock(
+        side_effect=[httpx.Response(503, text="busy"), httpx.Response(204)]
+    )
+    assert await http.delete(TRADING_PAPER_URL, "/v2/orders/o1") is None
+    assert route.call_count == 2
+
+
 # ---------------------------------------------------------------- other endpoints
 
 
@@ -376,10 +443,16 @@ async def test_news_params_pages_and_parsing(
 # ---------------------------------------------------------------- configuration
 
 
-async def test_from_config_uses_book_b_keys_when_no_data_keys(repo: Path) -> None:
-    cfg = load_config(repo)
-    async with AlpacaRest.from_config(cfg, SimClock(NOW)) as client:
-        assert client._headers["APCA-API-KEY-ID"] == FAKE_SECRETS["ALPACA_PAPER_B_KEY_ID"]
+async def test_from_config_uses_book_b_keys_when_no_data_keys(
+    repo: Path, respx_mock: respx.MockRouter
+) -> None:
+    route = respx_mock.get(f"{TRADING_PAPER_URL}/v2/calendar").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    async with AlpacaRest.from_config(load_config(repo), SimClock(NOW)) as client:
+        await client.calendar(date(2026, 10, 9), date(2026, 10, 9))
+    sent = route.calls.last.request.headers
+    assert sent["APCA-API-KEY-ID"] == FAKE_SECRETS["ALPACA_PAPER_B_KEY_ID"]
 
 
 async def test_from_config_without_keys_raises(repo: Path) -> None:
