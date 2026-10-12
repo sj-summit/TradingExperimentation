@@ -1,5 +1,5 @@
 from collections.abc import AsyncIterator
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -140,5 +140,23 @@ async def test_peak_only_rises_and_streaks_reset_on_a_good_day(journal: Journal)
     assert await stats.raise_peak("A", D(980)) == D(1000)
     assert await stats.raise_peak("A", D("1010.50")) == D("1010.50")
     assert await stats.peak_equity("A") == D("1010.50")
-    streak = [await stats.record_day("A", D(pnl)) for pnl in (-5, -3, 0, -1, -2)]
+    days = [date(2026, 10, d) for d in (5, 6, 7, 8, 9)]
+    streak = [
+        await stats.record_day("A", d, D(pnl), traded=True)
+        for d, pnl in zip(days, (-5, -3, 0, -1, -2), strict=True)
+    ]
     assert streak == [1, 2, 0, 1, 2]
+
+
+async def test_a_session_counts_once_and_a_day_without_trades_ends_the_streak(
+    journal: Journal,
+) -> None:
+    stats = BookStats(journal, SimClock(T0))
+    assert await stats.record_day("A", date(2026, 10, 7), D(-4), traded=True) == 1
+    assert await stats.record_day("A", date(2026, 10, 8), D(-2), traded=True) == 2
+    assert await stats.record_day("A", date(2026, 10, 8), D(-2), traded=True) == 2  # a rerun
+    assert await stats.record_day("A", date(2026, 10, 7), D(-9), traded=True) == 2  # an old day
+    assert await stats.record_day("A", date(2026, 10, 9), D(0), traded=False) == 0
+    row = await journal.fetch_one("SELECT streak_through FROM book_state WHERE book = 'A'")
+    assert row is not None
+    assert row["streak_through"] == "2026-10-09"

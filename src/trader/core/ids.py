@@ -40,6 +40,13 @@ def check_client_order_id(cid: str) -> str:
     return cid
 
 
+def is_ticker(symbol: str) -> bool:
+    """1-6 upper-case letters: the only symbols our ids can carry. Alpaca also lists delisted
+    assets under CUSIP-like placeholders (``0029900E0``, ``003CVR016``), which its bars endpoint
+    rejects outright (DECISIONS D-042)."""
+    return _SYMBOL_RE.fullmatch(symbol) is not None
+
+
 def _check_symbol(symbol: str) -> None:
-    if not _SYMBOL_RE.fullmatch(symbol):
+    if not is_ticker(symbol):
         raise ValueError(f"symbol {symbol!r} must be 1-6 upper-case letters")

@@ -22,8 +22,8 @@ from trader.core.clock import Clock, fmt_iso
 from trader.core.events import Event
 from trader.core.ids import client_order_id
 from trader.core.models import Asset, OrderIntent, Snapshot
+from trader.core.prices import ceil_tick, floor_tick
 from trader.execution.broker import BrokerAdapter
-from trader.execution.orders import ceil_tick, floor_tick
 from trader.execution.records import OrderRow, Records
 from trader.execution.service import ExecutionService, Exposure, TradingDay
 from trader.memory.journal import Journal
@@ -200,7 +200,7 @@ async def _fill_and_flatten(d: SmokeDeps, cid: str, echo: Echo) -> bool:
     leg_status = leg.status if leg else "MISSING"
     echo(f"filled at {order.filled_avg_price}; stop leg after the fill: {leg_status}")
     echo("  (record the leg status for DECISIONS: it settles how D-032 treats 'held')")
-    result = await d.service.flatten()
+    result = await d.service.flatten(purpose="manual")
     held = ", ".join(f"{s} {q}" for s, q in sorted(result.remaining.items()))
     echo("flattened: flat" if result.flat else f"FAIL: still held after flatten: {held}")
     return result.flat and leg is not None and leg_status in ("new", "accepted", "held")

@@ -184,6 +184,13 @@ class SimBroker:
             self._last_quote[event.symbol] = event
         self._match(event.symbol, trade=event if isinstance(event, Trade) else None)
 
+    def hold(self, symbol: str, qty: int, price: Decimal) -> None:
+        """Start with ``qty`` shares bought at ``price`` earlier (cash already spent): a
+        position carried overnight, or a replay's starting state."""
+        held, cost = self._positions.get(symbol, (0, Decimal(0)))
+        self._positions[symbol] = (held + qty, cost + qty * price)
+        self.cash -= qty * price
+
     def expire_day_orders(self) -> None:
         """The session closed: every open day order expires, held legs included."""
         self._advance()

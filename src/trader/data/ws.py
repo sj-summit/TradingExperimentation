@@ -7,6 +7,9 @@ Shared by the market-data hub and the news hub. The protocol, verified against A
 - Every server message is a JSON array.
 - A subscribe or unsubscribe is acknowledged with the full current set, and a 405 rejects the
   whole request.
+
+Bad input never ends the stream (DECISIONS D-048): a frame that isn't JSON, or a message the
+owner can't parse, is logged and skipped, and any other unexpected error reconnects.
 """
 
 import asyncio
@@ -33,6 +36,7 @@ CONNECTION_LIMIT_WAIT_S = 30.0
 # 402 auth failed, 409 insufficient subscription: retrying cannot help.
 FATAL_CODES = frozenset({402, 409})
 CONNECTION_LIMIT = 406
+ACK_TIMEOUT = 408  # ours, not Alpaca's: no ack for a subscription change in time
 
 
 class WsClosed(Exception):
@@ -111,6 +115,7 @@ class AlpacaStream:
         clock: Clock,
         on_data: Callable[[Mapping[str, Any]], None],
         on_connected: Callable[[bool], Awaitable[None]] | None = None,
+        on_error: Callable[[StreamError], None] | None = None,
         connector: WsConnector = websockets_connector,
         should_be_busy: Callable[[], bool] = lambda: False,
         silence_s: float = 60.0,
@@ -120,11 +125,13 @@ class AlpacaStream:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         """``connection_limit_retries``: after this many consecutive 406s, stop with ``failed``
-        set (None retries forever)."""
+        set (None retries forever). ``on_error`` hears every server error that no request was
+        waiting for, such as a 405 on the subscriptions replayed after a reconnect."""
         self._url, self._key, self._secret = url, key_id, secret_key
         self._limit_retries, self._limit_hits = connection_limit_retries, 0
         self._channels = tuple(channels)
         self._clock, self._on_data, self._on_connected = clock, on_data, on_connected
+        self._on_error = on_error
         self._connector, self._should_be_busy = connector, should_be_busy
         self._silence_s, self._auth_timeout_s, self._ack_timeout_s = (
             silence_s,
@@ -173,7 +180,13 @@ class AlpacaStream:
                     return
                 log.warning("stream error", url=self._url, code=exc.code, msg=exc.message)
             except (WsClosed, TimeoutError) as exc:
-                log.warning("stream disconnected", url=self._url, reason=str(exc) or "timeout")
+                if self._stop.is_set():
+                    log.info("stream closed", url=self._url)
+                else:
+                    log.warning("stream disconnected", url=self._url, reason=str(exc) or "timeout")
+            except Exception:
+                # Never let one surprise end market data for the day: reconnect instead.
+                log.exception("stream failed unexpectedly; reconnecting", url=self._url)
             finally:
                 await self._closed(conn)
             if self._stop.is_set():
@@ -192,7 +205,9 @@ class AlpacaStream:
 
         Unsubscribes go first, so the change never briefly exceeds the plan's limit. If the
         server rejects a request (e.g. 405) the StreamError propagates and the server keeps
-        its previous set. While disconnected the change waits for the next connect.
+        its previous set. While disconnected the change waits for the next connect. With no
+        ack in time, the target is kept, the connection is dropped so the reconnect replays it,
+        and StreamError(ACK_TIMEOUT) is raised.
         """
         target = {channel: set(symbols) for channel, symbols in desired.items()}
         async with self._lock:
@@ -211,6 +226,11 @@ class AlpacaStream:
             except WsClosed:
                 self._desired = target  # replayed on reconnect
                 return {}
+            except TimeoutError:
+                self._desired = target  # replayed on reconnect
+                with contextlib.suppress(Exception):
+                    await conn.close()
+                raise StreamError(ACK_TIMEOUT, "no subscription ack in time") from None
             return self.acked
 
     # ---------------------------------------------------------------- connection lifecycle
@@ -260,8 +280,21 @@ class AlpacaStream:
                 if self._should_be_busy():
                     raise TimeoutError(f"no message for {self._silence_s:.0f} s") from None
                 continue
+            except ValueError as exc:  # not JSON: skip the frame, keep the connection
+                log.warning("unreadable stream frame", url=self._url, error=str(exc)[:200])
+                continue
             for message in messages:
-                self._dispatch(message)
+                try:
+                    self._dispatch(message)
+                except StreamError:
+                    raise
+                except Exception as exc:
+                    log.warning(
+                        "unreadable stream message",
+                        url=self._url,
+                        error=f"{type(exc).__name__}: {exc}"[:200],
+                        kind=str(message.get("T"))[:8],
+                    )
 
     def _dispatch(self, message: Mapping[str, Any]) -> None:
         kind = message.get("T")
@@ -284,6 +317,8 @@ class AlpacaStream:
                 log.warning(
                     "stream error message", url=self._url, code=error.code, msg=error.message
                 )
+                if self._on_error is not None:
+                    self._on_error(error)
         elif kind == "success":
             return
         else:
@@ -297,7 +332,8 @@ class AlpacaStream:
     @staticmethod
     async def _recv(conn: WsConnection) -> list[dict[str, Any]]:
         decoded = json.loads(await conn.recv(), parse_float=Decimal)
-        return decoded if isinstance(decoded, list) else [decoded]
+        items = decoded if isinstance(decoded, list) else [decoded]
+        return [item for item in items if isinstance(item, dict)]
 
     @staticmethod
     def _raise_errors(messages: list[dict[str, Any]]) -> None:

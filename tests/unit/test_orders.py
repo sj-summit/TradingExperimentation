@@ -3,16 +3,13 @@ from decimal import Decimal
 import pytest
 
 from trader.core.models import OrderIntent
+from trader.core.prices import ceil_tick, floor_tick, tick_size, valid_price
 from trader.execution.orders import (
     InvalidOrderError,
-    ceil_tick,
     entry_oto_body,
-    floor_tick,
     market_sell_body,
     price_text,
     stop_body,
-    tick_size,
-    valid_price,
 )
 
 D = Decimal

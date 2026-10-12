@@ -59,7 +59,7 @@ def test_fresh_database_is_migrated_in_wal_mode(tmp_path: Path) -> None:
     conn = open_database(tmp_path / "runtime" / "trader.db")
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert {"meta", "signals", "orders", "llm_calls", "daily_reviews", "book_state"} <= tables
-    assert len(tables) == 26
+    assert len(tables) == 28
     assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     latest = len(bundled_migrations())

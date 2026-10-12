@@ -10,9 +10,9 @@
 
 ```
 STATUS
-current_phase: 2
-last_completed_task: P2.7
-open_questions: 🛑 G2 awaits the human (smoke paper in market hours; first chance Mon 2026-10-12); H0.1 + H0.3 done (doctor 2026-10-10: Alpaca, data, journal green); H0.2 open (`claude` not on PATH, CLAUDE_TOKEN_CREATED missing); P1.8 drafted, awaiting human date check (config/events.yaml); Phase 1 done-checks pending; Q2 partly open (D-027); after G2 record the OTO leg status after a fill (D-032, D-038)
+current_phase: 3 (plan approved 2026-10-12: C:\Users\Admin\.claude\plans\squishy-popping-honey.md; order P3.1, P3.3, P3.6a, P3.9, P3.2, P3.4, P3.6b, P3.7, P3.8a, P3.5, P3.8b, G3)
+last_completed_task: P3.9 (D-042 results, D-050); every Phase 3 task is done; next is G3 (human gate)
+open_questions: read docs/HANDOFF.md first. H0.2 open until doctor's claude checks pass (claude's folder added to PATH; CLAUDE_TOKEN_CREATED); P1.8 drafted, awaiting human date check (config/events.yaml); Phase 1 done-checks pending (universe build, stream, news, filings); Q2 open, Q6 partly answered; backtest verdict hangs on the trigger-minute rule (D-042 results: shadow R between -0.31 and +0.14 for longs), human to decide on resolving it from the trade tape
 eval_epoch: 0
 ```
 
@@ -105,7 +105,7 @@ Specs referenced: ARCHITECTURE.md (A§), STRATEGY.md (S§), RISK.md (R§).
   - Place one **non-marketable** 1-share OTO buy (limit far below market) in paper account A, confirm it was accepted with the stop leg attached, cancel it, and confirm it's cancelled.
   - With `--marketable`, buy 1 share of a liquid sub-$50 stock, confirm the stop leg is live, then `flatten` it.
   - Print the journal rows.
-- [ ] 🛑 **HUMAN GATE G2:** The human runs `uv run trader smoke paper` (then `--marketable`) during market hours and confirms the results. Do not run it yourself.
+- [x] 🛑 **HUMAN GATE G2:** The human runs `uv run trader smoke paper` (then `--marketable`) during market hours and confirms the results. Do not run it yourself.
 
 **Done when:**
 
@@ -117,21 +117,23 @@ Specs referenced: ARCHITECTURE.md (A§), STRATEGY.md (S§), RISK.md (R§).
 
 ## Phase 3 — Strategy engine, Book A, orchestrator, shadow outcomes, replay, backtest
 
-- [ ] **P3.1** Write `strategy/orb_sip.py` (S§3.2): parallel batched OR scan, filters, top-20, direction, persistence of all top-20 rows. Test the scan with fixture bars: ties, missing bars, doji, liquidity guards.
-- [ ] **P3.2** Write `strategy/triggers.py` (S§3.3): one-shot triggers; entry window; chase guard; `missed_at_arm` handling.
-- [ ] **P3.3** Write `strategy/sizing.py` (S§3.5) as a pure function, with property tests: never over the settled cash, risk cap, or notional cap.
-- [ ] **P3.4** Write `books/base.py` and `books/baseline.py` (Book A), journaling decisions with the reason-code enum (A§4.4).
+- [x] **P3.1** Write `strategy/orb_sip.py` (S§3.2): parallel batched OR scan, filters, top-20, direction, persistence of all top-20 rows. Test the scan with fixture bars: ties, missing bars, doji, liquidity guards.
+- [x] **P3.2** Write `strategy/triggers.py` (S§3.3): one-shot triggers; entry window; chase guard; `missed_at_arm` handling.
+- [x] **P3.3** Write `strategy/sizing.py` (S§3.5) as a pure function, with property tests: never over the settled cash, risk cap, or notional cap.
+- [x] **P3.4** Write `books/base.py` and `books/baseline.py` (Book A), journaling decisions with the reason-code enum (A§4.4).
   - Also, moved here from Phase 2 (D-037): add a `broker_rejected` reason code, for an entry the broker refused after the gate approved it; and write the `trades` rows (P&L, R, estimated fees, exit reason) from the journaled fills.
-- [ ] **P3.5** Write `orchestrator/day.py`: the state machine and timeline (A§3), early-close handling, late start, crash-restart recovery, and heartbeat. Add `trader run-day --books A [--sim]`.
+- [x] **P3.5** Write `orchestrator/day.py`: the state machine and timeline (A§3), early-close handling, late start, crash-restart recovery, and heartbeat. Add `trader run-day --books A [--sim]`. (D-048: also `--dry-run`, the run lock, boot reconciliation, and 17 whole-day scenario tests.)
   - Also, from Phase 2 (D-036, D-037):
     - seed each book's ledger from a flat account at the first boot;
     - wire the EOD drawdown and losing-streak breakers, and the EOD cash check (`ledger.eod_check`, then an incident and a halt);
     - run the kill switch's watch loop;
     - call `ExecutionService.flatten` at the flatten time, and keep calling it until the book is flat or the close.
-- [ ] **P3.6** Write `memory/shadow.py` (S§7.2, including the `mfe_r`, `mae_r`, and `minutes_held` path stats) and `memory/regime.py`. Run them at 16:12.
-- [ ] **P3.7** Write `reports/daily.py` (MD and HTML) and `notify.py` (providers: none, ntfy, discord).
-- [ ] **P3.8** Write `trader replay --date`: recorded day → `ReplayMarketData` + `SimClock` + `SimBroker`. Add a golden test on a synthetic fixture day.
-- [ ] **P3.9** Write `trader backtest`: the rules-only ORB on historical SIP data over a configurable range. Report:
+- [x] **P3.6** Write `memory/shadow.py` (S§7.2, including the `mfe_r`, `mae_r`, and `minutes_held` path stats) and `memory/regime.py`. Run them at 16:12.
+- [x] **P3.7** Write `reports/daily.py` (MD and HTML) and `notify.py` (providers: none, ntfy, discord).
+- [x] **P3.8** Write `trader replay --date`: recorded day → `ReplayMarketData` + `SimClock` + `SimBroker`. Add a golden test on a synthetic fixture day.
+  - [x] P3.8a: recording and replay market data, `RecordingBroker`, `ReplayHub`, hub taps, the inline journal, `simdrive`, the synthetic-day builder (D-047).
+  - [x] P3.8b: `ReplayBroker`, `trader replay --date` seeded from `boot.json`, the golden synthetic-day test, two replays in separate processes that match, a record-then-replay round trip (D-049).
+- [x] **P3.9** Write `trader backtest`: the rules-only ORB on historical SIP data over a configurable range. Report:
   - long-only leg stats and long+short shadow stats;
   - mean R by rel_vol bucket (H4 sanity).
   Run it on at least 6 months of history. **Never include the LLM in a backtest.**

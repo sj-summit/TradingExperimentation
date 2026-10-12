@@ -253,11 +253,20 @@ class AlpacaRest:
             raise AlpacaError(200, "unexpected calendar payload", "/v2/calendar")
         return rows
 
-    async def assets(self) -> list[Asset]:
-        """Every active us_equity asset. Tradability and exchange are filtered by the caller."""
-        rows = await self._http.get(
-            self._trading_url, "/v2/assets", {"status": "active", "asset_class": "us_equity"}
-        )
+    async def clock(self) -> datetime:
+        """Alpaca's server time (``/v2/clock``), for the boot skew check (RISK.md §9)."""
+        data = await self._http.get(self._trading_url, "/v2/clock")
+        if not isinstance(data, dict) or "timestamp" not in data:
+            raise AlpacaError(200, "unexpected clock payload", "/v2/clock")
+        return parse_et_iso(str(data["timestamp"]))
+
+    async def assets(
+        self, *, status: Literal["active", "inactive"] | None = "active"
+    ) -> list[Asset]:
+        """Every us_equity asset of ``status`` (None: every status, which the backtest uses to
+        include delisted symbols). Tradability and exchange are filtered by the caller."""
+        params = {"asset_class": "us_equity"} | ({"status": status} if status else {})
+        rows = await self._http.get(self._trading_url, "/v2/assets", params)
         return [_asset(row) for row in rows]
 
     async def asset(self, symbol: str) -> Asset | None:
@@ -281,11 +290,13 @@ class AlpacaRest:
         *,
         feed: Feed,
         adjustment: Adjustment = "raw",
+        asof: str | None = None,
     ) -> dict[str, list[Bar]]:
         """Bars per symbol, oldest first. Symbols with no bars are absent from the result.
 
         Leave ``end`` as None for SIP on the free plan: the server then defaults it to 15 minutes
-        ago, while an explicit recent ``end`` raises SipRecentError.
+        ago, while an explicit recent ``end`` raises SipRecentError. ``asof`` sets the symbol
+        mapping date for renamed tickers; ``"-"`` skips the mapping (the backtest's choice).
         """
         params: dict[str, Any] = {
             "timeframe": timeframe,
@@ -297,6 +308,8 @@ class AlpacaRest:
         }
         if end is not None:
             params["end"] = rfc3339(end)
+        if asof is not None:
+            params["asof"] = asof
 
         async def fetch(chunk: list[str]) -> dict[str, list[Bar]]:
             out: dict[str, list[Bar]] = defaultdict(list)

@@ -15,7 +15,7 @@ Data staleness is not a halt: it is an input to the gate (R-016) while it lasts.
 
 import sqlite3
 from collections.abc import Iterable
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Literal
 
@@ -275,23 +275,30 @@ class BookStats:
 
         return await self._journal.write(write)
 
-    async def record_day(self, book: BookName, pnl: Decimal) -> int:
-        """Count consecutive losing days: a loss extends the streak, anything else ends it."""
+    async def record_day(self, book: BookName, day: date, pnl: Decimal, *, traded: bool) -> int:
+        """Count consecutive losing sessions (RISK.md §5; DECISIONS D-048). A session that
+        traded and lost extends the streak; any other session, one without trades included,
+        ends it. Each session counts once: recording a day already counted (an EOD rerun)
+        returns the streak unchanged."""
         now = self._clock.now()
 
         def write(conn: sqlite3.Connection) -> int:
             row = conn.execute(
-                "SELECT consecutive_losing_days FROM book_state WHERE book = ?", (book,)
+                "SELECT consecutive_losing_days, streak_through FROM book_state WHERE book = ?",
+                (book,),
             ).fetchone()
             streak = (row["consecutive_losing_days"] or 0) if row is not None else 0
-            streak = streak + 1 if pnl < 0 else 0
+            through = row["streak_through"] if row is not None else None
+            if through is not None and through >= day.isoformat():
+                return int(streak)
+            streak = streak + 1 if traded and pnl < 0 else 0
             conn.execute(
-                "INSERT INTO book_state (book, consecutive_losing_days, updated_at) "
-                "VALUES (?, ?, ?) ON CONFLICT (book) DO UPDATE SET "
+                "INSERT INTO book_state (book, consecutive_losing_days, streak_through, "
+                "updated_at) VALUES (?, ?, ?, ?) ON CONFLICT (book) DO UPDATE SET "
                 "consecutive_losing_days = excluded.consecutive_losing_days, "
-                "updated_at = excluded.updated_at",
-                (book, streak, fmt_iso(now)),
+                "streak_through = excluded.streak_through, updated_at = excluded.updated_at",
+                (book, streak, day.isoformat(), fmt_iso(now)),
             )
-            return streak
+            return int(streak)
 
         return await self._journal.write(write)

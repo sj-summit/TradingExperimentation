@@ -26,6 +26,10 @@ smoke_app = typer.Typer(
     help="End-to-end checks against real accounts. HUMAN GATES only.", no_args_is_help=True
 )
 app.add_typer(smoke_app, name="smoke")
+report_app = typer.Typer(help="Reports (ARCHITECTURE.md 4.10).", no_args_is_help=True)
+app.add_typer(report_app, name="report")
+notify_app = typer.Typer(help="Push notifications (ntfy or Discord).", no_args_is_help=True)
+app.add_typer(notify_app, name="notify")
 
 DateOption = Annotated[
     str | None,
@@ -117,6 +121,249 @@ async def _universe(root: Path, date: str | None, *, persist: bool) -> None:
                 f"OR baseline before {target}: {with_baseline} symbols have 14 sessions "
                 f"({rt.cfg.settings.data.feed} feed); universe not written"
             )
+
+
+@app.command("run-day")
+def run_day(
+    ctx: typer.Context,
+    books: Annotated[str, typer.Option("--books", help="A (Book B arrives in Phase 4).")] = "A",
+    sim: Annotated[
+        bool,
+        typer.Option("--sim", help="Live data, simulated brokers, under runtime/sim/<date>/."),
+    ] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Boot's checks and the timeline; trades nothing.")
+    ] = False,
+) -> None:
+    """HUMAN GATE until Phase 6: today's full session (A§3) for Book A's paper account, from
+    boot to the report. Start it by 08:25 ET; it exits after the 16:30 report."""
+    _run(_run_day(ctx.obj, books, sim=sim, dry_run=dry_run))
+
+
+async def _run_day(root: Path, books: str, *, sim: bool, dry_run: bool) -> None:
+    from trader.orchestrator.live import RunOptions, parse_books, run_day
+
+    options = RunOptions(books=parse_books(books), sim=sim, dry_run=dry_run)
+    await run_day(root, options, typer.echo)
+
+
+@app.command()
+def replay(
+    ctx: typer.Context,
+    date: Annotated[str, typer.Option("--date", help="A recorded session, YYYY-MM-DD.")],
+) -> None:
+    """Replay a recorded day offline through the real engine (recorded market data and broker
+    answers on a simulated clock) into runtime/replay/<date>/, then compare its signals,
+    decisions and trades with the journal. Exits 1 on any divergence or difference. Never
+    touches an account or sends a notification."""
+    _run(_replay(ctx.obj, date))
+
+
+async def _replay(root: Path, date: str) -> None:
+    from trader.config import load_config
+    from trader.core.clock import ET, RealClock
+    from trader.core.events import EVENTS_FILE, load_events
+    from trader.core.logging import configure_logging, shutdown_logging
+    from trader.orchestrator.replay import replay_day
+
+    cfg = load_config(root)
+    day = dt.date.fromisoformat(date)
+    midnight = dt.datetime.combine(day, dt.time(0), ET)
+    events = load_events(root / EVENTS_FILE).between(midnight, midnight + dt.timedelta(days=1))
+    db = cfg.path(cfg.settings.storage.db_path)
+    replays = db.parent / "replay"
+    configure_logging(
+        clock=RealClock(),
+        secrets=cfg.secrets.redaction_map(),
+        logs_dir=replays / "logs",
+        console=None,
+    )
+    try:
+        report = await replay_day(
+            recordings=cfg.path(cfg.settings.storage.recordings_dir),
+            day=day,
+            out=replays / day.isoformat(),
+            settings=cfg.settings,
+            risk=cfg.risk,
+            events=events,
+            recorded_db=db,
+            root=root,
+        )
+    finally:
+        shutdown_logging()
+    for line in report.lines():
+        typer.echo(line)
+    if not report.matches:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def scan(
+    ctx: typer.Context,
+    date: Annotated[
+        str | None,
+        typer.Option(
+            "--date",
+            help="Session YYYY-MM-DD. Default: the latest session whose 09:35 scan has passed.",
+        ),
+    ] = None,
+) -> None:
+    """Dev: run the 09:35 opening-range scan for a session and print the top rows. Saves
+    nothing. Needs that session's universe (`trader universe build --date D`)."""
+    _run(_scan(ctx.obj, date))
+
+
+async def _scan(root: Path, date: str | None) -> None:
+    from trader.runtime import open_runtime
+    from trader.strategy.orb_sip import OrbSipSelector, last_scanned_session, scan_lines
+
+    async with open_runtime(root) as rt:
+        calendar = await rt.calendar()
+        settings = rt.cfg.settings
+        scan_at = settings.strategy.selection.scan_at
+        day = (
+            dt.date.fromisoformat(date)
+            if date
+            else last_scanned_session(calendar, rt.clock.now(), scan_at)
+        )
+        selector = OrbSipSelector(
+            market=rt.rest,
+            journal=rt.journal,
+            clock=rt.clock,
+            calendar=calendar,
+            strategy=settings.strategy,
+            max_chase_pct=rt.cfg.risk.max_chase_pct,
+            feed=settings.data.feed,
+            ready_symbol=settings.data.regime_symbols[0],
+        )
+        result = await selector.scan(day, persist=False)
+        for line in scan_lines(result, settings.data.feed):
+            typer.echo(line)
+
+
+@report_app.command("daily")
+def report_daily(
+    ctx: typer.Context,
+    date: Annotated[
+        str | None, typer.Option("--date", help="Session YYYY-MM-DD. Default: today.")
+    ] = None,
+) -> None:
+    """Regenerate a day's report (Markdown and HTML) from the journal. Offline."""
+    _run(_report_daily(ctx.obj, date))
+
+
+async def _report_daily(root: Path, date: str | None) -> None:
+    from trader.core.calendar import CalendarRangeError, NotATradingDayError, load_calendar
+    from trader.reports.daily import build_daily, write_daily
+    from trader.runtime import open_local
+
+    async with open_local(root) as local:
+        now = local.clock.now()
+        day = dt.date.fromisoformat(date) if date else now.date()
+        try:
+            session = (await load_calendar(local.journal)).session(day)
+        except (CalendarRangeError, NotATradingDayError):
+            session = None
+        rows = await local.journal.fetch_all(
+            "SELECT DISTINCT book FROM daily_stats WHERE date = ? ORDER BY book", (day.isoformat(),)
+        )
+        books = tuple(r["book"] for r in rows) or ("A",)
+        report = await build_daily(
+            local.journal, day, books=books, mode=local.cfg.settings.mode, session=session, now=now
+        )
+        md, page = write_daily(report, local.cfg.path(local.cfg.settings.storage.reports_dir))
+        typer.echo(report.summary())
+        typer.echo(f"report: {md}\n        {page}")
+
+
+@notify_app.command("test")
+def notify_test(ctx: typer.Context) -> None:
+    """Send one test message through the configured provider, to check your channel (H0.5)."""
+    _run(_notify_test(ctx.obj))
+
+
+async def _notify_test(root: Path) -> None:
+    from trader.notify import NullNotifier, notifier_from_config
+    from trader.runtime import open_local
+
+    async with open_local(root) as local:
+        notifier = notifier_from_config(local.cfg)
+        if isinstance(notifier, NullNotifier):
+            typer.echo("notify.provider is none, or its secret is missing: nothing sent")
+            return
+        sent = await notifier.send(
+            "trader notify test", "If you can read this, alerts reach you.", tags=("test_tube",)
+        )
+        if not sent:
+            raise ValueError("the provider refused the test message; see the log")
+        typer.echo(f"sent through {local.cfg.settings.notify.provider}")
+
+
+@app.command()
+def backtest(
+    ctx: typer.Context,
+    start: Annotated[str, typer.Option("--start", help="First session, YYYY-MM-DD.")],
+    end: Annotated[str, typer.Option("--end", help="Last session, YYYY-MM-DD, before today.")],
+    feed: Annotated[
+        str | None,
+        typer.Option(
+            "--feed", help="iex (mirrors live) or sip (as in the paper). Default: settings."
+        ),
+    ] = None,
+    force: Annotated[
+        bool, typer.Option("--force", help="Run between 09:00 and 16:30 ET on a trading day.")
+    ] = False,
+) -> None:
+    """Rules-only ORB backtest on historical data (P3.9). Never uses the LLM (D-010). Data is
+    cached under runtime/backtest/, so a rerun over the same range makes no requests."""
+    _run(_backtest(ctx.obj, start, end, feed, force=force))
+
+
+async def _backtest(root: Path, start: str, end: str, feed: str | None, *, force: bool) -> None:
+    from typing import cast
+
+    from trader.backtest import report
+    from trader.backtest.data import BacktestData
+    from trader.backtest.engine import BacktestSettings, DayResult, busy_hours, run_backtest
+    from trader.data.alpaca_rest import Feed
+    from trader.memory.journal import Journal
+    from trader.runtime import open_runtime
+
+    async with open_runtime(root) as rt:
+        calendar = await rt.calendar()
+        now = rt.clock.now()
+        first, last = dt.date.fromisoformat(start), dt.date.fromisoformat(end)
+        chosen = feed or rt.cfg.settings.data.feed
+        if chosen not in ("iex", "sip"):
+            raise ValueError(f"--feed must be iex or sip, not {chosen!r}")
+        if not first <= last < now.date():
+            raise ValueError("--start must not be after --end, and --end must be before today")
+        if busy_hours(calendar, now) and not force:
+            raise ValueError(
+                "the backtest doesn't run 09:00-16:30 ET on trading days: it would share the "
+                "market-data rate limit with the live scan (--force overrides)"
+            )
+
+        def progress(n: int, total: int, day: DayResult) -> None:
+            typer.echo(
+                f"{n}/{total} {day.day}: {day.eligible} eligible, {len(day.signals)} signals, "
+                f"{day.triggered} triggered, {len(day.trades)} trades, cash ${day.end_cash:.2f}"
+            )
+
+        cache_dir = rt.cfg.path(rt.cfg.settings.storage.db_path).parent / "backtest"
+        async with await Journal.open(cache_dir / "cache.db") as cache:
+            data = BacktestData(source=rt.rest, cache=cache, calendar=calendar)
+            result = await run_backtest(
+                data,
+                calendar=calendar,
+                settings=rt.cfg.settings,
+                risk=rt.cfg.risk,
+                cfg=BacktestSettings(start=first, end=last, feed=cast(Feed, chosen)),
+                progress=progress,
+            )
+        reports = rt.cfg.path(rt.cfg.settings.storage.reports_dir)
+        md, table = report.write(result, reports, cache_dir)
+        typer.echo(f"report: {md}\nsignals: {table}")
 
 
 @app.command()
@@ -389,6 +636,7 @@ async def _halt(root: Path, books: list[Literal["A", "B"]], *, flatten: bool, so
                     clock=rt.clock,
                     deadline=rt.clock.now() + dt.timedelta(seconds=FLATTEN_TIMEOUT_S),
                     hours=hours,
+                    purpose="manual",
                     heartbeat=beat,
                 )
             finally:
@@ -400,8 +648,10 @@ async def _halt(root: Path, books: list[Literal["A", "B"]], *, flatten: bool, so
             held = ", ".join(f"{s} {q}" for s, q in sorted(result.remaining.items()))
             if result.market_closed:
                 stops = ", ".join(f"{s} @ {p}" for s, p in sorted(result.protected.items()))
-                typer.echo(f"Book {book}: market closed, nothing sold. Still held: {held}. "
-                           f"GTC stops: {stops or 'none placed'}.")  # fmt: skip
+                typer.echo(
+                    f"Book {book}: market closed, nothing sold. Still held: {held}. "
+                    f"GTC stops: {stops or 'none placed'}."
+                )
             else:
                 typer.echo(f"Book {book}: NOT flat after {FLATTEN_TIMEOUT_S:.0f} s: {held}.")
             failed.append(book)
@@ -546,6 +796,7 @@ def _run(job: Coroutine[Any, Any, None]) -> None:
     from trader.data.alpaca_rest import AlpacaError
     from trader.data.edgar import EdgarError
     from trader.execution.broker import BrokerError
+    from trader.orchestrator.lock import RunLockError
     from trader.risk.breakers import HaltError
     from trader.risk.ledger import LedgerError
 
@@ -562,6 +813,7 @@ def _run(job: Coroutine[Any, Any, None]) -> None:
         NotATradingDayError,
         HaltError,
         LedgerError,
+        RunLockError,
         ValueError,
     ) as exc:
         typer.echo(f"error: {exc}", err=True)

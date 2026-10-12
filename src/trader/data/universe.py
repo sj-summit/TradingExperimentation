@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict
 from trader.config import UniverseConfig
 from trader.core.calendar import TradingCalendar
 from trader.core.clock import REGULAR_OPEN, et_datetime
+from trader.core.ids import is_ticker
 from trader.core.models import Asset, Bar, Split
 from trader.data.alpaca_rest import Adjustment, Feed, Timeframe
 from trader.data.indicators import PERIOD, adv, atr, or_vol_avg
@@ -115,9 +116,13 @@ class UniverseBuilder:
         calendar: TradingCalendar,
         universe: UniverseConfig,
         feed: Feed,
+        include_inactive: bool = False,
     ) -> None:
+        """``include_inactive`` keeps delisted and untradable assets: the backtest needs them to
+        avoid survivorship bias (DECISIONS D-042); the live universe never does."""
         self._data, self._journal, self._calendar = data, journal, calendar
         self._universe, self._feed = universe, feed
+        self._include_inactive = include_inactive
 
     async def build(
         self, t: dt.date, *, persist: bool = True
@@ -215,12 +220,14 @@ class UniverseBuilder:
     def _asset_exclusion(self, asset: Asset) -> str | None:
         if asset.asset_class != "us_equity":
             return "asset_class"
-        if asset.status != "active" or not asset.tradable:
+        if not self._include_inactive and (asset.status != "active" or not asset.tradable):
             return "not_tradable"
         if asset.exchange not in self._universe.exchanges:
             return "exchange"
         if any(ch in asset.symbol for ch in self._universe.exclude_symbol_chars):
             return "symbol_chars"
+        if not is_ticker(asset.symbol):
+            return "not_a_ticker"
         return None
 
     def _features(

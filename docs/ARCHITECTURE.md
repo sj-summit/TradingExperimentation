@@ -80,7 +80,7 @@ Times are config defaults. On **early-close days**:
 |---|---|---|---|
 | 07:30 | Universe refresh (if not done the night before) | — | assets, SIP daily bars → ATR14/ADV14, corporate actions, OR baselines, EDGAR ticker map |
 | 08:25 | Process start (OS scheduler) | — | Exit cleanly if not a trading day |
-| 08:30 | Boot | A, B | `doctor --quick`; clock skew; reconcile both accounts (must be flat with no open orders, else P1 and flatten at 09:30:05); connect the news stream; load ledgers; set E and S |
+| 08:30 | Boot | A, B | boot's own checks (not `doctor --quick`); clock skew; the universe if missing; the t−1 regime tags; reconcile each account: today's journal explains a restart, anything else is a P1 and a flatten at max(now, 09:30:05); seed (first use, flat account only) or load the ledgers; set E; start the kill switch, heartbeat, alert pump and stream; write `boot.json` (DECISIONS D-048). The news stream joins in Phase 4 |
 | 09:00 | Pre-market scan | — | top gainers among eligible (Alpaca movers endpoint if available on the plan, else IEX snapshots); news (last 18 h); EDGAR flags; up to 40 candidates |
 | 09:05 | Claude pre-market brief | B | deadline 09:28 (STRATEGY.md §5.2) |
 | 09:29 | Subscribe the stream to regime symbols (SPY, QQQ, IWM) | — | |
@@ -91,19 +91,21 @@ Times are config defaults. On **early-close days**:
 | continuous | Reconciliation every 60 s; R-020 stop-leg checks every 5 s; heartbeat every 10 s | A, B | |
 | last_entry (15:30) | Stop arming new entries; cancel unfilled entries | A, B | |
 | flatten (15:55) | Cancel all orders; close all positions; verify flat by close − 2 min | A, B | |
-| 16:05 | EOD reconcile: broker activities ↔ journal; ledger settlement entries; daily stats | A, B | |
+| 16:05 | EOD per book: reconcile; final decisions; trades; daily stats; breakers (cash check, drawdown, losing streak) | A, B | each step marked in `day_runs`, so a restart skips it (D-048) |
 | 16:12 | Shadow outcomes (SIP 1-min bars; the 15:55 bar is > 15 min old from about 16:11; retry for up to 5 min) | — | STRATEGY.md §7.2 |
 | 16:15 | Claude post-close review → signal reviews, process issues, notes, lesson proposals (each to its own table) | B | 10 min first attempt; repair only if it can finish by 16:29, else `daily_reviews.status = missing` and the report says so |
 | 16:30 | Reports (MD and HTML), notifications, DB backup, recordings finalized | — | then exit |
 
 ### Late start and partial days
 
-- **Started after 09:36:30:** no signals today. Run monitor + EOD only; P2 incident `late_start`.
-- **Started after the flatten time:** EOD tasks only.
+- **Started after 09:36:30:** nothing is armed today. The scan still runs and saves its rows `not_armed` (flag `late_start`), so shadow outcomes keep the day. Monitor and EOD as usual; P2 incident `late_start` (D-040, D-048).
+- **Started after the flatten time:** the end of the day only. A book still holding positions is flattened first (FLATTEN), then EOD.
 - **Crash restart mid-day:**
-  1. Reconcile first.
-  2. Re-arm only signals that are still `armed` and untriggered, if before `last_entry`.
-  3. Never re-trigger a signal that already has orders.
+  1. Reconcile first. Positions today's journal explains are adopted, with no P1.
+  2. The saved scan is loaded, not refetched. Re-arm only signals that are still `armed` and have no orders, if before `last_entry`, with a fresh arm check.
+  3. Never re-trigger a signal that already has orders. A triggered signal a book never decided is served again before `last_entry`, and gets `restart_lost` after it.
+  4. EOD steps already marked done in `day_runs` are skipped.
+- **A finished session** (`trading_days.run_status = DONE`) is never run again.
 
 ---
 
@@ -165,13 +167,17 @@ class MarketDataHub:                          # the single WebSocket
   - Recent filings from `https://data.sec.gov/submissions/CIK##########.json`.
   - Flags these forms: `S-1, S-1/A, S-3, S-3ASR, F-1, F-3, 424B1–424B5, 424B7, 8-K (items), 6-K, DEF 14A, 10-Q, 10-K`.
 - **`Recorder`:** per-day `runtime/recordings/YYYY-MM-DD/`:
-  - stream events → `stream.jsonl.gz`
+  - stream events, each with its receive time `rx` → `stream.jsonl.gz`
+  - every market-data REST call after boot (arguments, result or error, start and end `rx`) → `rest.jsonl.gz`
+  - each book's broker calls and trade updates (parsed models, no raw payloads) → `broker-A.jsonl.gz`, `broker-B.jsonl.gz`
+  - each book's ledger, halts and state at boot, a calendar slice, and the config hashes and git SHA → `boot.json` (`boot-2.json` after a restart)
   - OR scan response → `or_scan.parquet`
   - universe snapshot → `universe.parquet`
   - news → `news.jsonl.gz`
   - LLM context packs and envelopes are referenced by path from `llm_calls`
 
   This is enough for `trader replay` to reproduce the day deterministically.
+- **Replay** (`data/replay.py`, DECISIONS D-047): `RecordingMarketData` wraps the REST client while live and `ReplayMarketData` serves the recording back (matched by call and occurrence, after the recorded duration); `RecordingBroker` (`execution/recording.py`) records a book's broker traffic; `ReplayHub` plays the stream by `rx` through the live hub's own `HubState`. Hub taps run synchronously at publish time.
 
 ### 4.3 strategy
 
@@ -202,8 +208,11 @@ class LlmFilteredBook(Book): ...     # STRATEGY.md §5; consults VerdictStore, d
 ```
 taken, entered_after_wait, capacity_positions, capacity_entries, insufficient_settled_cash,
 qty_zero, chased, chased_after_wait, missed_at_arm, entry_unfilled, vetoed, vet_timeout,
-llm_unavailable, llm_degraded, day_mode_no_trade, book_halted, risk_gate:<R-xxx>
+llm_unavailable, llm_degraded, day_mode_no_trade, book_halted, risk_gate:<R-xxx>,
+broker_rejected, restart_lost
 ```
+
+Decisions are append-only: an outcome row (`entry_unfilled`, `broker_rejected`, `restart_lost`) is added only when it differs from the latest one, and the `final_decisions` view holds the latest per signal and book (DECISIONS D-044).
 
 ### 4.5 risk
 
@@ -292,8 +301,11 @@ class LLMResult(Generic[T]):
   BOOT → PREMARKET → OR_SCAN → TRADING → FLATTEN → EOD → REVIEW → REPORT → DONE
   ```
 
-  - Every state transition is journaled.
+  - Every state transition is journaled in `day_runs` (kind `state`) and `trading_days.run_status`; finished EOD steps are `day_runs` rows of kind `step`.
   - Each task has a deadline. A missed deadline follows the fallback in STRATEGY.md and RISK.md.
+  - A state that fails before the flatten is a P2 and falls through to FLATTEN and EOD: closed for entries, open for exits.
+  - The modules: `plan.py` (the timeline), `day.py` (the machine), `eod.py`, `tasks.py` (heartbeat, staleness, subscriptions), `inputs.py` (the gate's network inputs), `lock.py`, `live.py` (the `run-day` wiring), `simdrive.py` (drives a SimClock), `ports.py`. Details in DECISIONS D-048.
+- **`run-day` modes:** paper (records everything for replay; `runtime/run-day.lock` keeps a second engine away); `--sim` (live data, a SimBroker per book, everything under `runtime/sim/<date>/`, alerts prefixed `[SIM]`); `--dry-run` (boot's checks, read-only, and the timeline).
 - **`watchdog.py`:** RISK.md §6.
 
 ### 4.10 reports and notify
@@ -317,7 +329,7 @@ class LLMResult(Generic[T]):
 | `universe build [--date]` / `universe or-baseline` | Daily features, OR baselines | — |
 | `stream --symbols … --minutes N` | Dev: print live bars | — |
 | `run-day [--books A,B] [--sim] [--dry-run]` | The full day | HUMAN GATE until Phase 6 |
-| `replay --date D [--speed N]` | Recorded day through SimBroker and SimClock | — |
+| `replay --date D [--speed N]` | Recorded day through the real engine on SimClock, with recorded market data and broker answers; compares with the journal (D-049). `--speed` is deferred | — |
 | `backtest --start --end` | Rules-only ORB on historical SIP | — |
 | `report daily\|weekly\|evaluation` | Reports | — |
 | `lessons evaluate [--promote]` | Weekly job | — |
@@ -451,7 +463,8 @@ CREATE TABLE risk_checks (id INTEGER PRIMARY KEY, signal_id TEXT, book TEXT, app
 CREATE TABLE orders (client_order_id TEXT PRIMARY KEY, broker_order_id TEXT, book TEXT, signal_id TEXT,
   symbol TEXT, side TEXT, type TEXT, order_class TEXT, qty INTEGER, limit_price TEXT, stop_price TEXT,
   parent_client_order_id TEXT, status TEXT, submitted_at TEXT, updated_at TEXT, raw_json TEXT,
-  group_id TEXT);   -- group_id: from 0003, ties an OTO leg to its entry (D-030)
+  group_id TEXT,    -- group_id: from 0003, ties an OTO leg to its entry (D-030)
+  purpose TEXT);    -- purpose: from 0004, why a sell exists (stop_leg, eod_flatten, ...; D-040)
 CREATE TABLE fills (id TEXT PRIMARY KEY, broker_order_id TEXT, book TEXT, symbol TEXT, side TEXT,
   qty INTEGER, price TEXT, filled_at TEXT, raw_json TEXT);
 CREATE TABLE trades (id TEXT PRIMARY KEY, book TEXT, signal_id TEXT, symbol TEXT, qty INTEGER,
@@ -459,7 +472,8 @@ CREATE TABLE trades (id TEXT PRIMARY KEY, book TEXT, signal_id TEXT, symbol TEXT
   pnl TEXT, r_multiple REAL, fees_est TEXT, entry_slippage TEXT, entry_delay_ms INTEGER, eval_epoch INTEGER);
 CREATE TABLE shadow_outcomes (signal_id TEXT PRIMARY KEY REFERENCES signals(id), entry_price TEXT,
   exit_price TEXT, exit_reason TEXT, shadow_r REAL, mfe_r REAL, mae_r REAL, minutes_held INTEGER,
-  path_source TEXT, computed_at TEXT);
+  path_source TEXT, computed_at TEXT,
+  trigger_ts TEXT, sip_only_trigger INTEGER);   -- from 0004: the SIP trigger minute; live feed never triggered
 CREATE TABLE llm_calls (id TEXT PRIMARY KEY, date TEXT, role TEXT, model_alias TEXT, model_resolved TEXT,
   prompt_sha256 TEXT, schema_sha256 TEXT, started_at TEXT, ended_at TEXT, duration_ms INTEGER,
   exit_code INTEGER, is_error INTEGER, num_turns INTEGER, cost_estimate_usd REAL, schema_valid INTEGER,
@@ -494,9 +508,15 @@ CREATE TABLE review_notes (id INTEGER PRIMARY KEY, first_raised TEXT, last_raise
   note TEXT, status TEXT, human_response TEXT, decided_at TEXT,
   last_llm_call_id TEXT);                                          -- status: open | accepted | rejected | done
 CREATE TABLE incidents (id INTEGER PRIMARY KEY, ts TEXT, severity TEXT, component TEXT, code TEXT,
-  message TEXT, detail_json TEXT, resolved_at TEXT, acknowledged_by TEXT);
+  message TEXT, detail_json TEXT, resolved_at TEXT, acknowledged_by TEXT,
+  alerted_at TEXT);   -- alerted_at: from 0004, set once a P1/P2 has been pushed (D-040)
 CREATE TABLE book_state (book TEXT PRIMARY KEY, halted INTEGER, halt_reason TEXT, halted_at TEXT,
-  peak_equity TEXT, consecutive_losing_days INTEGER, updated_at TEXT);   -- halted/halt_reason: a summary of halts
+  peak_equity TEXT, consecutive_losing_days INTEGER, updated_at TEXT,   -- halted/halt_reason: a summary of halts
+  streak_through TEXT);   -- from 0004: the last session counted in consecutive_losing_days
+CREATE TABLE regime_daily (date TEXT PRIMARY KEY, spy_close TEXT, spy_sma20 TEXT, spy_trend TEXT,   -- from 0004
+  spy_atr_pct REAL, tercile_low REAL, tercile_high REAL, vol_bucket TEXT, computed_at TEXT);
+CREATE TABLE day_runs (id INTEGER PRIMARY KEY, date TEXT NOT NULL, kind TEXT NOT NULL,   -- from 0004
+  name TEXT NOT NULL, at TEXT NOT NULL, detail TEXT);   -- kind: state (a transition log) | step (an EOD step done)
 CREATE TABLE halts (id INTEGER PRIMARY KEY, book TEXT NOT NULL, reason TEXT NOT NULL,    -- from 0003 (D-036)
   scope TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL, expires_at TEXT,           -- scope: until_resume | session | marker
   cleared_at TEXT, cleared_by TEXT);
@@ -508,6 +528,13 @@ CREATE INDEX ix_decisions_signal ON decisions(signal_id);
 CREATE INDEX ix_trades_book_date ON trades(book, entry_ts);
 CREATE INDEX ix_signal_reviews_date ON signal_reviews(date);
 CREATE INDEX ix_news_created ON news(created_at);
+CREATE INDEX ix_day_runs_date ON day_runs(date, kind);                              -- from 0004
+CREATE UNIQUE INDEX ux_day_runs_step ON day_runs(date, name) WHERE kind = 'step';  -- each EOD step once
+CREATE INDEX ix_decisions_signal_book ON decisions(signal_id, book, id);
+CREATE VIEW final_decisions AS          -- decisions are append-only; this is the latest per (signal, book)
+  SELECT d.* FROM decisions d
+  WHERE d.id = (SELECT MAX(d2.id) FROM decisions d2
+                WHERE d2.signal_id = d.signal_id AND d2.book = d.book);
 ```
 
 ---
@@ -669,7 +696,7 @@ Per-role contents:
 ## 11. Observability
 
 - **Logs:** structlog JSON to `runtime/logs/YYYY-MM-DD.jsonl` plus a pretty console. Every log line carries `book`, `signal_id`, and `client_order_id` where relevant.
-- **Heartbeat:** `runtime/heartbeat.json` every 10 s, with `{ts, state, books:{A:{halted,positions},B:{…}}, hub_age_s}`.
+- **Heartbeat:** `runtime/heartbeat.json` every 10 s, written atomically, with `{ts, state, books:{A:{halted, halts, positions:{symbol: qty}},B:{…}}, hub_age_s}`.
 - **Incidents:** the `incidents` table, with alerts per RISK.md §11.
 - **Reports:** `runtime/reports/YYYY-MM-DD.{md,html}` and `weekly-YYYY-WW.{md,html}`.
 

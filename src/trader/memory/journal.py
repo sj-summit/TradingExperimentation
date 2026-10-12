@@ -4,6 +4,10 @@ Every write goes through one asyncio queue drained by one task, which runs it in
 transaction on a dedicated thread that owns the only write connection. WAL mode lets the
 separate query-only reader connection proceed concurrently. Money is stored as Decimal text and
 time as ISO-8601 with offset, converted explicitly by the helpers below (no global adapters).
+
+``inline=True`` runs every read and write on the event loop thread instead (DECISIONS D-047):
+replay and scenario tests then need no real time for thread work, and which task resumes first
+can't depend on the operating system's scheduling.
 """
 
 import asyncio
@@ -166,8 +170,9 @@ class Journal:
     journal entries are never dropped.
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, inline: bool = False) -> None:
         self.path = path
+        self.inline = inline
         self._writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="journal-writer")
         self._reader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="journal-reader")
         self._queue: asyncio.Queue[_WriteOp | None] = asyncio.Queue()
@@ -178,8 +183,12 @@ class Journal:
         self._busy = 0
 
     @classmethod
-    async def open(cls, path: Path) -> Self:
-        journal = cls(path)
+    async def open(cls, path: Path, *, inline: bool = False) -> Self:
+        journal = cls(path, inline=inline)
+        if inline:
+            journal._write_conn = open_database(path)
+            journal._read_conn = _connect_reader(path)
+            return journal
         loop = asyncio.get_running_loop()
         journal._write_conn = await loop.run_in_executor(journal._writer, open_database, path)
         journal._read_conn = await loop.run_in_executor(journal._reader, _connect_reader, path)
@@ -203,6 +212,10 @@ class Journal:
         """Run ``fn`` on the writer thread inside one transaction; returns after COMMIT."""
         if self._closed:
             raise JournalClosedError("the journal is closed")
+        if self.inline:
+            result = cast(T, self._transaction(fn))
+            await asyncio.sleep(0)  # still a suspension point, as with the writer thread
+            return result
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         await self._queue.put(_WriteOp(fn, future))
         return cast(T, await future)
@@ -242,7 +255,26 @@ class Journal:
 
         return await self._on_reader(snapshot)
 
+    async def backup(self, dest: Path) -> None:
+        """Copy the whole database to ``dest`` (SQLite's online backup, from the reader: a
+        consistent snapshot while writes go on)."""
+        conn = self._live(self._read_conn)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        def copy() -> None:
+            target = sqlite3.connect(dest)
+            try:
+                conn.backup(target)
+            finally:
+                target.close()
+
+        await self._on_reader(copy)
+
     async def _on_reader[T](self, fn: Callable[[], T]) -> T:
+        if self.inline:
+            result = fn()
+            await asyncio.sleep(0)
+            return result
         self._busy += 1
         try:
             return await asyncio.get_running_loop().run_in_executor(self._reader, fn)
@@ -252,7 +284,7 @@ class Journal:
     @property
     def idle(self) -> bool:
         """No read or write is queued or running (tests wait for this before moving time)."""
-        return self._queue.empty() and not self._busy
+        return self.inline or (self._queue.empty() and not self._busy)
 
     # -- lifecycle
 
@@ -261,6 +293,13 @@ class Journal:
         if self._closed:
             return
         self._closed = True
+        if self.inline:
+            for conn in (self._write_conn, self._read_conn):
+                if conn is not None:
+                    conn.close()
+            self._writer.shutdown(wait=True)
+            self._reader.shutdown(wait=True)
+            return
         await self._queue.put(None)
         if self._task is not None:
             await self._task

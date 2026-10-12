@@ -203,9 +203,11 @@ async def test_an_older_snapshot_never_replaces_a_newer_one(records: Records) ->
 
 
 async def test_exit_and_stop_ids_take_the_next_attempt(records: Records) -> None:
-    first = await records.pending_sell(symbol="XYZ", qty=40, leg="exit")
-    second = await records.pending_sell(symbol="XYZ", qty=40, leg="exit")
-    stop = await records.pending_sell(symbol="XYZ", qty=40, leg="stop", stop_price=D("12.21"))
+    first = await records.pending_sell(symbol="XYZ", qty=40, leg="exit", purpose="manual")
+    second = await records.pending_sell(symbol="XYZ", qty=40, leg="exit", purpose="manual")
+    stop = await records.pending_sell(
+        symbol="XYZ", qty=40, leg="stop", purpose="protective_stop", stop_price=D("12.21")
+    )
     assert (first, second, stop) == (
         "A-20261009-XYZ-exit-1",
         "A-20261009-XYZ-exit-2",
@@ -214,7 +216,7 @@ async def test_exit_and_stop_ids_take_the_next_attempt(records: Records) -> None
 
 
 async def test_mark_settles_only_unconfirmed_orders(records: Records) -> None:
-    cid = await records.pending_sell(symbol="XYZ", qty=40, leg="exit")
+    cid = await records.pending_sell(symbol="XYZ", qty=40, leg="exit", purpose="manual")
     await records.mark(cid, "uncertain")
     await records.mark(cid, "lost")
     row = await records.order(cid)
@@ -225,3 +227,22 @@ async def test_mark_settles_only_unconfirmed_orders(records: Records) -> None:
     entry = await records.order("A-20261009-XYZ-entry-1")
     assert entry is not None
     assert entry.status == "filled"
+
+
+async def test_every_sell_says_why_and_carries_the_entry_signal(
+    records: Records, journal: Journal
+) -> None:
+    signal = "20261009-XYZ-orb5"
+    entry = order(
+        status="filled", filled_qty=40, filled_avg_price=D("12.33"), legs=(leg(status="new"),)
+    )
+    await records.apply(entry, signal_id=signal)
+    await records.pending_sell(symbol="XYZ", qty=40, leg="exit", purpose="eod_flatten")
+    await records.pending_sell(symbol="ABC", qty=1, leg="exit", purpose="manual")  # no entry
+    rows = await journal.fetch_all("SELECT client_order_id, purpose, signal_id FROM orders")
+    assert {r["client_order_id"]: (r["purpose"], r["signal_id"]) for r in rows} == {
+        "A-20261009-XYZ-entry-1": (None, signal),
+        "alpaca-generated": ("stop_leg", signal),
+        "A-20261009-XYZ-exit-1": ("eod_flatten", signal),
+        "A-20261009-ABC-exit-1": ("manual", None),
+    }

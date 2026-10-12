@@ -24,7 +24,8 @@ from trader.core.calendar import DayTimes
 from trader.core.clock import fmt_iso
 from trader.core.events import Event
 from trader.core.models import Asset, OrderIntent, RiskCheck
-from trader.execution.orders import MIN_STOP_GAP, valid_price
+from trader.core.prices import valid_price
+from trader.execution.orders import MIN_STOP_GAP
 from trader.memory.journal import Journal
 from trader.risk import caps
 

@@ -4,12 +4,18 @@ Trades, quotes and minute bars for at most ``stream_symbol_limit`` symbols are p
 out to consumer queues, and kept as "latest" per symbol for freshness checks (R-016). After a
 reconnect, missed minute bars are backfilled over REST and published with
 ``source="backfill"``.
+
+``HubState`` holds what a hub knows and whom it tells; the replay hub (``data/replay.py``) uses
+the same class, so live and replayed days behave alike. Taps are called synchronously at publish
+time (DECISIONS D-047): the recorder stamps each event's receive time there, and SimBroker sees
+each event at the instant it arrives.
 """
 
 import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Any, Literal
 
 import structlog
@@ -17,12 +23,21 @@ from pydantic import BaseModel, ConfigDict
 
 from trader.core.clock import Clock, parse_et_iso
 from trader.core.models import Bar, Quote, Trade
-from trader.data.ws import STOCK_STREAM_URL, AlpacaStream, WsConnector, websockets_connector
+from trader.data.conditions import counts_for_price
+from trader.data.ws import (
+    STOCK_STREAM_URL,
+    AlpacaStream,
+    StreamError,
+    WsConnector,
+    websockets_connector,
+)
 
 log = structlog.get_logger(__name__)
 
 StreamFeed = Literal["iex", "sip", "test"]
-CHANNELS = ("trades", "quotes", "bars")
+Channel = Literal["trades", "quotes", "bars"]
+CHANNELS: tuple[Channel, ...] = ("trades", "quotes", "bars")
+TRADING_CHANNELS: tuple[Channel, ...] = ("trades", "quotes")  # run-day needs no bars (D-048)
 Backfill = Callable[[Sequence[str], datetime, datetime], Awaitable[Mapping[str, Sequence[Bar]]]]
 
 
@@ -44,6 +59,74 @@ class SubscriptionLimitError(ValueError):
     """More symbols than the plan's stream limit (30 on the free plan)."""
 
 
+Tap = Callable[[MarketEvent], None]
+PRICE_MAX_AGE_S = 60.0  # an older last trade is no price at all: callers use the broker's
+
+
+class HubState:
+    """What a hub knows (latest trade and quote, event ages) and whom it tells (consumer
+    queues and synchronous taps)."""
+
+    def __init__(self, clock: Clock) -> None:
+        self._clock = clock
+        self._consumers: list[asyncio.Queue[MarketEvent]] = []
+        self._taps: list[Tap] = []
+        self._last_trade: dict[str, Trade] = {}
+        self._last_quote: dict[str, Quote] = {}
+        self._priced: dict[str, tuple[Trade, datetime]] = {}  # trades that count, when received
+        self._last_seen: dict[str, datetime] = {}
+        self._last_any: datetime | None = None
+
+    def subscribe_consumer(self) -> asyncio.Queue[MarketEvent]:
+        queue: asyncio.Queue[MarketEvent] = asyncio.Queue()
+        self._consumers.append(queue)
+        return queue
+
+    def remove_consumer(self, queue: asyncio.Queue[MarketEvent]) -> None:
+        """Stop feeding a queue nobody reads any more, so it can't grow without bound."""
+        with contextlib.suppress(ValueError):
+            self._consumers.remove(queue)
+
+    def add_tap(self, tap: Tap) -> None:
+        self._taps.append(tap)
+
+    def publish(self, event: MarketEvent, *, seen: bool = True) -> None:
+        now = self._clock.now()
+        if isinstance(event, Trade):
+            self._last_trade[event.symbol] = event
+            if counts_for_price(event):
+                self._priced[event.symbol] = (event, now)
+        elif isinstance(event, Quote):
+            self._last_quote[event.symbol] = event
+        if seen:
+            self._last_seen[event.symbol] = self._last_any = now
+        for tap in list(self._taps):
+            try:
+                tap(event)
+            except Exception:
+                log.exception("hub tap failed")
+        for queue in self._consumers:
+            queue.put_nowait(event)
+
+    def last_trade(self, symbol: str) -> Trade | None:
+        return self._last_trade.get(symbol)
+
+    def last_quote(self, symbol: str) -> Quote | None:
+        return self._last_quote.get(symbol)
+
+    def last_price(self, symbol: str, max_age_s: float = PRICE_MAX_AGE_S) -> Decimal | None:
+        """The latest trade that may set a price (odd lots excluded, D-043), or None once it is
+        older than ``max_age_s``: a stale price must not hide a loss (``PriceSource``)."""
+        found = self._priced.get(symbol)
+        if found is None or (self._clock.now() - found[1]).total_seconds() > max_age_s:
+            return None
+        return found[0].price
+
+    def last_event_age_s(self, symbol: str | None = None) -> float:
+        seen = self._last_any if symbol is None else self._last_seen.get(symbol)
+        return float("inf") if seen is None else (self._clock.now() - seen).total_seconds()
+
+
 class MarketDataHub:
     def __init__(
         self,
@@ -58,15 +141,17 @@ class MarketDataHub:
         connector: WsConnector = websockets_connector,
         silence_s: float = 60.0,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        channels: Sequence[Channel] = CHANNELS,
+        on_stream_error: Callable[[StreamError], None] | None = None,
     ) -> None:
+        """``channels``: what ``set_subscriptions`` asks for unless told otherwise.
+        ``on_stream_error``: server errors no request was waiting for (a 405 on the
+        subscriptions replayed after a reconnect)."""
         self._clock, self._limit, self._backfill = clock, symbol_limit, backfill
+        self._channels = tuple(channels)
         self._symbols: set[str] = set()
-        self._consumers: list[asyncio.Queue[MarketEvent]] = []
-        self._last_trade: dict[str, Trade] = {}
-        self._last_quote: dict[str, Quote] = {}
+        self._state = HubState(clock)
         self._last_bar_ts: dict[str, datetime] = {}
-        self._last_seen: dict[str, datetime] = {}
-        self._last_any: datetime | None = None
         self._task: asyncio.Task[None] | None = None
         self._stream = AlpacaStream(
             url=STOCK_STREAM_URL.format(feed=feed),
@@ -76,6 +161,7 @@ class MarketDataHub:
             clock=clock,
             on_data=self._on_data,
             on_connected=self._on_connected,
+            on_error=on_stream_error,
             connector=connector,
             should_be_busy=lambda: bool(self._symbols) and market_open(clock.now()),
             silence_s=silence_s,
@@ -111,8 +197,11 @@ class MarketDataHub:
 
     # ---------------------------------------------------------------- subscriptions
 
-    async def set_subscriptions(self, symbols: Iterable[str]) -> dict[str, list[str]]:
-        """Stream trades, quotes and bars for exactly ``symbols``; returns the server's ack.
+    async def set_subscriptions(
+        self, symbols: Iterable[str], *, channels: Sequence[Channel] | None = None
+    ) -> dict[str, list[str]]:
+        """Stream ``channels`` (default: the hub's) for exactly ``symbols``; every other
+        channel is dropped. Returns the server's ack.
 
         Raises SubscriptionLimitError above ``stream_symbol_limit`` without asking the server,
         and StreamError when the server rejects the change (its previous set stays).
@@ -122,28 +211,42 @@ class MarketDataHub:
             raise SubscriptionLimitError(
                 f"{len(wanted)} symbols exceeds the limit of {self._limit}"
             )
-        acked = await self._stream.update({channel: wanted for channel in CHANNELS})
+        chosen = self._channels if channels is None else tuple(channels)
+        acked = await self._stream.update(
+            {channel: wanted if channel in chosen else set() for channel in CHANNELS}
+        )
         self._symbols = wanted
         return acked
 
     def subscribe_consumer(self) -> asyncio.Queue[MarketEvent]:
         """A queue that receives every event from now on."""
-        queue: asyncio.Queue[MarketEvent] = asyncio.Queue()
-        self._consumers.append(queue)
-        return queue
+        return self._state.subscribe_consumer()
+
+    def remove_consumer(self, queue: asyncio.Queue[MarketEvent]) -> None:
+        self._state.remove_consumer(queue)
+
+    def add_tap(self, tap: Tap) -> None:
+        """Call ``tap`` synchronously for every event, before any consumer queue sees it."""
+        self._state.add_tap(tap)
 
     # ---------------------------------------------------------------- state
 
     def last_trade(self, symbol: str) -> Trade | None:
-        return self._last_trade.get(symbol)
+        return self._state.last_trade(symbol)
 
     def last_quote(self, symbol: str) -> Quote | None:
-        return self._last_quote.get(symbol)
+        return self._state.last_quote(symbol)
+
+    def last_price(self, symbol: str, max_age_s: float = PRICE_MAX_AGE_S) -> Decimal | None:
+        return self._state.last_price(symbol, max_age_s)
 
     def last_event_age_s(self, symbol: str | None = None) -> float:
         """Seconds since the last event for ``symbol`` (any symbol if None); inf if none yet."""
-        seen = self._last_any if symbol is None else self._last_seen.get(symbol)
-        return float("inf") if seen is None else (self._clock.now() - seen).total_seconds()
+        return self._state.last_event_age_s(symbol)
+
+    @property
+    def symbols(self) -> frozenset[str]:
+        return frozenset(self._symbols)
 
     @property
     def disconnected_since(self) -> datetime | None:
@@ -176,7 +279,6 @@ class MarketDataHub:
                 size=int(message["s"]),
                 conditions=tuple(message.get("c") or ()),
             )
-            self._last_trade[symbol] = event
         elif kind == "q":
             event = Quote(
                 symbol=symbol,
@@ -186,7 +288,6 @@ class MarketDataHub:
                 ask=message["ap"],
                 ask_size=int(message["as"]),
             )
-            self._last_quote[symbol] = event
         elif kind in ("b", "u"):
             bar = Bar(
                 ts=parse_et_iso(message["t"]),
@@ -202,9 +303,7 @@ class MarketDataHub:
             self._note_bar(symbol, bar.ts)
         else:
             return  # statuses, LULD bands, corrections: not used yet
-        now = self._clock.now()
-        self._last_seen[symbol] = self._last_any = now
-        self._publish(event)
+        self._state.publish(event)
 
     async def _on_connected(self, first: bool) -> None:
         """After a reconnect, fill the gap with REST minute bars the stream never sent."""
@@ -219,7 +318,8 @@ class MarketDataHub:
                 last = self._last_bar_ts.get(symbol)
                 if last is None or bar.ts > last:
                     self._note_bar(symbol, bar.ts)
-                    self._publish(BarEvent(symbol=symbol, bar=bar, source="backfill"))
+                    backfilled = BarEvent(symbol=symbol, bar=bar, source="backfill")
+                    self._state.publish(backfilled, seen=False)
                     published += 1
         log.info("stream backfilled", since=since.isoformat(), bars=published)
 
@@ -227,7 +327,3 @@ class MarketDataHub:
         last = self._last_bar_ts.get(symbol)
         if last is None or ts > last:
             self._last_bar_ts[symbol] = ts
-
-    def _publish(self, event: MarketEvent) -> None:
-        for queue in self._consumers:
-            queue.put_nowait(event)

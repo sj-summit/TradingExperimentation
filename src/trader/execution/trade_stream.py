@@ -77,9 +77,12 @@ class AlpacaTradeStream:
                 log.error("trade stream refused", url=self._url, reason=str(exc))
                 return
             except (WsClosed, TimeoutError, ValueError) as exc:
-                log.warning(
-                    "trade stream disconnected", url=self._url, reason=str(exc) or "timeout"
-                )
+                if self._stop.is_set():  # our own close at the end of the day (D-039)
+                    log.info("trade stream closed", url=self._url)
+                else:
+                    log.warning(
+                        "trade stream disconnected", url=self._url, reason=str(exc) or "timeout"
+                    )
             finally:
                 await self._closed(conn)
             if self._stop.is_set():

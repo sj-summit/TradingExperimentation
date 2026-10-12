@@ -11,6 +11,7 @@ from typing import Any
 from tests.fixtures.exec_harness import NEXT_OPEN, TIMES, Harness
 from trader.core.clock import ET, SimClock
 from trader.core.models import OrderIntent
+from trader.execution import service as service_module
 from trader.execution.broker import Order
 from trader.execution.sim_broker import SimBroker
 from trader.risk.killswitch import KillSwitch
@@ -30,6 +31,17 @@ async def running(tmp_path: Path, **options: Any) -> AsyncIterator[Harness]:
 
 async def reasons(h: Harness, book: str = "A") -> list[str]:
     return [halt.reason for halt in await h.halts.active(book)]
+
+
+async def sells(h: Harness) -> dict[str, tuple[str | None, str | None]]:
+    """client_order_id -> (purpose, signal_id) of every sell journaled (D-044)."""
+    rows = await h.journal.fetch_all(
+        "SELECT client_order_id, purpose, signal_id FROM orders WHERE side = 'sell'"
+    )
+    return {r["client_order_id"]: (r["purpose"], r["signal_id"]) for r in rows}
+
+
+SIGNAL = "20261009-XYZ-orb5"
 
 
 # ---------------------------------------------------------------- the basic paths
@@ -142,6 +154,8 @@ async def test_a_rejected_stop_leg_is_replaced_by_a_standalone_stop(tmp_path: Pa
         assert await h.working_stops() == [(40, D("12.21"), "new")]
         assert await h.status("A-20261009-XYZ-stop-1") == "new"
         assert ("P1", "unprotected_position") not in await h.incidents()
+        tagged = await sells(h)
+        assert tagged["A-20261009-XYZ-stop-1"] == ("protective_stop", SIGNAL)
 
 
 async def test_already_through_the_stop_means_sell_now(tmp_path: Path) -> None:
@@ -154,6 +168,7 @@ async def test_already_through_the_stop_means_sell_now(tmp_path: Path) -> None:
         assert await h.held() == {}
         assert await h.status("A-20261009-XYZ-exit-1") == "filled"
         assert await h.status("A-20261009-XYZ-stop-1") is None
+        assert (await sells(h))["A-20261009-XYZ-exit-1"] == ("stop_breached", SIGNAL)
 
 
 # ---------------------------------------------------------------- uncertain submits (D-033)
@@ -235,7 +250,7 @@ async def test_kill_during_a_submit_in_flight_is_flat_within_10_s(tmp_path: Path
         await h.settle()  # the submit is in flight
 
         async def flatten() -> bool:
-            return (await h.service.flatten()).flat
+            return (await h.service.flatten(purpose="kill_switch")).flat
 
         kill = KillSwitch(
             tmp_path / "KILL", halts=h.halts, clock=h.clock, books=("A",), flatten=flatten
@@ -274,11 +289,44 @@ async def test_flatten_at_1555_is_flat_well_before_1558(tmp_path: Path) -> None:
         await h.enter()
         await h.advance(3300, step=30)  # quietly to 15:55
         assert await h.held() == {"XYZ": 40}
-        flattening = asyncio.create_task(h.service.flatten(deadline=TIMES.flat_by))
+        flattening = asyncio.create_task(
+            h.service.flatten(purpose="eod_flatten", deadline=TIMES.flat_by)
+        )
         while not flattening.done():
             await h.advance(0.5)
         assert (await flattening).flat
         assert h.clock.now() < TIMES.flat_by
+        tagged = await sells(h)
+        assert tagged["A-20261009-XYZ-exit-1"] == ("eod_flatten", SIGNAL)
+        assert sorted(purpose for purpose, _ in tagged.values()) == ["eod_flatten", "stop_leg"]
+
+
+async def test_flattens_run_one_at_a_time(tmp_path: Path, monkeypatch: Any) -> None:
+    async with running(tmp_path) as h:
+        h.quote("12.30", "12.32")
+        await h.enter()
+        await h.advance(2)
+        active = peak = 0
+        real = service_module.flatten_account
+
+        async def counting(*args: Any, **kwargs: Any) -> Any:
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            try:
+                return await real(*args, **kwargs)
+            finally:
+                active -= 1
+
+        monkeypatch.setattr(service_module, "flatten_account", counting)
+        kill = asyncio.create_task(h.service.flatten(purpose="kill_switch"))
+        eod = asyncio.create_task(h.service.flatten(purpose="eod_flatten"))
+        while not (kill.done() and eod.done()):
+            await h.advance(0.5)
+        assert peak == 1  # the second waited for the first
+        assert (await kill).flat
+        assert (await eod).flat  # and found the book already flat
+        assert sorted(p for p, _ in (await sells(h)).values()) == ["kill_switch", "stop_leg"]
 
 
 class Flaky(SimBroker):

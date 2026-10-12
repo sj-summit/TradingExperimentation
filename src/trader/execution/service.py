@@ -10,6 +10,7 @@
 
 import asyncio
 import contextlib
+import json
 import sqlite3
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -44,6 +45,7 @@ from trader.execution.records import (
     OWN_STATUSES,
     BookDay,
     BookedFill,
+    ExitPurpose,
     Records,
     read_book_day,
 )
@@ -84,13 +86,15 @@ async def flatten_account(
     clock: Clock,
     deadline: datetime,
     hours: MarketHours | None,
+    purpose: ExitPurpose,
     heartbeat: Callable[[], Awaitable[object]] | None = None,
     poll_s: float = FLATTEN_POLL_S,
 ) -> FlattenResult:
     """Make the account flat: cancel every order, wait until each is final, re-read the
     positions, sell the shares no order holds, and repeat until flat or ``deadline``.
 
-    The caller has already halted the book, so nothing new is submitted meanwhile.
+    The caller has already halted the book, so nothing new is submitted meanwhile. Every sell
+    it places carries ``purpose`` (D-044).
 
     Outside ``hours`` nothing can be sold (a sell would only queue for the next open), and
     cancelling the stops would leave positions bare. So instead every remaining position gets a
@@ -124,7 +128,7 @@ async def flatten_account(
             return FlattenResult(flat=True)
         for position in held:
             if position.qty > 0 and position.qty_available > 0:  # never sell into a short
-                sold = await _sell(broker, records, clock, position)
+                sold = await _sell(broker, records, clock, position, purpose)
                 if sold is not None:
                     watched.add(sold.id)
         if clock.now() >= deadline:
@@ -134,11 +138,17 @@ async def flatten_account(
 
 
 async def _sell(
-    broker: BrokerAdapter, records: Records, clock: Clock, position: Position
+    broker: BrokerAdapter,
+    records: Records,
+    clock: Clock,
+    position: Position,
+    purpose: ExitPurpose,
 ) -> Order | None:
     """Market-sell the shares no order holds. Resending after an uncertain submit is safe for a
     sell: the account can't short, so a second sell of the same shares is rejected (D-033)."""
-    cid = await records.pending_sell(symbol=position.symbol, qty=position.qty_available, leg="exit")
+    cid = await records.pending_sell(
+        symbol=position.symbol, qty=position.qty_available, leg="exit", purpose=purpose
+    )
     try:
         order = await broker.submit_market_sell(position.symbol, position.qty_available, cid)
     except DuplicateClientOrderId:
@@ -185,7 +195,7 @@ async def _protect_overnight(
         if need <= 0 or stop is None:
             continue
         cid = await records.pending_sell(
-            symbol=position.symbol, qty=need, leg="stop", stop_price=stop
+            symbol=position.symbol, qty=need, leg="stop", purpose="protective_stop", stop_price=stop
         )
         try:
             order = await broker.submit_stop(position.symbol, need, stop, cid, tif="gtc")
@@ -369,6 +379,7 @@ class ExecutionService:
         self._risk, self._day, self._both_books = risk, day, both_books
         self._reconciler = Reconciler(book=book, broker=broker, records=records, journal=journal)
         self._lock = asyncio.Lock()
+        self._flatten_lock = asyncio.Lock()  # one flatten at a time (D-044)
         self._entries: dict[str, _Entry] = {}
         self._view: _View | None = None
         self._bare: dict[str, datetime] = {}  # symbol -> when its unprotected time started
@@ -386,6 +397,7 @@ class ExecutionService:
         self._last_refresh: datetime | None = None
         self._next_reconcile = clock.now()
         self._confirm_at: datetime | None = None
+        self._reported: str | None = None  # the mismatch already reported, until it clears
         self._tasks: list[asyncio.Task[None]] = []
         self.equity_sod = Decimal(0)
 
@@ -578,6 +590,17 @@ class ExecutionService:
             open_order_for_signal=intent is not None and intent.signal_id in open_signals,
         )
 
+    @property
+    def accepting(self) -> bool:
+        """False once a flatten began: the book takes no more entries today (D-044)."""
+        return not (self._closing or self._flattening)
+
+    @property
+    def held(self) -> dict[str, int]:
+        """Shares held per symbol, as the monitor last read them from the broker."""
+        view = self._view
+        return {} if view is None else {s: p.qty for s, p in sorted(view.positions.items())}
+
     async def cancel_entry(self, client_order_id: str) -> bool:
         """Cancel one of our open entries (its OTO leg goes with it). Returns False if the
         broker no longer has it open."""
@@ -597,29 +620,37 @@ class ExecutionService:
 
     # ---------------------------------------------------------------- flatten
 
-    async def flatten(self, *, deadline: datetime | None = None) -> FlattenResult:
+    async def flatten(
+        self, *, purpose: ExitPurpose, deadline: datetime | None = None
+    ) -> FlattenResult:
         """Stop new entries, let submits in flight land, then flatten the book (D-036). A
-        submit that lands after this started cancels its own order."""
+        submit that lands after this started cancels its own order.
+
+        One flatten runs at a time: a second caller (the kill switch, the orchestrator's
+        FLATTEN state, a P1 from the monitor) waits for the first, then runs its own pass,
+        which finds the book flat at once if the first succeeded (D-044)."""
         self._closing = True
-        drain_until = self._clock.now() + timedelta(seconds=SUBMIT_DRAIN_S)
-        while self._in_flight and self._clock.now() < drain_until:
-            await self._clock.sleep_until(self._clock.now() + DRAIN_STEP)
-        self._flattening = True
-        self._flattens += 1
-        try:
-            result = await flatten_account(
-                self._broker,
-                self._records,
-                clock=self._clock,
-                deadline=deadline or self._clock.now() + timedelta(seconds=FLATTEN_TIMEOUT_S),
-                hours=self._day.hours,
-            )
-        finally:
-            self._flattening = False
-            self._last_refresh = None
-        if result.flat:
-            self._bare.clear()
-        return result
+        async with self._flatten_lock:
+            drain_until = self._clock.now() + timedelta(seconds=SUBMIT_DRAIN_S)
+            while self._in_flight and self._clock.now() < drain_until:
+                await self._clock.sleep_until(self._clock.now() + DRAIN_STEP)
+            self._flattening = True
+            self._flattens += 1
+            try:
+                result = await flatten_account(
+                    self._broker,
+                    self._records,
+                    clock=self._clock,
+                    deadline=deadline or self._clock.now() + timedelta(seconds=FLATTEN_TIMEOUT_S),
+                    hours=self._day.hours,
+                    purpose=purpose,
+                )
+            finally:
+                self._flattening = False
+                self._last_refresh = None
+            if result.flat:
+                self._bare.clear()
+            return result
 
     # ---------------------------------------------------------------- the loops
 
@@ -845,10 +876,12 @@ class ExecutionService:
             return
         last = self._prices.last_price(symbol)
         if last is not None and last <= stop:  # R§5 step 1: already through the stop
-            await _sell(self._broker, self._records, self._clock, position)
+            await _sell(self._broker, self._records, self._clock, position, "stop_breached")
             self._last_refresh = None
             return
-        cid = await self._records.pending_sell(symbol=symbol, qty=need, leg="stop", stop_price=stop)
+        cid = await self._records.pending_sell(
+            symbol=symbol, qty=need, leg="stop", purpose="protective_stop", stop_price=stop
+        )
         try:
             order = await self._broker.submit_stop(symbol, need, stop, cid)
         except DuplicateClientOrderId:
@@ -874,7 +907,7 @@ class ExecutionService:
         """No stop in time: flatten, and keep flattening until flat (RISK.md §5). The P1 and
         its halt are recorded once per symbol."""
         if symbol in self._p1_symbols:
-            await self.flatten()
+            await self.flatten(purpose="incident")
             return
         self._p1_symbols.add(symbol)
         await self._p1("unprotected_position", message)
@@ -883,7 +916,7 @@ class ExecutionService:
         """RISK.md §11: a P1 flattens the affected book and halts it until a human resumes."""
         await self._incident("P1", code, message, detail)
         await self._halts.halt(self.book, "p1_incident", detail=message)
-        await self.flatten()
+        await self.flatten(purpose="incident")
 
     async def _incident(
         self, severity: Severity, code: str, message: str, detail: dict[str, object] | None = None
@@ -921,7 +954,7 @@ class ExecutionService:
             self.book, "daily_loss", detail=message, expires_at=self._day.next_open
         )
         await self._incident("P2", "daily_loss_limit", message)
-        await self.flatten()
+        await self.flatten(purpose="daily_loss")
 
     # ---------------------------------------------------------------- reconciliation (D-037)
 
@@ -939,7 +972,7 @@ class ExecutionService:
         found = await self._reconciler.check(since=start)
         self._last_refresh = None
         if found.empty:
-            self._confirm_at = None
+            self._confirm_at = self._reported = None
             return
         if self._confirm_at is None:  # first sighting: look again shortly
             self._confirm_at = now + timedelta(seconds=RECONCILE_CONFIRM_S)
@@ -950,12 +983,19 @@ class ExecutionService:
 
     async def _mismatch(self, found: ReconcileDiff) -> None:
         """RISK.md §5: halt both books. Positions that differ are a P1, which also flattens
-        this book (R§11); orders alone are a P2."""
+        this book (R§11); orders alone are a P2. A mismatch that persists is reported once
+        (D-048), but a position mismatch keeps being flattened until it clears."""
         detail: dict[str, object] = {
             "unknown_positions": found.unknown_positions,
             "qty_mismatches": {s: list(q) for s, q in found.qty_mismatches.items()},
             "unknown_orders": list(found.unknown_orders),
         }
+        key = json.dumps(detail, sort_keys=True)
+        if key == self._reported:
+            if found.positions_differ:
+                await self.flatten(purpose="incident")
+            return
+        self._reported = key
         message = f"Book {self.book} disagrees with the broker: {detail}"
         for book in self._both_books:
             await self._halts.halt(book, "reconcile_mismatch", detail=message)

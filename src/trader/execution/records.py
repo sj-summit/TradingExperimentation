@@ -10,6 +10,8 @@ Every update is one journal transaction (DECISIONS D-033, D-036):
   catch-up can therefore never book a fill twice.
 - **Exit and stop ids** take the next attempt number from the journal, reserved by inserting the
   pending row in the same transaction.
+- **Every sell says why it exists** (``orders.purpose``, DECISIONS D-044) and carries the signal
+  of the entry that bought the shares, so a trade can name its exit reason.
 """
 
 import json
@@ -36,6 +38,17 @@ log = structlog.get_logger(__name__)
 # Our own statuses for orders the broker hasn't confirmed; any broker snapshot replaces them.
 SUBMITTING, UNCERTAIN, LOST = "submitting", "uncertain", "lost"
 OWN_STATUSES = frozenset({SUBMITTING, UNCERTAIN, LOST})
+
+ExitPurpose = Literal[
+    "stop_leg",  # an OTO entry's stop-loss leg
+    "protective_stop",  # a standalone stop for shares without one (D-032), or overnight GTC
+    "stop_breached",  # sold at market because the last price was already through the stop
+    "eod_flatten",
+    "daily_loss",
+    "incident",  # a P1 or a reconcile mismatch
+    "kill_switch",
+    "manual",  # `trader flatten` / `trader halt --flatten`, or the smoke test
+]
 
 
 @dataclass(frozen=True)
@@ -119,24 +132,27 @@ class Records:
         symbol: str,
         qty: int,
         leg: Leg,
+        purpose: ExitPurpose,
         stop_price: Decimal | None = None,
         signal_id: str | None = None,
     ) -> str:
         """Reserve the next ``exit`` or ``stop`` id for ``symbol`` today and journal the sell as
-        ``submitting``; returns its client_order_id."""
+        ``submitting``; returns its client_order_id. Without a ``signal_id`` the sell takes the
+        signal of the book's latest entry in the symbol: the one that bought the shares."""
         now = self._clock.now()
         prefix = client_order_id(self.book, now.date(), symbol, leg, 1).rsplit("-", 1)[0] + "-"
 
         def write(conn: sqlite3.Connection) -> str:
             cid = client_order_id(self.book, now.date(), symbol, leg, _next_attempt(conn, prefix))
+            signal = signal_id or _entry_signal(conn, self.book, symbol)
             conn.execute(
                 "INSERT INTO orders (client_order_id, book, signal_id, symbol, side, type, "
-                "order_class, qty, stop_price, status, submitted_at, updated_at) "
-                "VALUES (?, ?, ?, ?, 'sell', ?, 'simple', ?, ?, ?, ?, ?)",
+                "order_class, qty, stop_price, status, submitted_at, updated_at, purpose) "
+                "VALUES (?, ?, ?, ?, 'sell', ?, 'simple', ?, ?, ?, ?, ?, ?)",
                 (
                     cid,
                     self.book,
-                    signal_id,
+                    signal,
                     symbol,
                     "stop" if leg == "stop" else "market",
                     qty,
@@ -144,6 +160,7 @@ class Records:
                     SUBMITTING,
                     fmt_iso(now),
                     fmt_iso(now),
+                    purpose,
                 ),
             )
             return cid
@@ -421,12 +438,13 @@ def _upsert(
         signal_id = None if found is None else found["signal_id"]
     raw = json.dumps(order.raw, sort_keys=True, default=str)
     updated = fmt_iso(order.updated_at or now)
+    purpose = "stop_leg" if parent_cid is not None and order.side == "sell" else None
     if row is None:
         conn.execute(
             "INSERT INTO orders (client_order_id, broker_order_id, book, signal_id, symbol, "
             "side, type, order_class, qty, limit_price, stop_price, parent_client_order_id, "
-            "status, submitted_at, updated_at, raw_json, group_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "status, submitted_at, updated_at, raw_json, group_id, purpose) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 order.client_order_id,
                 order.id,
@@ -445,6 +463,7 @@ def _upsert(
                 updated,
                 raw,
                 order.group_id,
+                purpose,
             ),
         )
         return
@@ -462,7 +481,8 @@ def _upsert(
         "UPDATE orders SET broker_order_id = ?, status = ?, updated_at = ?, raw_json = ?, "
         "group_id = COALESCE(group_id, ?), "
         "signal_id = COALESCE(signal_id, ?), "
-        "parent_client_order_id = COALESCE(parent_client_order_id, ?) "
+        "parent_client_order_id = COALESCE(parent_client_order_id, ?), "
+        "purpose = COALESCE(purpose, ?) "
         "WHERE client_order_id = ?",
         (
             order.id,
@@ -472,9 +492,20 @@ def _upsert(
             order.group_id,
             signal_id,
             parent_cid,
+            purpose,
             order.client_order_id,
         ),
     )
+
+
+def _entry_signal(conn: sqlite3.Connection, book: str, symbol: str) -> str | None:
+    row = conn.execute(
+        "SELECT signal_id FROM orders WHERE book = ? AND symbol = ? AND side = 'buy' "
+        "AND parent_client_order_id IS NULL AND signal_id IS NOT NULL "
+        "ORDER BY submitted_at DESC LIMIT 1",
+        (book, symbol),
+    ).fetchone()
+    return None if row is None else str(row["signal_id"])
 
 
 def _next_attempt(conn: sqlite3.Connection, prefix: str) -> int:

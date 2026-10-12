@@ -78,7 +78,11 @@ async def hold(sim: SimBroker, records: Records) -> None:
 async def flatten(
     sim: SimBroker, records: Records, clock: SimClock, **kwargs: object
 ) -> FlattenResult:
-    options: dict[str, object] = {"deadline": clock.now() + timedelta(seconds=60), "hours": HOURS}
+    options: dict[str, object] = {
+        "deadline": clock.now() + timedelta(seconds=60),
+        "hours": HOURS,
+        "purpose": "manual",
+    }
     options.update(kwargs)
     return await run_on_clock(
         clock,

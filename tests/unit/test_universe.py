@@ -75,11 +75,12 @@ class FakeMarket:
             asset("NEWB"),
             asset("HALT"),
             asset("SPLT"),
-            asset("SPL2"),
+            asset("SPLX"),
             asset("ETFX", exchange="ARCA"),
             asset("OTCX", exchange="OTC"),
             asset("BRK.B", exchange="NYSE"),
             asset("DEAD", tradable=False),
+            asset("0029900E0"),  # a delisted asset's CUSIP placeholder
         ]
         full = list(SESSIONS)
         self.daily = {
@@ -90,16 +91,16 @@ class FakeMarket:
             "NEWB": daily(full[-10:], *GOOD_DAILY),
             "HALT": daily(full[:-1], *GOOD_DAILY),  # no bar on t-1
             "SPLT": daily(full, *GOOD_DAILY),
-            "SPL2": daily(full, *GOOD_DAILY),
+            "SPLX": daily(full, *GOOD_DAILY),
             "ETFX": daily(full, *GOOD_DAILY),
         }
         self.or_volume: dict[tuple[date, str], int] = {}
         for day in OR_SESSIONS:
-            for symbol in ("GOOD", "SPL2", "ETFX", "SPLT", "THIN", "CALM", "HALT"):
+            for symbol in ("GOOD", "SPLX", "ETFX", "SPLT", "THIN", "CALM", "HALT"):
                 self.or_volume[(day, symbol)] = 3_000
         for day in OR_SESSIONS[::2]:  # IEX printed in the opening range on 7 of 14 sessions
             self.or_volume[(day, "QUIET")] = 2_000
-        self.split_list = [split("SPLT", SESSIONS[-1]), split("SPL2", date(2026, 10, 1))]
+        self.split_list = [split("SPLT", SESSIONS[-1]), split("SPLX", date(2026, 10, 1))]
         self.requests: list[tuple[str, tuple[str, ...], datetime, datetime | None, str, str]] = []
 
     async def assets(self) -> list[Asset]:
@@ -178,14 +179,15 @@ async def test_build_applies_every_rule(tmp_path: Path) -> None:
         "HALT": "stale_prev_close",
         "NEWB": "insufficient_history",
         "QUIET": None,
-        "SPL2": None,  # split inside the window, but not on t or t-1
+        "SPLX": None,  # split inside the window, but not on t or t-1
         "SPLT": "split",
         "THIN": "adv",
     }
-    assert (report.total_assets, report.candidates, report.eligible) == (12, 9, 4)
+    assert (report.total_assets, report.candidates, report.eligible) == (13, 9, 4)
     assert report.excluded == {
         "exchange": 1,
         "symbol_chars": 1,
+        "not_a_ticker": 1,
         "not_tradable": 1,
         "adv": 1,
         "atr": 1,
@@ -193,7 +195,8 @@ async def test_build_applies_every_rule(tmp_path: Path) -> None:
         "stale_prev_close": 1,
         "split": 1,
     }
-    assert set(report.excluded) - {"exchange", "symbol_chars", "not_tradable"} <= set(REASONS)
+    asset_level = {"exchange", "symbol_chars", "not_a_ticker", "not_tradable"}
+    assert set(report.excluded) - asset_level <= set(REASONS)
     assert len(stored) == 9  # one row per candidate; asset-level exclusions are only counted
 
 
@@ -226,7 +229,7 @@ async def test_requests_use_split_adjusted_sip_daily_and_live_feed_or_bars(tmp_p
     or_requests = [r for r in market.requests if r[0] == "5Min"]
     assert len(or_requests) == 14  # one per baseline session
     _, symbols, start, end, feed, adjustment = or_requests[0]
-    assert symbols == ("ETFX", "GOOD", "QUIET", "SPL2")  # only symbols that passed so far
+    assert symbols == ("ETFX", "GOOD", "QUIET", "SPLX")  # only symbols that passed so far
     assert (start.time(), feed, adjustment) == (time(9, 30), "iex", "split")
     assert end is not None
     assert end.time() == time(9, 34, 59)
@@ -252,11 +255,11 @@ async def test_baselines_are_cached_except_after_a_split(tmp_path: Path) -> None
     async with await Journal.open(tmp_path / "trader.db") as journal:
         await builder(market, journal).build(T)
         market.requests.clear()
-        market.or_volume.update({(d, "SPL2"): 6_000 for d in OR_SESSIONS})  # post-split shares
+        market.or_volume.update({(d, "SPLX"): 6_000 for d in OR_SESSIONS})  # post-split shares
         report, rows = await builder(market, journal).build(T)
         stored = await stored_rows(journal)
-    assert five_minute_requests(market) == [("SPL2",)] * 14  # only the split symbol is refetched
-    spl2 = next(row for row in rows if row.symbol == "SPL2")
+    assert five_minute_requests(market) == [("SPLX",)] * 14  # only the split symbol is refetched
+    spl2 = next(row for row in rows if row.symbol == "SPLX")
     assert spl2.or_vol_avg14 == pytest.approx(6_000.0)
     assert len(stored) == 9  # rebuilding replaces the day's rows
     assert report.eligible == 4
@@ -305,7 +308,7 @@ def test_cli_universe_build(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(runtime.AlpacaRest, "from_config", lambda _cfg, _clock: market)
     result = CliRunner().invoke(app, ["--root", str(repo), "universe", "build"])
     assert result.exit_code == 0, result.output
-    assert "universe for 2026-10-09: 12 assets, 9 candidates, 4 eligible" in result.output
+    assert "universe for 2026-10-09: 13 assets, 9 candidates, 4 eligible" in result.output
     assert (repo / "runtime" / "trader.db").is_file()
     snapshot = read_table(repo / "runtime" / "recordings" / "2026-10-09" / "universe.parquet")
     assert len(snapshot) == 9

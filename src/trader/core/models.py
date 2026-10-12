@@ -113,6 +113,65 @@ class Mover(_Frozen):
     price: Decimal
 
 
+# ---------------------------------------------------------------- strategy
+
+SignalDirection = Literal["long", "shadow_short", "none"]
+SignalStatus = Literal["armed", "not_armed", "triggered", "expired", "missed_at_arm"]
+FeatureValue = float | int | str | bool | None
+
+
+class Signal(_Frozen):
+    """One top-20 row of the 09:35 scan (S§3.2, A§5; DECISIONS D-040).
+
+    ``direction`` is ``none`` for a doji (A§5's enum had no value for it). A long starts
+    ``armed``; shorts and dojis are ``not_armed``. Trigger, stop and chase prices are set for
+    longs; a shadow short has a trigger and a stop only (S§7.2.5); a doji has none.
+    ``entry_limit`` is the nominal limit (last = trigger); the real one is priced at submission.
+    ``features`` hold pre-decision data only.
+    """
+
+    id: str
+    date: date
+    symbol: str
+    strategy: Literal["orb5_sip_long"] = "orb5_sip_long"
+    direction: SignalDirection
+    status: SignalStatus
+    rel_vol: float
+    rel_vol_rank: int
+    or_open: Decimal
+    or_high: Decimal
+    or_low: Decimal
+    or_close: Decimal
+    or_volume: int
+    atr14: Decimal
+    adv14: int
+    prev_close: Decimal
+    gap_pct: float
+    trigger_price: Decimal | None = None
+    stop_price: Decimal | None = None
+    max_chase_price: Decimal | None = None
+    entry_limit: Decimal | None = None
+    armed_at: datetime | None = None
+    triggered_at: datetime | None = None
+    features: dict[str, FeatureValue] = {}
+
+
+class TriggerEvent(_Frozen):
+    """A signal's one-shot trigger (S§3.3). ``ts`` and ``price`` are the trade's (or, for
+    ``arm_check``, the snapshot's); ``received_at`` is when the engine saw it, the live trigger
+    time. ``source`` ``restart`` re-serves a trigger a crash left without a decision."""
+
+    signal_id: str
+    symbol: str
+    rank: int
+    ts: datetime
+    received_at: datetime
+    price: Decimal
+    size: int | None = None
+    conditions: tuple[str, ...] = ()
+    source: Literal["stream_trade", "arm_check", "restart"]
+
+
 # ---------------------------------------------------------------- orders and the risk gate
 
 

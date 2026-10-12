@@ -9,13 +9,14 @@ import pytest
 from typer.testing import CliRunner
 
 from tests.fixtures import nyse
-from tests.fixtures.fake_ws import FakeAlpacaServer
+from tests.fixtures.fake_ws import FakeAlpacaServer, FakeConnection
 from trader import runtime
 from trader.cli import app
 from trader.core.clock import ET, Clock, SimClock
 from trader.core.models import Bar, Quote, Trade
 from trader.data import ws
 from trader.data.stream import (
+    TRADING_CHANNELS,
     Backfill,
     BarEvent,
     MarketDataHub,
@@ -280,6 +281,110 @@ async def test_silence_watchdog(sleeps: Sleeps, market_open: bool, reconnects: b
 async def test_stop_closes_the_connection(hub: MarketDataHub, server: FakeAlpacaServer) -> None:
     await hub.stop()
     assert server.connections[0].closed
+
+
+# ---------------------------------------------------------------- bad input (D-048)
+
+
+async def test_bad_frames_and_messages_are_skipped(
+    hub: MarketDataHub, server: FakeAlpacaServer
+) -> None:
+    await hub.set_subscriptions(["SPY"])
+    events = hub.subscribe_consumer()
+    conn = server.connections[0]
+    conn.push_raw("not json at all")
+    conn.push_raw('"a bare string"')
+    conn.push({"T": "t", "S": "SPY", "s": 100, "t": "2026-10-09T14:00:01Z"})  # no price
+    conn.push(trade_msg(571.12, "2026-10-09T14:00:02Z"))
+    (trade,) = await take(events, 1)
+    assert isinstance(trade, Trade)
+    assert trade.price == Decimal("571.12")
+    assert hub.connections == 1  # nothing above cost the connection
+
+
+async def test_trading_channels_and_the_trades_only_fallback(
+    server: FakeAlpacaServer, sleeps: Sleeps
+) -> None:
+    hub = MarketDataHub(key_id="PKTEST", secret_key="secret-value", feed="iex", clock=SimClock(NOW),
+                        symbol_limit=30, connector=server.connect, sleep=sleeps,
+                        channels=TRADING_CHANNELS)  # fmt: skip
+    await hub.start()
+    assert await hub.wait_connected(1.0)
+    assert await hub.set_subscriptions(["SPY"]) == {"trades": ["SPY"], "quotes": ["SPY"]}
+    assert await hub.set_subscriptions(["SPY", "QQQ"], channels=("trades",)) == {
+        "trades": ["QQQ", "SPY"],
+        "quotes": [],
+    }
+    sent = server.connections[0].sent
+    assert sent[1] == {"action": "subscribe", "trades": ["SPY"], "quotes": ["SPY"]}
+    assert sent[2] == {"action": "unsubscribe", "quotes": ["SPY"]}
+    assert sent[3] == {"action": "subscribe", "trades": ["QQQ"]}
+    await hub.stop()
+
+
+class SilentServer(FakeAlpacaServer):
+    """Never acknowledges a subscription on its first connection."""
+
+    def respond(self, conn: FakeConnection, payload: Mapping[str, Any]) -> None:
+        if payload.get("action") == "subscribe" and len(self.connections) == 1:
+            conn.sent.pop()  # as if lost on the way
+            return
+        super().respond(conn, payload)
+
+
+def stream_for(server: FakeAlpacaServer, sleeps: Sleeps, **kwargs: Any) -> ws.AlpacaStream:
+    return ws.AlpacaStream(url="wss://stream.data.alpaca.markets/v2/iex", key_id="PKTEST",
+                           secret_key="secret-value", channels=("trades",), clock=SimClock(NOW),
+                           on_data=lambda _m: None, connector=server.connect, sleep=sleeps,
+                           **kwargs)  # fmt: skip
+
+
+async def test_an_ack_timeout_keeps_the_target_and_reconnects(sleeps: Sleeps) -> None:
+    server = SilentServer()
+    stream = stream_for(server, sleeps, ack_timeout_s=0.05)
+    task = asyncio.create_task(stream.run())
+    await until(stream.connected.is_set)
+    with pytest.raises(StreamError) as info:
+        await stream.update({"trades": {"SPY"}})
+    assert info.value.code == ws.ACK_TIMEOUT
+    await until(lambda: len(server.connections) == 2 and stream.acked == {"trades": ["SPY"]})
+    assert server.connections[1].sent[1] == {"action": "subscribe", "trades": ["SPY"]}
+    await stream.stop()
+    await task
+
+
+async def test_errors_nobody_asked_for_reach_on_error(
+    server: FakeAlpacaServer, sleeps: Sleeps
+) -> None:
+    heard: list[int] = []
+    stream = stream_for(server, sleeps, on_error=lambda exc: heard.append(exc.code))
+    task = asyncio.create_task(stream.run())
+    await until(stream.connected.is_set)
+    server.connections[0].push({"T": "error", "code": 405, "msg": "symbol limit exceeded"})
+    await until(lambda: heard == [405])
+    assert stream.connections == 1  # not fatal
+    await stream.stop()
+    await task
+
+
+async def test_an_unexpected_error_reconnects(server: FakeAlpacaServer, sleeps: Sleeps) -> None:
+    calls = 0
+
+    async def connect(url: str) -> FakeConnection:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("a surprise")
+        return await server.connect(url)
+
+    stream = ws.AlpacaStream(url="wss://x/v2/iex", key_id="k", secret_key="s", channels=("trades",),
+                             clock=SimClock(NOW), on_data=lambda _m: None, connector=connect,
+                             sleep=sleeps)  # fmt: skip
+    task = asyncio.create_task(stream.run())
+    await until(stream.connected.is_set)
+    assert (calls, sleeps.calls) == (2, [1.0])
+    await stream.stop()
+    await task
 
 
 # ---------------------------------------------------------------- trader stream

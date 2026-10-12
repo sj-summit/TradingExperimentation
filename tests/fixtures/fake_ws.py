@@ -26,6 +26,10 @@ class FakeConnection:
         """Deliver one server frame: a JSON array of messages."""
         self._inbox.put_nowait(json.dumps(list(messages)))
 
+    def push_raw(self, frame: str) -> None:
+        """Deliver a frame exactly as given, valid JSON or not."""
+        self._inbox.put_nowait(frame)
+
     def drop(self) -> None:
         """The server goes away."""
         self._inbox.put_nowait(_CLOSE)

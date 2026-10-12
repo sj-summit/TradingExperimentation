@@ -2,7 +2,10 @@
 
 | File | Contents |
 |---|---|
-| ``stream.jsonl.gz`` | every market event, one JSON object per line |
+| ``stream.jsonl.gz`` | every market event with its receive time ``rx``, one JSON object per line |
+| ``rest.jsonl.gz`` | every market-data REST call of the day: arguments, result, start/end ``rx`` |
+| ``broker-A.jsonl.gz`` | Book A's broker calls and trade updates (``broker-B`` likewise) |
+| ``boot.json`` | each book's ledger, halts and state at boot (``boot-2.json`` after a restart) |
 | ``news.jsonl.gz`` | every news item |
 | ``or_scan.parquet`` | the 09:35 opening-range scan (written by P3.1) |
 | ``universe.parquet`` | the day's universe snapshot |
@@ -19,7 +22,7 @@ import gzip
 import json
 import zlib
 from collections.abc import Iterator, Sequence
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from types import TracebackType
 from typing import IO, Any, Self
@@ -28,13 +31,20 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import BaseModel
 
+from trader.core.clock import fmt_iso
 from trader.core.models import NewsItem, Quote, Trade
 from trader.data.stream import MarketEvent
 
 STREAM_FILE = "stream.jsonl.gz"
+REST_FILE = "rest.jsonl.gz"
+BOOT_FILE = "boot.json"
 NEWS_FILE = "news.jsonl.gz"
 UNIVERSE_FILE = "universe.parquet"
 OR_SCAN_FILE = "or_scan.parquet"
+
+
+def broker_file(book: str) -> str:
+    return f"broker-{book}.jsonl.gz"
 
 
 class Recorder:
@@ -56,11 +66,20 @@ class Recorder:
 
     # ---------------------------------------------------------------- JSON lines
 
-    def record_event(self, event: MarketEvent) -> None:
+    def record_event(self, event: MarketEvent, rx: datetime | None = None) -> None:
+        """One hub event. ``rx`` is when the engine received it, so replay can order events
+        as the engine saw them (DECISIONS D-047)."""
         kind = (
             "trade" if isinstance(event, Trade) else "quote" if isinstance(event, Quote) else "bar"
         )
-        self._append(STREAM_FILE, {"kind": kind, **event.model_dump(mode="json")})
+        record = {"kind": kind, **event.model_dump(mode="json")}
+        if rx is not None:
+            record["rx"] = fmt_iso(rx)
+        self._append(STREAM_FILE, record)
+
+    def append(self, name: str, record: dict[str, Any]) -> None:
+        """One JSON line to ``name`` in the day's folder (REST and broker recordings)."""
+        self._append(name, record)
 
     def record_news(self, item: NewsItem) -> None:
         self._append(NEWS_FILE, item.model_dump(mode="json"))
