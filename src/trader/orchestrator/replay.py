@@ -98,11 +98,16 @@ async def replay_day(
 ) -> ReplayReport:
     folder = recordings / day.isoformat()
     boot, universe, notes = _prepare(folder, out, root)
-    clock = SimClock(parse_et_iso(boot["started_at"]))
+    clock = SimClock(started_at(boot))
     journal = await Journal.open(out / "trader.db", inline=True)
     try:
         calendar = await seed(journal, boot, universe)
-        market = ReplayMarketData.from_file(folder / REST_FILE, clock)
+        market = ReplayMarketData.from_file(folder / REST_FILE, clock, since=started_at(boot))
+        if market.skipped:
+            notes.append(
+                f"ignored {market.skipped} market-data answers recorded before this run's boot "
+                "(an earlier attempt that died during boot)"
+            )
         hub = ReplayHub(
             clock=clock,
             events=load_stream(folder / STREAM_FILE),

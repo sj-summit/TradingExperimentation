@@ -1014,6 +1014,47 @@ Append-only. Each entry records context, the decision, its consequences, and sou
   - Test fixtures named `SPL2`/`PRC2` were renamed.
 - **Backstop:** if Alpaca still calls a well-formed symbol invalid, the backtest's daily-bar fetch drops that symbol (logged) and asks for the rest of the chunk again, instead of failing the run. The live universe build relies on the filter alone, since active listings don't carry placeholders. A refused live build is a P2 `universe_unavailable` at boot.
 
+## D-051 — G3 pre-flight: failure paths hardened before the first real session
+- **Date:** 2026-10-12 · **Status:** Accepted
+- **Context:**
+  - The human verified `events.yaml` (P1.8), built the 2026-10-13 universe (1,587 eligible) and ran `run-day --dry-run`. The `--sim` rehearsal was skipped, so G3 is run-day's first contact with real data.
+  - A read-only review looked for what the offline tests can't catch: five reviewers, adversarial checks on serious findings, and a completeness critic. It found no blockers.
+  - The fixes below all sit on failure paths. Each has a test that fails on the old code.
+- **Fixes:**
+  1. **A trading task that dies no longer skips the flatten.**
+     - The trigger engine logs and skips an event that fails. A failed journal write re-arms the signal, so the next trade retries it.
+     - A dead engine or book worker is a P2 `state_failed` at once, and the engine's feed is detached from the hub.
+     - `_stop_trading` no longer re-raises the task's error. Before, it did so at last entry, which skipped FLATTEN, EOD and REPORT and could leave a position overnight on its DAY stop.
+  2. **The clock check is read again.**
+     - A reading's window includes the retries inside the call, so one slow answer looked like skew. A reading out of tolerance is now taken again, up to 3 times, and the shortest round trip counts.
+     - If boot found the clock skewed or unverified, or couldn't fetch the asset list, both are checked again at 09:29 before the scan.
+     - D-048's fail-closed rule still holds: still skewed or unverified at 09:29 means nothing is armed.
+  3. **The after-close pass** is tried 6 times, 5 s apart, before a P1 `not_flat`. Its result (what is held and which GTC stops protect it) is always recorded, even after the 15:58 P1; the book is halted only once.
+  4. **After the close, cancels are waited for** (up to 20 polls of 0.5 s) before the GTC stops are sized. A pending cancel holds the shares, so the stop came up short. `FlattenResult.protected` now lists every GTC stop protecting a position, existing ones included.
+  5. **EOD is retried every 30 s until the shadow time.**
+     - A state after the flatten that still fails leaves the day un-DONE: run-day prints the state with "run run-day again today to finish".
+     - That day's report isn't marked done, so the rerun finishes EOD and rebuilds the report.
+  6. **Shadow outcomes read the signals from the journal.** The scan-time copies lack `triggered_at`, so every long the stream triggered was stored with `sip_only_trigger = 1`. The golden day changed in exactly those four rows.
+  7. **Replay ignores market-data answers recorded before `boot.json`'s `started_at`**, which come from an attempt that died during boot, and says so in its notes.
+  8. **The console no longer shows httpx/httpcore INFO lines** (about 25 a minute all day). The JSON log keeps them; an answer of 400 or more still reaches the console.
+  9. **A second review, of these fixes themselves** (three lenses), found no blocker. It led to:
+     - **Never a traceback after a finished day:** a dead task's P2 and `_shutdown` never raise. A failed incident write could otherwise turn a DONE day into a traceback.
+     - **Bare shares are retried too:** the after-close pass is also retried while shares have no GTC stop. `FlattenResult.unprotected` names them, and the P1 adds "NO STOP: …".
+     - **The EOD retry window** is at least 7 minutes from EOD's start, so a rerun after the shadow time also retries.
+     - **An unknown drawdown is NULL, not 0:** a run that started after the close stores `max_intraday_dd` as NULL, since it sampled none of the session.
+     - **Honest wording:** boot's P2 promises a re-check only when one will run.
+     - **The replayed clock keeps the live skew:** the reading is moved by however far the replay's ask is from the recorded one.
+     - **A killed run's recording stays readable:** a gzip member cut short by a kill is read up to the next member, so the rerun's appended records survive.
+- **Left as they are** (the G3 runbook in HANDOFF covers the operator side):
+  - **Stopping run-day skips the flatten.** Ctrl+C or closing the terminal leaves positions on their broker-side stops, which are DAY orders and expire at 16:00. To stop trading, create the kill file; if run-day dies, rerun it the same day.
+  - **A resent subscription has no 405 fallback.** A subscription change made while the hub is reconnecting is resent on reconnect without it. This needs a reconnect at about 09:35 and Alpaca counting channels toward the 30 (Q2).
+  - **Partial-fill re-protection is tight.** It must finish within 5 s under the 3/s order-API limiter. A P1 `unprotected_position` right after a partial fill is that race.
+  - **Boot reconciliation acts on a single pass,** so a fill landing during a mid-day restart's boot can be a false P1.
+  - **Replay loads the whole stream into memory** (about 1.5 KB an event).
+  - **One surplus readiness call can fail the replay.** If the readiness poll gives up at 09:35:08, replay can report one extra SPY 1Min call as a divergence.
+  - **Live v2 orders carry no `group_id`/`group_role`.** D-030 assumed they do. Legs are tied through the nested `legs`. SimBroker sets the fields, so its group branches aren't the live path. To fix after G3.
+  - **Alpaca also checks an OTO stop against the current price,** not only against the limit. A fast reversal before the submit becomes `broker_rejected`, which fails safe.
+
 ---
 
 ## Open questions to resolve during the build (record answers as new entries)

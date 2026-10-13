@@ -109,7 +109,7 @@ class BookClose:
     broker: BrokerAdapter
     records: Records
     equity_sod: Decimal
-    max_drawdown: Decimal  # marked, in $, from the heartbeat's samples
+    max_drawdown: Decimal | None  # marked, in $, from the heartbeat; None if none sampled
 
 
 @dataclass(frozen=True)
@@ -202,7 +202,7 @@ async def _stats(ctx: EodContext, b: BookClose) -> None:
                 count,
                 triggered,
                 trades,
-                dec_to_db(b.max_drawdown),
+                None if b.max_drawdown is None else dec_to_db(b.max_drawdown),
                 json.dumps(dict(ctx.regime), sort_keys=True),
                 int(epoch[0]) if epoch is not None else 0,
             ),

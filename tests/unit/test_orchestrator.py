@@ -3,19 +3,25 @@
 import json
 from collections.abc import AsyncIterator, Iterable, Sequence
 from datetime import date, datetime, time, timedelta
+from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+import trader.orchestrator.day as day_module
 from tests.fixtures.dayrun import DayRun
 from tests.fixtures.days import DAY, D, SyntheticDay, path, standard_day
 from trader.core.clock import ET, SimClock
 from trader.data.replay import ReplayHub
 from trader.data.stream import Channel
 from trader.data.ws import StreamError
-from trader.execution.broker import Order, OrderRejected
+from trader.execution.broker import BrokerUnavailable, Order, OrderRejected
+from trader.execution.service import ExecutionService, FlattenResult
 from trader.execution.sim_broker import SimBroker
+from trader.orchestrator.eod import BookClose, EodContext
 from trader.risk.ledger import LedgerError, SettlementLedger
+from trader.strategy.triggers import TriggerEngine
 
 STATES = ["BOOT", "PREMARKET", "OR_SCAN", "TRADING", "FLATTEN", "EOD", "REVIEW", "REPORT", "DONE"]
 
@@ -63,8 +69,12 @@ async def test_a_normal_day(normal: DayRun) -> None:
         2,
     )
     assert json.loads(stats["regime_json"])["day_of_week"] == "Tue"
-    shadow = await normal.rows("SELECT signal_id, exit_reason FROM shadow_outcomes")
+    shadow = await normal.rows(
+        "SELECT signal_id, exit_reason, sip_only_trigger FROM shadow_outcomes"
+    )
     assert len(shadow) == 7  # every priced signal: six longs and the short; the doji has none
+    sip_only = {r["signal_id"].split("-")[1]: r["sip_only_trigger"] for r in shadow}
+    assert (sip_only["WIN"], sip_only["CHASE"]) == (0, 1)  # the live feed triggered WIN (D-051)
     assert await normal.steps() == [
         "reconcile:A",
         "decisions:A",
@@ -147,8 +157,19 @@ async def test_a_start_after_the_flatten_runs_only_the_end_of_the_day(tmp_path: 
     assert await run.statuses() == {}
     assert "bars:5Min" not in run.market.calls
     assert await run.incidents() == []
-    (stats,) = await run.rows("SELECT n_signals, n_trades FROM daily_stats")
+    (stats,) = await run.rows("SELECT n_signals, n_trades, max_intraday_dd FROM daily_stats")
     assert (stats["n_signals"], stats["n_trades"]) == (0, 0)
+    assert stats["max_intraday_dd"] is None  # it sampled none of the session: unknown (D-051)
+    await run.close()
+
+
+async def test_after_the_flatten_a_failed_check_promises_no_recheck(tmp_path: Path) -> None:
+    run = await DayRun(tmp_path, standard_day(), start=time(16, 20)).open()
+    run.market.fail["clock"] = TimeoutError("no answer (test)")
+    await run.run()
+    (row,) = await run.rows("SELECT code, message FROM incidents")
+    assert row["code"] == "clock_skew"
+    assert row["message"].endswith("nothing armed today")  # no 09:29 re-check is coming
     await run.close()
 
 
@@ -244,9 +265,45 @@ async def test_a_first_boot_refuses_an_account_that_is_not_flat(tmp_path: Path) 
 async def test_a_skewed_clock_arms_nothing(tmp_path: Path) -> None:
     run = await DayRun(tmp_path, standard_day(), skew=timedelta(seconds=5)).open()
     await run.run()
-    assert await run.incidents() == [("P2", "clock_skew")]
+    # Boot reads it three times (D-051), and so does the 09:29 re-check: still 5 s off.
+    assert await run.incidents() == [("P2", "clock_skew"), ("P2", "clock_skew")]
+    messages = [r["message"] for r in await run.rows("SELECT message FROM incidents")]
+    assert messages[0].endswith("checking again before the scan")
+    assert messages[1].endswith("nothing armed today")
+    assert run.market.calls.count("clock") == 6
     assert set((await run.statuses()).values()) == {"not_armed"}
     assert await run.trades() == {}
+    await run.close()
+
+
+async def test_one_slow_clock_answer_is_read_again_not_taken_as_skew(tmp_path: Path) -> None:
+    run = await DayRun(tmp_path, standard_day()).open()
+    answer, calls = run.market.clock, []
+
+    async def slow_once() -> datetime:  # the first answer takes 10 s (a timeout, then a retry)
+        calls.append(run.clock.now())
+        if len(calls) == 1:
+            await run.clock.sleep_until(run.clock.now() + timedelta(seconds=10))
+        return await answer()
+
+    run.market.clock = slow_once  # type: ignore[method-assign]
+    await run.run()
+    assert len(calls) == 2  # read again; the quick answer counts
+    assert await run.incidents() == []
+    assert (await run.trades())["WIN"][3] == "eod_flatten"
+    await run.close()
+
+
+async def test_a_clock_unverified_at_boot_is_checked_again_before_the_scan(
+    tmp_path: Path,
+) -> None:
+    run = await DayRun(tmp_path, standard_day()).open()
+    run.market.fail["clock"] = TimeoutError("no answer (test)")
+    run.market.fail["assets"] = TimeoutError("no answer (test)")
+    await run.run()
+    assert await run.incidents() == [("P2", "clock_skew"), ("P2", "assets_unavailable")]
+    assert (await run.statuses())["WIN"] == "triggered"  # the 09:29 checks passed
+    assert (await run.trades())["WIN"][3] == "eod_flatten"
     await run.close()
 
 
@@ -306,15 +363,156 @@ class NoBids(SimBroker):
 async def test_not_flat_by_close_is_a_p1_and_leaves_a_gtc_stop(tmp_path: Path) -> None:
     run = await DayRun(tmp_path, standard_day(), sim_class=NoBids).open()
     await run.run()
-    assert ("P1", "not_flat") in await run.incidents()
-    assert [c for s, c in await run.incidents() if s == "P1"] == ["not_flat"]
-    assert "p1_incident" in await run.halts()
+    assert [c for s, c in await run.incidents() if s == "P1"] == ["not_flat", "not_flat"]
+    p1s = await run.rows("SELECT message FROM incidents WHERE severity = 'P1' ORDER BY id")
+    assert [r["message"] for r in p1s] == [
+        "Book A: not flat by 15:58",
+        "Book A: held after the close: WIN 24; GTC stops: WIN @ 20.31",  # what protects it
+    ]
+    assert await run.halts() == ["p1_incident"]  # halted once
     held = await run.sims["A"].positions()
     assert [(p.symbol, p.qty) for p in held] == [("WIN", 24)]
     stops = [o for o in await run.sims["A"].open_orders() if o.type == "stop"]
     assert [(o.symbol, o.time_in_force, o.stop_price) for o in stops] == [
         ("WIN", "gtc", D("20.31"))
     ]
+    await run.close()
+
+
+# ---------------------------------------------------------------- failures (D-051)
+
+
+async def test_a_dead_trigger_engine_is_a_p2_at_once_and_the_day_still_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def dies(self: TriggerEngine, events: object) -> None:
+        raise RuntimeError("engine failure (test)")
+
+    monkeypatch.setattr(TriggerEngine, "run", dies)
+    run = await DayRun(tmp_path, standard_day()).open()
+    feeds: list[object] = []
+    run.at("09:40:00", lambda: feeds.append(run.orchestrator._events))
+    outcome = await run.run()
+    assert feeds == [None]  # detached from the hub at once, not at last entry
+    assert outcome is not None
+    assert outcome.state == "DONE"
+    assert await run.states() == STATES  # FLATTEN, EOD and REPORT still ran
+    (row,) = await run.rows("SELECT code, message, ts FROM incidents")
+    assert (row["code"], row["message"]) == (
+        "state_failed",
+        "the trigger engine died (RuntimeError): no more entries today",
+    )
+    assert row["ts"][11:19] < "09:36:00"  # at once, not at last entry
+    assert await run.trades() == {}
+    await run.close()
+
+
+async def test_a_broker_error_after_the_close_is_retried_not_a_p1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    flatten, close, failures = ExecutionService.flatten, datetime.combine(DAY, time(16), ET), []
+
+    async def blip(self: ExecutionService, **kwargs: Any) -> FlattenResult:
+        if self._clock.now() >= close and len(failures) < 2:  # a 503 at 16:00, twice
+            failures.append(self._clock.now())
+            raise BrokerUnavailable("no answer (test)")
+        return await flatten(self, **kwargs)
+
+    monkeypatch.setattr(ExecutionService, "flatten", blip)
+    run = await DayRun(tmp_path, standard_day()).open()
+    outcome = await run.run()
+    assert outcome is not None
+    assert outcome.state == "DONE"
+    assert [f.strftime("%H:%M:%S") for f in failures] == ["16:00:00", "16:00:05"]
+    assert await run.incidents() == []
+    assert await run.halts() == []
+    await run.close()
+
+
+async def test_a_failed_eod_is_retried(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    close_book, tries = day_module.close_book, []
+
+    async def flaky(ctx: EodContext, b: BookClose) -> None:
+        tries.append(ctx.clock.now())
+        if len(tries) == 1:
+            raise BrokerUnavailable("no answer at 16:05 (test)")
+        await close_book(ctx, b)
+
+    monkeypatch.setattr(day_module, "close_book", flaky)
+    run = await DayRun(tmp_path, standard_day()).open()
+    outcome = await run.run()
+    assert outcome is not None
+    assert outcome.state == "DONE"
+    assert [t.strftime("%H:%M:%S") for t in tries] == ["16:05:00", "16:05:30"]
+    assert await run.incidents() == []
+    assert (await run.trades())["WIN"][3] == "eod_flatten"
+    await run.close()
+
+
+async def test_an_eod_that_keeps_failing_leaves_the_day_for_a_rerun(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    close_book, mode, tries = day_module.close_book, ["down"], []
+
+    async def flaky(ctx: EodContext, b: BookClose) -> None:
+        tries.append(ctx.clock.now())
+        if mode[0] == "down" or (mode[0] == "blip" and len(tries) == 1):
+            raise BrokerUnavailable("no answer (test)")
+        await close_book(ctx, b)
+
+    monkeypatch.setattr(day_module, "close_book", flaky)
+    run = await DayRun(tmp_path, standard_day()).open()
+    outcome = await run.run()
+    assert outcome is not None
+    assert (outcome.state, outcome.note) == (
+        "REPORT",
+        "EOD failed: run run-day again today to finish",
+    )
+    assert tries[-1].strftime("%H:%M:%S") == "16:11:30"  # retried until the shadow time
+    assert await run.incidents() == [("P2", "state_failed")]
+    assert "report" not in await run.steps()  # the report lacks the trades: rebuilt on a rerun
+    assert await run.trades() == {}
+    mode[0], tries[:] = "blip", []  # the rerun meets one more failure, and retries it
+    run.new_hub()
+    again = await run.run()
+    assert again is not None
+    assert again.state == "DONE"
+    assert len(tries) == 2
+    assert tries[1] - tries[0] == timedelta(seconds=30)
+    assert (await run.trades())["WIN"][3] == "eod_flatten"
+    steps = await run.steps()
+    assert sorted(steps) == sorted(set(steps))  # nothing ran twice
+    assert steps[-1] == "report"
+    assert "stats:A" in steps
+    (stats,) = await run.rows("SELECT max_intraday_dd FROM daily_stats")
+    assert stats["max_intraday_dd"] is None  # the rerun sampled none of the session
+    await run.close()
+
+
+class NoBidsFlakyStops(NoBids):
+    """No market for the shares, and the first two GTC stops get no answer."""
+
+    gtc_failures = 2
+
+    async def submit_stop(
+        self, symbol: str, qty: int, stop_price: Decimal, client_order_id: str, *, tif: Any = "day"
+    ) -> Order:
+        if tif == "gtc" and self.gtc_failures:
+            self.gtc_failures -= 1
+            raise BrokerUnavailable("no answer (test)")
+        return await super().submit_stop(symbol, qty, stop_price, client_order_id, tif=tif)
+
+
+async def test_after_the_close_a_failed_gtc_stop_is_tried_again(tmp_path: Path) -> None:
+    run = await DayRun(tmp_path, standard_day(), sim_class=NoBidsFlakyStops).open()
+    await run.run()
+    p1s = await run.rows("SELECT message FROM incidents WHERE severity = 'P1' ORDER BY id")
+    assert [r["message"] for r in p1s] == [
+        "Book A: not flat by 15:58",
+        "Book A: held after the close: WIN 24; GTC stops: WIN @ 20.31",  # no "NO STOP" part
+    ]
+    stops = [o for o in await run.sims["A"].open_orders() if o.time_in_force == "gtc"]
+    assert [(o.symbol, o.qty) for o in stops] == [("WIN", 24)]
     await run.close()
 
 

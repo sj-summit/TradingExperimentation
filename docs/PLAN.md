@@ -11,8 +11,8 @@
 ```
 STATUS
 current_phase: 3 (plan approved 2026-10-12: C:\Users\Admin\.claude\plans\squishy-popping-honey.md; order P3.1, P3.3, P3.6a, P3.9, P3.2, P3.4, P3.6b, P3.7, P3.8a, P3.5, P3.8b, G3)
-last_completed_task: P3.9 (D-042 results, D-050); every Phase 3 task is done; next is G3 (human gate)
-open_questions: read docs/HANDOFF.md first. H0.2 open until doctor's claude checks pass (claude's folder added to PATH; CLAUDE_TOKEN_CREATED); P1.8 drafted, awaiting human date check (config/events.yaml); Phase 1 done-checks pending (universe build, stream, news, filings); Q2 open, Q6 partly answered; backtest verdict hangs on the trigger-minute rule (D-042 results: shadow R between -0.31 and +0.14 for longs), human to decide on resolving it from the trade tape
+last_completed_task: P1.8 (the human verified events.yaml 2026-10-12) and the G3 pre-flight fixes (D-051); every Phase 3 task is done; next is G3 (human gate), set for 2026-10-13 (runbook in docs/HANDOFF.md)
+open_questions: read docs/HANDOFF.md first. H0.2 open until doctor's claude checks pass (claude's folder added to PATH; CLAUDE_TOKEN_CREATED); Phase 1 done-checks pending (stream, news, filings; universe build done 2026-10-12: 1,587 eligible for 2026-10-13); Q2 open (G3 answers it: a 405 on about 23 symbols x trades+quotes means channels count toward the 30), Q6 partly answered; backtest verdict hangs on the trigger-minute rule (D-042 results: shadow R between -0.31 and +0.14 for longs), human to decide on resolving it from the trade tape
 eval_epoch: 0
 ```
 
@@ -74,7 +74,7 @@ Specs referenced: ARCHITECTURE.md (A§), STRATEGY.md (S§), RISK.md (R§).
 - [x] **P1.5** Write `data/stream.py` (`MarketDataHub`): one WebSocket; subscription limit enforced; consumer fan-out; reconnect, resubscribe and backfill; staleness metrics. Add the dev command `trader stream`. Write fake-WS tests.
 - [x] **P1.6** Write `data/news.py` (`NewsHub`: stream + REST backfill) and `data/edgar.py` (user agent, rate limit, ticker→CIK cache, recent-filing flags). Write mocked tests.
 - [x] **P1.7** Write `data/recorder.py`: daily recordings per A§4.2.
-- [ ] **P1.8** Fill `config/events.yaml` for the next 3 months. Claude Code drafts it from the official Federal Reserve FOMC calendar and the BLS release schedule (CPI, Employment Situation), with source URLs. **The human verifies the dates.**
+- [x] **P1.8** Fill `config/events.yaml` for the next 3 months. Claude Code drafts it from the official Federal Reserve FOMC calendar and the BLS release schedule (CPI, Employment Situation), with source URLs. **The human verifies the dates.** (Verified 2026-10-12; covers to 2027-01-08.)
 
 **Done when:**
 

@@ -209,9 +209,22 @@ async def test_outside_market_hours_it_keeps_a_gtc_stop_instead(
         40,
         D("12.21"),
     )
-    again = await flatten(sim, records, clock)  # a working GTC stop is left alone
-    assert again.protected == {}
+    again = await flatten(sim, records, clock)  # a working GTC stop is left alone...
+    assert again.protected == {"XYZ": D("12.21")}  # ...and reported, so the P1 can name it
     assert len(await sim.open_orders()) == 1
+
+
+async def test_after_the_close_a_slow_cancel_is_waited_for_before_the_gtc_stop(
+    clock: SimClock, records: Records, journal: Journal
+) -> None:
+    sim = SimBroker(clock=clock)
+    await hold(sim, records)  # its day stop leg still works: Alpaca hasn't expired it yet
+    sim.slow_cancels = timedelta(seconds=2)  # the leg holds the shares until then
+    await clock.advance_to(datetime(2026, 10, 9, 16, 1, tzinfo=ET))
+    result = await flatten(sim, records, clock)
+    assert result.protected == {"XYZ": D("12.21")}
+    stops = [o for o in await sim.open_orders() if o.time_in_force == "gtc"]
+    assert [(o.qty, o.stop_price) for o in stops] == [(40, D("12.21"))]  # all 40 covered
 
 
 async def test_flat_already_is_quick(clock: SimClock, records: Records) -> None:

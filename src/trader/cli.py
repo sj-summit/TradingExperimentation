@@ -648,9 +648,11 @@ async def _halt(root: Path, books: list[Literal["A", "B"]], *, flatten: bool, so
             held = ", ".join(f"{s} {q}" for s, q in sorted(result.remaining.items()))
             if result.market_closed:
                 stops = ", ".join(f"{s} @ {p}" for s, p in sorted(result.protected.items()))
+                bare = ", ".join(f"{s} {q}" for s, q in sorted(result.unprotected.items()))
                 typer.echo(
                     f"Book {book}: market closed, nothing sold. Still held: {held}. "
                     f"GTC stops: {stops or 'none placed'}."
+                    + (f" NO STOP on: {bare}." if bare else "")
                 )
             else:
                 typer.echo(f"Book {book}: NOT flat after {FLATTEN_TIMEOUT_S:.0f} s: {held}.")
@@ -662,7 +664,11 @@ async def _halt(root: Path, books: list[Literal["A", "B"]], *, flatten: bool, so
                 component="flatten",
                 code="not_flat",
                 message=f"Book {book} not flat after {source}: {held}",
-                detail={"remaining": result.remaining, "protected": result.protected},
+                detail={
+                    "remaining": result.remaining,
+                    "protected": result.protected,
+                    "unprotected": result.unprotected,
+                },
             )
         if failed:
             raise typer.Exit(code=1)

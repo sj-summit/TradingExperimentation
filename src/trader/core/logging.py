@@ -27,6 +27,19 @@ _SENSITIVE_KEY = re.compile(
     r"token|secret|password|passwd|authorization|api_?key|key_id|webhook|cookie", re.IGNORECASE
 )
 _MASK = "**********"
+# Libraries whose INFO lines stay out of the console: httpx logs every request (about 25 a
+# minute all day), which buries warnings and incidents. The JSON log keeps them, and an answer
+# of 400 or more (a refused order, a failed call) still reaches the console.
+_QUIET_LOGGERS = ("httpx", "httpcore")
+_HTTPX_STATUS_ARG = 3  # 'HTTP Request: %s %s "%s %d %s"': method, url, version, status, reason
+
+
+def _quiet_libraries(record: logging.LogRecord) -> bool:
+    if record.levelno >= logging.WARNING or not record.name.startswith(_QUIET_LOGGERS):
+        return True
+    args = record.args
+    status = args[_HTTPX_STATUS_ARG] if isinstance(args, tuple) and len(args) > 3 else None
+    return isinstance(status, int) and status >= 400
 
 
 class RedactSecrets:
@@ -115,6 +128,7 @@ def configure_logging(
     if console is not None:
         console_handler = logging.StreamHandler(console)
         console_handler.set_name(f"{_HANDLER_PREFIX}console")
+        console_handler.addFilter(_quiet_libraries)
         # Plain tracebacks: rich's default formatter prints local variables, which can hold secrets.
         renderer = structlog.dev.ConsoleRenderer(
             colors=False, timestamp_key="ts", exception_formatter=structlog.dev.plain_traceback

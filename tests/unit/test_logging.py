@@ -50,6 +50,29 @@ def test_stdlib_records_share_the_pipeline(tmp_path: Path) -> None:
     assert line["ts"] == "2026-10-09T09:35:05-04:00"
 
 
+def test_the_console_skips_httpx_info_lines_the_file_keeps_them(tmp_path: Path) -> None:
+    console = io.StringIO()
+    path = configure_logging(clock=CLOCK, secrets={}, logs_dir=tmp_path, console=console)
+    assert path is not None
+    httpx = logging.getLogger("httpx")
+    request = 'HTTP Request: %s %s "%s %d %s"'  # httpx's own format
+    httpx.info(request, "GET", "https://example.invalid/v2/clock", "HTTP/1.1", 200, "OK")
+    httpx.info(request, "POST", "https://example.invalid/v2/orders", "HTTP/1.1", 403, "Forbidden")
+    httpx.warning("HTTP retry")
+    structlog.get_logger("trader.x").info("kept")
+    shown = console.getvalue()
+    assert "v2/clock" not in shown  # about 25 a minute all day would bury the incidents
+    assert '"HTTP/1.1 403 Forbidden"' in shown  # a refusal still shows
+    assert "HTTP retry" in shown
+    assert "kept" in shown
+    assert [line["event"] for line in read_lines(path)] == [
+        'HTTP Request: GET https://example.invalid/v2/clock "HTTP/1.1 200 OK"',
+        'HTTP Request: POST https://example.invalid/v2/orders "HTTP/1.1 403 Forbidden"',
+        "HTTP retry",
+        "kept",
+    ]
+
+
 def test_reconfiguring_replaces_earlier_handlers(tmp_path: Path) -> None:
     configure_logging(clock=CLOCK, secrets={}, logs_dir=tmp_path, console=None)
     path = configure_logging(clock=CLOCK, secrets={}, logs_dir=tmp_path, console=None)

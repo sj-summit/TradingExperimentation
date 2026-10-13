@@ -41,6 +41,8 @@ BOOT_FILE = "boot.json"
 NEWS_FILE = "news.jsonl.gz"
 UNIVERSE_FILE = "universe.parquet"
 OR_SCAN_FILE = "or_scan.parquet"
+_GZIP_MAGIC = b"\x1f\x8b\x08"  # the start of a gzip member (deflate)
+_CHUNK = 1 << 16  # a damaged member is decoded in pieces, keeping what precedes the damage
 
 
 def broker_file(book: str) -> str:
@@ -138,23 +140,44 @@ def read_jsonl(path: Path) -> Iterator[dict[str, Any]]:
 
 
 def _gunzip_tolerant(data: bytes) -> bytes:
-    """Decompress concatenated gzip members, keeping everything before a truncation.
+    """Decompress concatenated gzip members, keeping every complete line it can.
 
     ``gzip.open`` can't do this: on a member without its trailer its buffered reader raises
-    EOFError and drops output it had already decompressed.
+    EOFError and drops output it had already decompressed. A member cut short by a crash may
+    be followed by the next run's members (append mode): it is read again only up to the next
+    gzip header, its torn last line is dropped, and reading resumes there (D-051).
     """
     out: list[bytes] = []
-    while data:
+    pos = 0
+    while pos < len(data):
         member = zlib.decompressobj(wbits=31)  # 31: gzip header and trailer
         try:
-            out.append(member.decompress(data))
-            out.append(member.flush())
+            whole = member.decompress(data[pos:]) + member.flush()
         except zlib.error:
-            break  # corrupt bytes: keep what came before
-        if not member.eof:
-            break  # the last member was cut short: what was flushed is all there is
-        data = member.unused_data  # the next member, if any
+            whole = None
+        if whole is not None and member.eof:  # the trailer's CRC checked out
+            out.append(whole)
+            pos = len(data) - len(member.unused_data)  # the next member, if any
+            continue
+        nxt = data.find(_GZIP_MAGIC, pos + 1)
+        out.append(_whole_lines(data[pos : len(data) if nxt < 0 else nxt]))
+        if nxt < 0:
+            break
+        pos = nxt
     return b"".join(out)
+
+
+def _whole_lines(member: bytes) -> bytes:
+    """What a damaged member decodes to before the damage, cut to its last complete line."""
+    reader = zlib.decompressobj(wbits=31)
+    parts: list[bytes] = []
+    for start in range(0, len(member), _CHUNK):
+        try:
+            parts.append(reader.decompress(member[start : start + _CHUNK]))
+        except zlib.error:
+            break
+    text = b"".join(parts)
+    return text[: text.rfind(b"\n") + 1]
 
 
 def read_table(path: Path) -> list[dict[str, Any]]:

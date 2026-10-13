@@ -140,12 +140,15 @@ class TriggerEngine:
     # ---------------------------------------------------------------- the stream
 
     async def run(self, events: "asyncio.Queue[MarketEvent]") -> None:
-        """Fire triggers from a hub consumer queue until cancelled."""
+        """Fire triggers from a hub consumer queue until cancelled. One event that fails is
+        logged and skipped, so the engine never dies mid-day."""
         while True:
             event = await events.get()
             try:
                 if isinstance(event, Trade):
                     await self.on_trade(event)
+            except Exception:
+                log.exception("trigger check failed", symbol=getattr(event, "symbol", None))
             finally:
                 events.task_done()
 
@@ -160,7 +163,11 @@ class TriggerEngine:
             return None
         del self._armed[trade.symbol]  # one-shot: before any await
         ev = _event(sig, trade, now, "stream_trade")
-        await self.journal.write(lambda conn: _mark_triggered(conn, sig.id, now))
+        try:
+            await self.journal.write(lambda conn: _mark_triggered(conn, sig.id, now))
+        except Exception:
+            self._armed[trade.symbol] = sig  # not journaled, not dispatched: the next trade retries
+            raise
         self._dispatch(ev)
         log.info("triggered", signal=sig.id, price=str(trade.price), rank=sig.rel_vol_rank)
         return ev

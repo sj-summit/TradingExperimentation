@@ -37,7 +37,7 @@ from trader.data.stream import MarketEvent
 from trader.execution.broker import BrokerAdapter
 from trader.execution.reconcile import Reconciler
 from trader.execution.records import Records, read_book_day
-from trader.execution.service import ExecutionService, TradingDay
+from trader.execution.service import ExecutionService, FlattenResult, TradingDay
 from trader.memory.incidents import Severity, record_incident
 from trader.memory.journal import Journal
 from trader.memory.regime import RegimeTags, ensure_regime, load_regime, signal_features
@@ -76,7 +76,11 @@ State = Literal[
     "BOOT", "PREMARKET", "OR_SCAN", "TRADING", "FLATTEN", "EOD", "REVIEW", "REPORT", "DONE"
 ]
 MAX_CLOCK_SKEW_S = 2.0  # RISK.md §9
+CLOCK_TRIES = 3  # a reading out of tolerance is taken again; the shortest round trip counts
 FLATTEN_PASS = timedelta(seconds=60)
+AFTER_CLOSE_TRIES = 6  # the after-close pass, every flatten_retry_s, before a P1 not_flat
+EOD_RETRY = timedelta(seconds=30)  # a failed EOD is retried...
+EOD_RETRY_WINDOW = timedelta(minutes=7)  # ...until the shadow time, or this long on a rerun
 CALENDAR_SLICE = timedelta(days=45)  # boot.json keeps this much calendar around the day
 STOP_POLL = timedelta(milliseconds=100)
 
@@ -161,6 +165,7 @@ class DayOrchestrator:
         self._regime: RegimeTags | None = None
         self._assets: dict[str, Asset] = {}
         self._skew = False
+        self._failed: list[State] = []  # states after the flatten that raised (D-051)
         self._inputs: LiveInputs | None = None
         self._heartbeat: Heartbeat | None = None
         self._stale: StaleWatch | None = None
@@ -206,6 +211,10 @@ class DayOrchestrator:
                 except Exception:
                     log.exception("day state failed", state=self.state)
                     await self._incident("P2", "state_failed", f"{self.state} failed")
+                    self._failed.append(self.state)
+            if self._failed:  # not DONE: run-day again today redoes only the unfinished steps
+                note = f"{', '.join(self._failed)} failed: run run-day again today to finish"
+                return DayOutcome(self.day, self.state, note)
             await self._enter("DONE")
             return DayOutcome(self.day, "DONE")
         finally:
@@ -221,7 +230,8 @@ class DayOrchestrator:
     async def _boot(self) -> None:
         await self._enter("BOOT")
         d, plan = self._d, self.plan
-        self._skew = await self._clock_skewed()
+        last_chance = self._clock.now() >= plan.times.flatten  # no re-check before a scan
+        self._skew = await self._clock_skewed(final=last_chance)
         if self._clock.now() < plan.times.flatten and d.ensure_universe is not None:
             try:
                 eligible = await d.ensure_universe(self.day)
@@ -236,11 +246,7 @@ class DayOrchestrator:
             d=d.calendar.previous_session(self.day),
             symbol=d.settings.data.regime_symbols[0],
         )
-        try:
-            self._assets = {a.symbol: a for a in await d.market.assets()}
-        except Exception as exc:  # R-003 then rejects every entry
-            log.exception("asset list unavailable")
-            await self._incident("P2", "assets_unavailable", f"{type(exc).__name__}: {exc}")
+        await self._load_assets(final=last_chance)
         self._stale = StaleWatch(
             hub=d.hub,
             clock=self._clock,
@@ -293,24 +299,60 @@ class DayOrchestrator:
             await self._incident("P2", "stream_unavailable", "market data stream not connected")
         await self._write_boot_record()
 
-    async def _clock_skewed(self) -> bool:
+    async def _clock_skewed(self, *, final: bool) -> bool:
         """RISK.md §9: more than 2 s from Alpaca's clock is a P2 and nothing is armed. A clock
-        that can't be checked counts as skewed: entries fail closed."""
-        before = self._clock.now()
+        that can't be checked counts as skewed: entries fail closed. Boot's verdict isn't
+        ``final``: PREMARKET checks again before the scan (DECISIONS D-051)."""
+        then = "nothing armed today" if final else "checking again before the scan"
         try:
-            server = await self._d.market.clock()
+            skew = await self._measure_skew()
         except Exception as exc:
-            await self._incident("P2", "clock_skew", f"clock not verified: {type(exc).__name__}")
+            await self._incident(
+                "P2", "clock_skew", f"clock not verified: {type(exc).__name__}; {then}"
+            )
             return True
-        after = self._clock.now()
-        skew = (server - (before + (after - before) / 2)).total_seconds()
         if abs(skew) <= MAX_CLOCK_SKEW_S:
             log.info("clock checked", skew_s=round(skew, 3))
             return False
         await self._incident(
-            "P2", "clock_skew", f"system clock is {skew:+.1f} s from Alpaca's: nothing armed today"
+            "P2", "clock_skew", f"system clock is {skew:+.1f} s from Alpaca's: {then}"
         )
         return True
+
+    async def _measure_skew(self) -> float:
+        """Seconds between the system clock and Alpaca's. A reading's window includes the
+        retries inside the call, so one that is out of tolerance is taken again, up to
+        CLOCK_TRIES, and the one with the shortest round trip counts. A first call that fails
+        raises: the clock is unverified."""
+        best: tuple[timedelta, float] | None = None
+        for _ in range(CLOCK_TRIES):
+            before = self._clock.now()
+            try:
+                server = await self._d.market.clock()
+            except Exception:
+                if best is None:
+                    raise
+                break
+            after = self._clock.now()
+            skew = (server - (before + (after - before) / 2)).total_seconds()
+            if best is None or after - before < best[0]:
+                best = (after - before, skew)
+            if abs(best[1]) <= MAX_CLOCK_SKEW_S:
+                break
+        assert best is not None  # the first call either answered or raised
+        return best[1]
+
+    async def _load_assets(self, *, final: bool) -> None:
+        """The asset list R-003 checks. Filled in place, since LiveInputs holds the same dict.
+        A failure at boot is tried again before the scan (DECISIONS D-051)."""
+        try:
+            assets = await self._d.market.assets()
+        except Exception as exc:  # R-003 then rejects every entry
+            log.exception("asset list unavailable")
+            then = "entries are refused today" if final else "trying again before the scan"
+            await self._incident("P2", "assets_unavailable", f"{type(exc).__name__}: {exc}; {then}")
+            return
+        self._assets.update({a.symbol: a for a in assets})
 
     async def _start_book(self, name: BookName) -> None:
         """Reconcile, seed on first use, raise the peak, then start the book's service."""
@@ -484,6 +526,10 @@ class DayOrchestrator:
         if self._clock.now() >= self.plan.times.flatten:
             return
         await self._clock.sleep_until(self.plan.subscribe_at)
+        if self._skew:  # one slow or failed answer at boot mustn't cost the whole day
+            self._skew = await self._clock_skewed(final=True)
+        if not self._assets:
+            await self._load_assets(final=True)
         await self._subscribe()
 
     async def _subscribe(self) -> None:
@@ -547,7 +593,11 @@ class DayOrchestrator:
         else:
             missed = (await self._engine.arm(list(result.signals), snapshots)).missed
         await record_skips(self._journal, sorted(self._books), missed, "missed_at_arm", at=now)
-        self._engine_task = asyncio.create_task(self._engine.run(self._events), name="triggers")
+        self._engine_task = self._watch(
+            asyncio.create_task(self._engine.run(self._events), name="triggers"),
+            "the trigger engine",
+            on_death=self._drop_trigger_feed,
+        )
 
     async def _scan(self) -> ScanResult | None:
         d, plan = self._d, self.plan
@@ -614,8 +664,11 @@ class DayOrchestrator:
         engine = self._engine
         if engine is not None and self._clock.now() < last_entry:
             for b in self._books.values():
-                b.worker = asyncio.create_task(
-                    self._work(b, engine.queues[b.name]), name=f"book-{b.name}"
+                b.worker = self._watch(
+                    asyncio.create_task(
+                        self._work(b, engine.queues[b.name]), name=f"book-{b.name}"
+                    ),
+                    f"Book {b.name}'s trigger worker",
                 )
             await self._clock.sleep_until(last_entry)
         if engine is not None:
@@ -649,24 +702,61 @@ class DayOrchestrator:
                 b.busy = False
 
     async def _stop_trading(self) -> None:
-        """Stop the trigger engine and the book workers, never in the middle of a decision."""
+        """Stop the trigger engine and the book workers, never in the middle of a decision.
+        One that already died was reported by ``_watch``; its error isn't raised again here,
+        so the day still falls through to FLATTEN (resolution 12)."""
         if self._engine_task is not None:
             self._engine_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._engine_task
             self._engine_task = None
-        if self._events is not None:
-            self._d.hub.remove_consumer(self._events)
-            self._events = None
+        self._drop_trigger_feed()
         for b in self._books.values():
             if b.worker is None:
                 continue
             while b.busy:
                 await self._clock.sleep_until(self._clock.now() + STOP_POLL)
             b.worker.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await b.worker
             b.worker = None
+
+    def _drop_trigger_feed(self) -> None:
+        """Detach the trigger engine's queue from the hub, which would otherwise keep filling
+        it with every trade and quote."""
+        if self._events is not None:
+            self._d.hub.remove_consumer(self._events)
+            self._events = None
+
+    def _watch(
+        self,
+        task: "asyncio.Task[None]",
+        what: str,
+        *,
+        on_death: Callable[[], None] | None = None,
+    ) -> "asyncio.Task[None]":
+        """A trading task that dies mid-day is a P2 at once, not a surprise at last entry."""
+
+        def done(t: "asyncio.Task[None]") -> None:
+            exc = None if t.cancelled() else t.exception()
+            if exc is None:
+                return
+            log.error("trading task died", task=what, exc_info=exc)
+            if on_death is not None:
+                on_death()
+            self._spawn(self._report_death(what, exc))
+
+        task.add_done_callback(done)
+        return task
+
+    async def _report_death(self, what: str, exc: BaseException) -> None:
+        """The P2 for a dead trading task. Spawned, so it must never raise."""
+        try:
+            await self._incident(
+                "P2", "state_failed", f"{what} died ({type(exc).__name__}): no more entries today"
+            )
+        except Exception:
+            log.exception("could not record the incident", task=what)
 
     # ---------------------------------------------------------------- FLATTEN
 
@@ -682,18 +772,34 @@ class DayOrchestrator:
             for hook in self._d.at_close:
                 hook()
         for _, b in self._sorted_books():
+            result = await self._after_close(b)
+            if result is None:
+                await self._not_flat(b, "the after-close pass failed", again=True)
+            elif not result.flat:
+                held = ", ".join(f"{s} {q}" for s, q in sorted(result.remaining.items()))
+                stops = ", ".join(f"{s} @ {p}" for s, p in sorted(result.protected.items()))
+                bare = ", ".join(f"{s} {q}" for s, q in sorted(result.unprotected.items()))
+                why = f"held after the close: {held}; GTC stops: {stops or 'none'}"
+                await self._not_flat(b, why + (f"; NO STOP: {bare}" if bare else ""), again=True)
+
+    async def _after_close(self, b: _Book) -> FlattenResult | None:
+        """The after-close pass, tried up to AFTER_CLOSE_TRIES times while it raises or leaves
+        shares without a GTC stop: one broker error isn't a P1 on a book that may well be flat,
+        nor a reason to leave shares bare overnight (DECISIONS D-051). Returns the last result;
+        None when every try raised."""
+        result: FlattenResult | None = None
+        for attempt in range(1, AFTER_CLOSE_TRIES + 1):
             try:
                 result = await b.service.flatten(purpose="eod_flatten")
             except Exception:
-                log.exception("after-close flatten failed", book=b.name)
-                await self._not_flat(b, "the after-close pass failed")
-                continue
-            if not result.flat:
-                held = ", ".join(f"{s} {q}" for s, q in sorted(result.remaining.items()))
-                stops = ", ".join(f"{s} @ {p}" for s, p in sorted(result.protected.items()))
-                await self._not_flat(
-                    b, f"held after the close: {held}; GTC stops: {stops or 'none'}"
-                )
+                log.exception("after-close flatten failed", book=b.name, attempt=attempt)
+            else:
+                if not result.unprotected:
+                    return result
+                log.warning("shares still without a GTC stop", book=b.name, bare=result.unprotected)
+            if attempt < AFTER_CLOSE_TRIES:
+                await self._clock.sleep_until(self._clock.now() + self._retry)
+        return result
 
     async def _flatten_until_close(self, b: _Book) -> None:
         times = self.plan.times
@@ -713,14 +819,18 @@ class DayOrchestrator:
                 return
             await self._clock.sleep_until(min(self._clock.now() + self._retry, times.close))
 
-    async def _not_flat(self, b: _Book, why: str) -> None:
-        """RISK.md §5: a book not flat by close - 2 min is a P1, halted until a human acks."""
-        if b.not_flat_alerted:
+    async def _not_flat(self, b: _Book, why: str, *, again: bool = False) -> None:
+        """RISK.md §5: a book not flat by close - 2 min is a P1, halted until a human acks.
+        The after-close pass reports ``again``: what is still held and which GTC stops protect
+        it is news even after the 15:58 alert."""
+        first = not b.not_flat_alerted
+        if not (first or again):
             return
         b.not_flat_alerted = True
         message = f"Book {b.name}: {why}"
         await self._incident("P1", "not_flat", message)
-        await self._halts.halt(b.name, "p1_incident", detail=message)
+        if first:
+            await self._halts.halt(b.name, "p1_incident", detail=message)
 
     # ---------------------------------------------------------------- EOD, REVIEW, REPORT
 
@@ -739,6 +849,9 @@ class DayOrchestrator:
             regime=signal_features(self._regime, self.day, self._d.events),
         )
         tracks = self._heartbeat.tracks if self._heartbeat is not None else {}
+        # A run that started after the close sampled none of the session: unknown, not 0.
+        sampled = self._started < self.plan.times.close
+        until = max(self.plan.shadow_at, self._clock.now() + EOD_RETRY_WINDOW)
         for name, b in self._sorted_books():
             track = tracks.get(name)
             close = BookClose(
@@ -746,11 +859,24 @@ class DayOrchestrator:
                 broker=b.broker,
                 records=b.records,
                 equity_sod=b.equity_sod,
-                max_drawdown=track.max_drawdown if track else Decimal(0),
+                max_drawdown=(track.max_drawdown if track else Decimal(0)) if sampled else None,
             )
-            await close_book(ctx, close)
+            await self._close_book(ctx, close, until=until)
         for _, b in self._sorted_books():
             await b.service.stop()
+
+    async def _close_book(self, ctx: EodContext, close: BookClose, *, until: datetime) -> None:
+        """EOD, retried every EOD_RETRY until ``until``: its steps are marked as they finish,
+        so a retry resumes where the failure stopped (DECISIONS D-051)."""
+        while True:
+            try:
+                await close_book(ctx, close)
+                return
+            except Exception:
+                if self._clock.now() + EOD_RETRY >= until:
+                    raise
+                log.exception("EOD failed; retrying", book=close.book)
+            await self._clock.sleep_until(self._clock.now() + EOD_RETRY)
 
     async def _review(self) -> None:
         """Shadow outcomes at close + 12 min (S§7.2). Claude's review joins here in Phase 5."""
@@ -771,7 +897,8 @@ class DayOrchestrator:
                 slippage_fixed=strategy.shadow.slippage_fixed,
                 slippage_pct=strategy.shadow.slippage_pct,
             ),
-            signals=list(self._signals.values()) or await load_signals(self._journal, self.day),
+            # From the journal, not the scan-time copies: they lack triggered_at (D-051).
+            signals=await load_signals(self._journal, self.day),
         )
         if not run.ok:
             await self._incident("P3", "shadow_unavailable", run.error or "no SIP bars")
@@ -801,6 +928,9 @@ class DayOrchestrator:
         await self._backup()
         if d.recorder is not None:
             d.recorder.close()
+        if self._failed:  # left unmarked: the rerun that finishes the day rebuilds it (D-051)
+            log.warning("report written without the failed states", failed=self._failed)
+            return
         await mark_step(self._journal, self.day, "report", self._clock.now(), str(md.name))
 
     async def _backup(self) -> None:
@@ -863,8 +993,12 @@ class DayOrchestrator:
         for task in self._tasks:
             task.cancel()
         for task in self._tasks:
-            with contextlib.suppress(asyncio.CancelledError):
+            try:
                 await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # a finished day's outcome mustn't turn into a traceback here
+                log.exception("background task failed")
         self._tasks = []
         for _, b in self._sorted_books():
             await b.service.stop()
@@ -881,9 +1015,7 @@ class DayOrchestrator:
             return [f"{self.day} is not a trading day: run-day would exit"]
         plan = day_plan(d.calendar, self.day, d.settings, d.risk)
         lines = plan.lines()
-        before = self._clock.now()
-        server = await d.market.clock()
-        skew = (server - (before + (self._clock.now() - before) / 2)).total_seconds()
+        skew = await self._measure_skew()
         verdict = "ok" if abs(skew) <= MAX_CLOCK_SKEW_S else "TOO FAR: nothing would be armed"
         lines.append(f"clock skew {skew:+.2f} s ({verdict})")
         row = await self._journal.fetch_one(
@@ -913,7 +1045,7 @@ class DayOrchestrator:
             halts = [h.reason for h in await self._halts.active(name)]
             lines.append(
                 f"Book {name}: cash {account.cash}, equity {account.equity}, "
-                f"{len(held)} positions {held or ''}, {len(orders)} open orders; "
+                f"{len(held)} positions{f' {held}' if held else ''}, {len(orders)} open orders; "
                 f"ledger {'E ' + str(equity) if seeded else 'not seeded (seeds at boot)'}; "
                 f"halts {', '.join(halts) or 'none'}"
             )

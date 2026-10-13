@@ -1,14 +1,18 @@
-# HANDOFF: Phase 3 in progress (updated 2026-10-12, evening)
+# HANDOFF: Phase 3 done, G3 set for Tuesday 2026-10-13 (updated 2026-10-12, late evening)
 
 To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, and the Phase 3 plan at `C:\Users\Admin\.claude\plans\squishy-popping-honey.md`. Everything below the line further down is the older G2 handoff, kept for its environment notes and the Phase 2 code map.
 
 ## Where Phase 3 stands
 
-- **Done:** P3.1–P3.8. The records are D-040 to D-049.
-  - 665 tests pass offline in about 90 s. The golden and replay round trips take about 45 s of that.
-  - ruff, format and mypy are clean.
-  - The gate is at 100% coverage.
-  - The repo is git (HEAD 4249c4f). The Phase 3 work is uncommitted; commit only when the user asks.
+- **Done:** P3.1–P3.9. The records are D-040 to D-050. The repo is git; Phase 3 was committed as b2f9f09 by the user. The D-051 changes are uncommitted; commit only when the user asks.
+- **G3 prerequisites (2026-10-12 evening):**
+  - **P1.8 is done:** the human verified every date in `events.yaml`.
+  - **Universe:** built for 2026-10-13, with 1,587 eligible.
+  - **Dry run:** ran at 20:42, so it showed the finished 10-12 session. It must be run again on the morning of the session.
+  - **Skipped:** the `--sim` rehearsal and the `trader stream` check. Run-day's own 09:35 subscription answers Q2.
+- **D-051 (late 2026-10-12):** a read-only pre-flight review of the run-day path found no blockers. It led to eight fixes on failure paths, each with a test that fails on the old code.
+  - The suite is now 682 tests. ruff, format and mypy are clean, and the gate is still at 100% coverage. A second review, of the fixes themselves, found no blocker; its minor points are fixed too (D-051 item 9).
+  - The G3 runbook below includes the review's operator guidance.
 - **P3.9 (backtest) is done.** It ran 2026-04-01 to 2026-10-09; the results are at the end of D-042.
   - **Book A:** −20.2%; longs average −0.31R.
   - **But:** the shadow R for longs lies between −0.31 and +0.14 depending on how a trigger minute that touched both trigger and stop is read. The approved rule is the pessimistic end.
@@ -18,41 +22,66 @@ To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, and
   - `trader replay --date D` replays a recorded day into `runtime/replay/<date>/`. It exits 1 on any divergence or difference from the journal.
   - The golden day is `tests/golden/standard_day.json` (`UPDATE_GOLDEN=1` rewrites it).
   - `ReplayBroker` matches reads by the nearest recorded call, unused answers first (D-049 says why).
-- **Then 🛑 G3.** Prerequisites (human):
-  - P1.8: verify `config/events.yaml`;
-  - `uv run trader universe build`;
-  - during market hours, `uv run trader stream --symbols <~23 symbols> --minutes 2 --news` (Q2);
-  - H0.2 isn't needed for Book A.
-  - Then optionally `uv run trader run-day --books A --sim`, and the supervised `uv run trader run-day --books A` started by 08:25 ET. Before it, give the pass criteria (memory `gate-pass-criteria`).
+- **Then 🛑 G3 on 2026-10-13**, with the runbook below; the human has it. Not pending: H0.2 isn't needed for Book A.
 
-## 🛑 G3: the supervised paper session (draft; confirm the pass criteria with the user first)
+## 🛑 G3: the supervised paper session, Tuesday 2026-10-13 (runbook as given to the human)
 
-**Before the day** (the human, in VS Code's PowerShell):
-1. **P1.8:** check every date in `config/events.yaml` against its `source:` link, and set `verified_by_human: true`. R-021's blackouts depend on it.
-2. **Universe:** `uv run trader universe build` the evening before (or by 08:00). Expect 800–2,000 eligible symbols; this answers Q6.
-3. **Stream** (any market hour before G3): `uv run trader stream --symbols <the 3 regime symbols plus about 20 liquid names> --minutes 2 --news`. The ack shows how the 30-symbol limit counts channels (Q2). If trades plus quotes get a 405, run-day falls back to trades only.
-4. **Optional, any time:** `uv run trader run-day --books A --dry-run`. It runs boot's checks read-only and prints the timeline.
-5. **Optional, a full rehearsal:** `uv run trader run-day --books A --sim`, a day of live data with a simulated broker under `runtime/sim/<date>/`.
+**Before 08:25** (the human, in PowerShell at the repo root):
+1. **Machine:**
+   - Set sleep to Never while plugged in, and keep the PC on AC power.
+   - Pause Windows Update for a week. 10-13 is Patch Tuesday.
+   - Run the session in a standalone PowerShell window. A VS Code restart kills its integrated terminal, and run-day with it.
+2. **Pre-flight:** run `uv run trader run-day --books A --dry-run` at about 08:10. Expect:
+   - `session 2026-10-13`;
+   - `clock skew … (ok)`;
+   - `universe: 1587 eligible`;
+   - `Book A: cash 999.99, equity 999.99, 0 positions, 0 open orders; ledger E 999.98; halts none`;
+   - no `KILL FILE PRESENT` line.
+3. **Start:** `uv run trader run-day --books A`. Within about 30 s, look for `stream connected … /v2/iex`.
 
-**The session:** `uv run trader run-day --books A`, started by 08:25 ET and watched. It exits after the report at about 16:30 (13:30 on an early close).
+**During the day:**
+- **Never stop run-day before its DONE line.** No Ctrl+C, no closing the window, no sleep. Stopping it skips the 15:55 flatten, and the broker-side stops are DAY orders that expire at 16:00 (D-051).
+- **Run no other `trader` command meanwhile.** They share the API rate limit and the single market-data stream, and they write to the same log. The exception is the emergency stop.
+- **Milestones:**
+  - 09:29 `subscribed`, then 09:35 `scan done` and the armed signals.
+  - At 15:30 (or right after the scan if nothing was armed), `day state FLATTEN` means waiting for 15:55.
+  - Then 16:05 EOD, 16:12 shadow outcomes, 16:30 the report, and `run-day 2026-10-13: DONE`.
+- **Expected, not a problem:**
+  - one P2 `subscription_limited` near 09:35 (that's Q2's answer);
+  - a `broker_rejected` decision (the price reversed before the order);
+  - a P3 `scan_slow`.
+- **Stop and paste:** copy the lines and paste them to Claude, and leave run-day running. Do this for:
+  - any P1 or traceback;
+  - `not_flat`, `scan_deadline_missed` or `state_failed`;
+  - a repeated `subscription_refused`;
+  - `stream_unavailable` not followed by `stream connected`;
+  - `data_stale`;
+  - a `clock_skew` or `assets_unavailable` that the 09:29 re-check doesn't clear.
+- **To stop trading** (emergency): from a second PowerShell at the repo root, run `New-Item -ItemType File runtime\KILL`.
+  - Run-day halts Book A, flattens it, and still finishes the day.
+  - Afterwards, `Remove-Item runtime\KILL`.
+  - Use `uv run trader flatten --book A` only if run-day isn't running.
+- **If run-day exits early:**
+  - Copy its last lines.
+  - Run `uv run trader run-day --books A` again at once, the same day. It resumes: it adopts today's position and still flattens at 15:55.
+  - A restart costs the replay criterion.
 
 **Pass:**
-- the run ends `run-day <date>: DONE`;
-- the journal has signals, decisions, orders, fills, trades, `daily_stats` and shadow outcomes;
-- Book A is flat by close − 2 min;
-- `runtime/reports/<date>.md` exists;
-- there are no P1 incidents;
-- `uv run trader replay --date <date>` ends with `the replay matches the recorded day`.
-
-**Stop and paste everything on:**
-- any P1 or traceback;
-- `not_flat`, `scan_deadline_missed` or `subscription_refused`;
-- a `state_failed` incident.
+- the last line is `run-day 2026-10-13: DONE`;
+- no P1 incidents (`runtime\reports\2026-10-13.md` lists them);
+- Book A is flat: after DONE, `uv run trader doctor --quick` shows `0 positions, 0 orders` for Book A;
+- the report exists;
+- the journal has signals, decisions, shadow outcomes and `daily_stats` (orders, fills and trades if anything triggered);
+- if the day ran with no restart, kill or halt, `uv run trader replay --date 2026-10-13` ends with `the replay matches the recorded day`. It prints nothing until it's done.
 
 **Afterwards (Claude):**
 - review the journal, the log and the report with the human;
 - add the day as a golden replay test;
-- record G3 in DECISIONS, including the real IEX trade condition codes seen (D-043 left them unverified).
+- record G3 in DECISIONS, including:
+  - the real IEX trade condition codes seen (D-043 left them unverified);
+  - the Q2 answer;
+  - whether the live 09:35 opening-range bars matched the final ones (compare `or_scan.parquet` with `or_bars` after the next universe build);
+- clear any halt with `uv run trader resume --book A` before the next session.
 
 ## Phase 3 code map
 

@@ -1,10 +1,12 @@
 """Entry triggers (S§3.3, P3.2; DECISIONS D-043)."""
 
 import asyncio
+import sqlite3
 from collections.abc import AsyncIterator
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -162,6 +164,32 @@ async def test_run_consumes_a_hub_queue(journal: Journal) -> None:
     await hub.join()
     task.cancel()
     assert [e.price for e in drain(eng.queues["A"])] == [D("12.75")]
+
+
+async def test_a_failed_write_is_skipped_and_the_next_trade_triggers(journal: Journal) -> None:
+    clock = SimClock(ARM_AT)
+    await save_signals(journal, [sig("XYZ", 1)])
+    eng = engine(journal, clock)
+    await eng.arm(await load_signals(journal, DAY), {})
+    write, failures = journal.write, []
+
+    async def locked_once(fn: Any) -> Any:  # as a database another program holds would
+        if not failures:
+            failures.append(fn)
+            raise sqlite3.OperationalError("database is locked (test)")
+        return await write(fn)
+
+    journal.write = locked_once  # type: ignore[method-assign]
+    hub: asyncio.Queue[object] = asyncio.Queue()
+    task = asyncio.create_task(eng.run(hub))  # type: ignore[arg-type]
+    hub.put_nowait(trade("XYZ", "12.75"))
+    hub.put_nowait(trade("XYZ", "12.76"))
+    await asyncio.wait_for(hub.join(), timeout=5)  # a dead engine never drains the queue
+    assert not task.done()  # the engine lives on (D-051)
+    task.cancel()
+    assert len(failures) == 1
+    assert [e.price for e in drain(eng.queues["A"])] == [D("12.76")]  # once, on the next trade
+    assert (await statuses(journal))["XYZ"][0] == "triggered"
 
 
 async def test_a_batch_is_served_by_rank_and_books_are_independent() -> None:

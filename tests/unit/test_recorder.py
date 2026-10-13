@@ -65,6 +65,26 @@ def test_a_file_cut_short_still_reads(tmp_path: Path) -> None:
     assert all(r["kind"] == "trade" for r in survivors)
 
 
+def test_a_killed_run_and_its_rerun_both_read_back(tmp_path: Path) -> None:
+    """A run killed mid-file leaves a member with no trailer; the rerun appends its own member
+    after it. Every complete record of both reads back (D-051)."""
+    rec = Recorder(tmp_path, DAY, flush_every=1)
+    for i in range(50):
+        rec.record_event(trade(i))
+    rec.close()
+    path = tmp_path / "2026-10-09" / STREAM_FILE
+    data = path.read_bytes()
+    path.write_bytes(data[: len(data) - 40])  # killed: no trailer, the tail torn
+    with Recorder(tmp_path, DAY) as rerun:
+        for i in range(50, 53):
+            rerun.record_event(trade(i))
+    seen = [r["ts"] for r in read_jsonl(path)]
+    first = seen[:-3]
+    assert 40 <= len(first) < 50
+    assert first == [(T0 + timedelta(seconds=i)).isoformat() for i in range(len(first))]
+    assert seen[-3:] == [(T0 + timedelta(seconds=i)).isoformat() for i in range(50, 53)]
+
+
 def test_reopening_appends_a_second_gzip_member(tmp_path: Path) -> None:
     with Recorder(tmp_path, DAY) as rec:
         rec.record_event(trade(0))

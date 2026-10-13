@@ -67,6 +67,7 @@ log = structlog.get_logger(__name__)
 
 FLATTEN_POLL_S = 0.5
 LOOKUP_RETRY_S = 1.0
+CANCEL_SETTLE_POLLS = 20  # after the close: wait up to 20 polls for cancels to become final
 
 MarketHours = tuple[datetime, datetime]  # today's regular session: (open, close)
 
@@ -76,7 +77,8 @@ class FlattenResult:
     flat: bool
     remaining: dict[str, int] = field(default_factory=dict)  # symbol -> shares still held
     market_closed: bool = False  # nothing could be sold: positions keep GTC stops instead
-    protected: dict[str, Decimal] = field(default_factory=dict)  # GTC stops placed
+    protected: dict[str, Decimal] = field(default_factory=dict)  # symbol -> its GTC stop price
+    unprotected: dict[str, int] = field(default_factory=dict)  # symbol -> shares without one
 
 
 async def flatten_account(
@@ -177,39 +179,61 @@ async def _protect_overnight(
     queued for the open), and give every uncovered position a GTC stop at its planned stop."""
     open_orders = await broker.open_orders()
     covered: dict[str, int] = {}
+    protected: dict[str, Decimal] = {}
     cancelled = False
     for order in _with_legs(open_orders):
         await records.apply(order)
-        if order.side == "sell" and order.time_in_force == "gtc" and stop_is_working(order):
+        if _overnight_stop(order):
             covered[order.symbol] = covered.get(order.symbol, 0) + order.qty - order.filled_qty
+            if order.stop_price is not None:
+                protected[order.symbol] = order.stop_price
         elif not order.final:
             await _cancel_quietly(broker, order)
             cancelled = True
-    if cancelled:
+    # A cancel's answer only means requested: shares stay held (qty_available 0) until it is
+    # final, and a stop sized from them would come up short (DECISIONS D-051).
+    for _ in range(CANCEL_SETTLE_POLLS if cancelled else 0):
         await clock.sleep_until(clock.now() + poll)
+        still = [o for o in _with_legs(await broker.open_orders()) if not o.final]
+        if all(_overnight_stop(o) for o in still):
+            break
     held = await _held_positions(broker)
-    protected: dict[str, Decimal] = {}
+    unprotected: dict[str, int] = {}
     for position in held:
-        need = min(position.qty - covered.get(position.symbol, 0), position.qty_available)
+        uncovered = position.qty - covered.get(position.symbol, 0)
+        need = min(uncovered, position.qty_available)
         stop = await records.planned_stop(position.symbol)
-        if need <= 0 or stop is None:
-            continue
-        cid = await records.pending_sell(
-            symbol=position.symbol, qty=need, leg="stop", purpose="protective_stop", stop_price=stop
-        )
-        try:
-            order = await broker.submit_stop(position.symbol, need, stop, cid, tif="gtc")
-        except BrokerError as exc:
-            await records.mark(cid, "lost" if isinstance(exc, SubmitUncertain) else "rejected")
-            log.error("overnight stop failed", symbol=position.symbol, error=str(exc))
-            continue
-        await records.apply(order)
-        protected[position.symbol] = stop
+        if need > 0 and stop is not None:
+            cid = await records.pending_sell(
+                symbol=position.symbol,
+                qty=need,
+                leg="stop",
+                purpose="protective_stop",
+                stop_price=stop,
+            )
+            try:
+                order = await broker.submit_stop(position.symbol, need, stop, cid, tif="gtc")
+            except BrokerError as exc:
+                await records.mark(cid, "lost" if isinstance(exc, SubmitUncertain) else "rejected")
+                log.error("overnight stop failed", symbol=position.symbol, error=str(exc))
+            else:
+                await records.apply(order)
+                protected[position.symbol] = stop
+                uncovered -= need
+        if uncovered > 0 and position.qty > 0:
+            unprotected[position.symbol] = uncovered
+            log.error(
+                "shares left without a GTC stop overnight",
+                symbol=position.symbol,
+                shares=uncovered,
+                planned_stop=str(stop),
+            )
     return FlattenResult(
         flat=not held,
         remaining={p.symbol: p.qty for p in held},
         market_closed=True,
-        protected=protected,
+        protected={s: p for s, p in protected.items() if any(h.symbol == s for h in held)},
+        unprotected=unprotected,
     )
 
 
@@ -249,6 +273,11 @@ def _open(hours: MarketHours | None, now: datetime) -> bool:
 
 def _with_legs(orders: list[Order]) -> list[Order]:
     return [o for order in orders for o in (order, *order.legs)]
+
+
+def _overnight_stop(order: Order) -> bool:
+    """A working GTC sell stop: what keeps a position protected after the close."""
+    return order.side == "sell" and order.time_in_force == "gtc" and stop_is_working(order)
 
 
 async def _held_positions(broker: BrokerAdapter) -> list[Position]:

@@ -119,6 +119,55 @@ async def test_rest_calls_replay_with_their_results_and_durations() -> None:
         await drive(replay_clock, replay.snapshots(["ABC"], feed="iex"))
 
 
+async def test_answers_recorded_before_the_boot_are_ignored() -> None:
+    """A run that died during boot left its answers in the file: the run that wrote boot.json
+    must not be served them (D-051)."""
+    clock = SimClock(T0)
+    sink: list[dict[str, Any]] = []
+    rec = RecordingMarketData(Inner(clock), clock, sink.append)  # type: ignore[arg-type]
+    await drive(clock, rec.assets(status=None))  # the attempt that died
+    sink[0]["result"] = []  # told apart: that attempt "saw" no assets
+    await clock.advance(timedelta(minutes=6))
+    boot = clock.now()
+    await drive(clock, rec.assets(status=None))  # the run that wrote boot.json
+    replay_clock = SimClock(boot)
+    replay = ReplayMarketData(sink, replay_clock, since=boot)
+    assert replay.skipped == 1
+    served = await drive(replay_clock, replay.assets(status=None))
+    assert [a.symbol for a in served] == ["XYZ"]  # this run's answer, not the dead one's
+    assert replay.divergences == []
+    await drive(replay_clock, replay.assets(status=None))  # only the one answer was kept
+    assert len(replay.divergences) == 1
+
+
+class AlpacaTime:
+    """Alpaca's clock: 0.4 s ahead of ours, answering in 0.2 s."""
+
+    def __init__(self, sim: SimClock) -> None:
+        self.sim = sim
+
+    async def clock(self) -> datetime:
+        await self.sim.sleep_until(self.sim.now() + timedelta(seconds=0.2))
+        return self.sim.now() + timedelta(seconds=0.4)
+
+
+async def test_a_replayed_clock_reads_the_live_skew_whenever_it_asks() -> None:
+    """A late or slow live boot asks at other instants than its replay does (D-051)."""
+    clock = SimClock(T0)
+    sink: list[dict[str, Any]] = []
+    rec = RecordingMarketData(AlpacaTime(clock), clock, sink.append)  # type: ignore[arg-type]
+
+    async def skew(market: Any, sim: SimClock) -> timedelta:
+        before = sim.now()
+        server = await market.clock()
+        return server - (before + (sim.now() - before) / 2)
+
+    live = await drive(clock, skew(rec, clock))
+    replay_clock = SimClock(T0 + timedelta(seconds=60))  # the replay asks a minute later
+    replayed = await drive(replay_clock, skew(ReplayMarketData(sink, replay_clock), replay_clock))
+    assert live == replayed == timedelta(seconds=0.5)
+
+
 def event(kind: str, symbol: str, seconds: float, price: str = "12.70",
           cond: tuple[str, ...] = ("@",)) -> RecordedEvent:  # fmt: skip
     ts = at(seconds)

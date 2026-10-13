@@ -196,25 +196,43 @@ class RecordingMarketData:
 class ReplayMarketData:
     """Serves a recorded day's REST answers back on the injected clock."""
 
-    def __init__(self, records: Iterable[Mapping[str, Any]], clock: Clock) -> None:
+    def __init__(
+        self,
+        records: Iterable[Mapping[str, Any]],
+        clock: Clock,
+        *,
+        since: datetime | None = None,
+    ) -> None:
+        """``since``: answers recorded before it are ignored. They belong to an attempt that
+        died before writing its boot record, and would be served to this one (D-051)."""
         self._clock = clock
         self._calls: dict[str, deque[Mapping[str, Any]]] = defaultdict(deque)
+        self.skipped = 0
         for record in records:
+            if since is not None and parse_et_iso(record["start_rx"]) < since:
+                self.skipped += 1
+                continue
             self._calls[str(record["key"])].append(record)
         self._last: dict[str, Mapping[str, Any]] = {}
         self.divergences: list[str] = []
 
     @classmethod
-    def from_file(cls, path: Path, clock: Clock) -> "ReplayMarketData":
-        return cls(read_jsonl(path) if path.exists() else [], clock)
+    def from_file(
+        cls, path: Path, clock: Clock, *, since: datetime | None = None
+    ) -> "ReplayMarketData":
+        return cls(read_jsonl(path) if path.exists() else [], clock, since=since)
 
     async def calendar(self, start: date, end: date) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = await self._serve("calendar", {"start": start, "end": end})
         return result
 
     async def clock(self) -> datetime:
-        result: datetime = await self._serve("clock", {})
-        return result
+        """Alpaca's recorded time, moved by however far this ask is from the recorded one, so
+        the replay reads the same skew live read, whenever it asks (D-051)."""
+        asked = self._clock.now()
+        result, record = await self._answer("clock", {})
+        moved: datetime = result + (asked - parse_et_iso(record["start_rx"]))
+        return moved
 
     async def assets(
         self, *, status: Literal["active", "inactive"] | None = "active"
@@ -255,6 +273,11 @@ class ReplayMarketData:
         return None
 
     async def _serve(self, method: str, args: Mapping[str, Any]) -> Any:
+        result, _ = await self._answer(method, args)
+        return result
+
+    async def _answer(self, method: str, args: Mapping[str, Any]) -> tuple[Any, Mapping[str, Any]]:
+        """The recorded result (or error) of the next matching call, and its record."""
         key = call_key(method, args)
         queue = self._calls.get(key)
         if queue:
@@ -272,7 +295,7 @@ class ReplayMarketData:
             err = record["error"]
             kind = _ERRORS.get(err["type"], AlpacaError)
             raise kind(int(err["status"]), str(err["message"]), str(err["path"]), err.get("code"))
-        return _decode(method, record["result"])
+        return _decode(method, record["result"]), record
 
 
 @dataclass(frozen=True)
