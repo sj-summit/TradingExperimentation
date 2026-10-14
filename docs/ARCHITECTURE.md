@@ -713,7 +713,7 @@ Per-role contents:
 |---|---|---|
 | Unit | indicators (ATR Wilder vs hand-computed fixtures), OR features, rel_vol, ranking, sizing, rounding, IDs, calendar (DST, early close), ledger (T+1 across weekends and holidays), every RiskGate rule, breakers, reason codes, schema validation, sanitizer, DSL evaluator, bootstrap determinism | pytest, hypothesis |
 | Component | MarketDataHub reconnect and backfill (fake WS), ExecutionService with SimBroker (fills, partials, rejects, timeouts, unprotected-position path), ClaudeCliClient with `fake_claude.py` | pytest-asyncio |
-| Integration | Full simulated day: synthetic fixture day plus one recorded real day, through `replay` with SimClock and SimBroker, compared against a golden journal snapshot | pytest |
+| Integration | Full simulated day: synthetic fixture day plus one recorded real day (G3 run 2, `tests/golden/recordings/2026-10-14/`, D-054), through `replay` with SimClock, SimBroker or the recorded broker answers, compared against a golden journal snapshot | pytest |
 | Manual (gated) | `smoke paper`, `smoke llm`, a supervised `run-day` | CLI |
 
 Default `pytest` options: `-m "not paper and not llm and not network"`. The network is blocked in tests (pytest-socket or equivalent).

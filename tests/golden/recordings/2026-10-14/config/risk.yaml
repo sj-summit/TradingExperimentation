@@ -1,0 +1,39 @@
+# risk.example.yaml → copy to config/risk.yaml
+# Configurable risk defaults (RISK.md §2). Values may only be loosened up to the hard caps in
+# src/trader/risk/caps.py — config loading fails fast otherwise.
+# Claude Code: do not loosen any value here (raise a limit, lower a floor, shorten a window) unless the human
+# explicitly asks in the current session.
+# Changing this file during an evaluation epoch starts a new epoch. In live mode its SHA-256 must match
+# config/LIVE_APPROVED.
+
+max_risk_per_trade_pct: 1.0        # of start-of-day equity (cap 2.0)
+daily_loss_limit_pct: 3.0          # pre-trade: realized loss + open risk + new risk must fit (R-015);
+                                   # intraday: realized + unrealized loss hitting it → flatten + halt book for the day (cap 5.0)
+max_position_pct: 50.0             # notional per position, of start-of-day equity (cap 100.0, no leverage)
+max_concurrent_positions: 2        # cap 3
+max_entries_per_day: 2             # cap 6
+
+min_price: 5.00                    # floor 1.00
+max_price: 1000.00
+min_stop_distance: 0.03            # $ per share
+max_stop_distance_pct: 5.0         # of price
+max_chase_pct: 0.30                # over trigger price
+entry_timeout_s: 10
+unprotected_position_max_s: 5      # R-020
+partial_fill_cancel_max_s: 20      # R-020: partly filled shares, while their entry's cancel is pending at the broker (D-053)
+
+entry_window_start: "09:35:03"
+# last_entry and flatten times come from settings.yaml schedule (bounded by caps relative to close)
+
+data_stale_halt_s: 120             # no market data during RTH → halt new entries
+symbol_quote_max_age_s: 15         # R-016: stream copy, else REST latest trade/quote at submission
+
+drawdown_breaker_pct: 10.0         # peak-to-trough per book → halt until human resumes
+consecutive_losing_days_breaker: 5 # → halt until human resumes
+reconcile_cash_tolerance: 1.00     # $; larger ledger/broker mismatch → incident, no trading next session until resolved
+account_equity_band_pct: 20.0      # R-019: broker equity within ±20% of ledger equity
+
+event_blackout_before_min: 5       # around high-impact events in config/events.yaml (R-021)
+event_blackout_after_min: 10
+
+llm_failures_degrade_after: 3      # Book B: no new entries for the rest of the day after this many failed calls

@@ -10,9 +10,9 @@
 
 ```
 STATUS
-current_phase: 3 (plan approved 2026-10-12: C:\Users\Admin\.claude\plans\squishy-popping-honey.md; order P3.1, P3.3, P3.6a, P3.9, P3.2, P3.4, P3.6b, P3.7, P3.8a, P3.5, P3.8b, G3)
-last_completed_task: G3 run 1 on 2026-10-13 (D-052: not passed, one P1) and its fixes (D-053: timeout from acceptance, cancels sent again, R-020 allowance of 20 s while an entry's cancel is pending, flatten keeps its exits; review follow-ups); 714 tests; next is G3 run 2 (human gate) after `trader resume --book A`
-open_questions: read docs/HANDOFF.md first. H0.2 open until doctor's claude checks pass (claude's folder added to PATH; CLAUDE_TOKEN_CREATED); Phase 1 done-checks pending (stream, news, filings; universe build done 2026-10-12: 1,587 eligible for 2026-10-13); Q2 open (G3 answers it: a 405 on about 23 symbols x trades+quotes means channels count toward the 30), Q6 partly answered; backtest verdict hangs on the trigger-minute rule (D-042 results: shadow R between -0.31 and +0.14 for longs), human to decide on resolving it from the trade tape
+current_phase: 3 done (G3 passed 2026-10-14, D-054; H4's direction noted in D-042); next is Phase 4 in plan mode. Due before G4b, not before Phase 4's coding: the shadow-entry and trigger-minute fix, and D-054's fixes that touch live trading
+last_completed_task: G3 passed on run 2, 2026-10-14 (D-054): DONE, no P1, flat, replay matches; D-053 handled VRNS's 12 s acceptance; the code that ran is commit cc6eb60; golden replay test from the recorded day (tests/golden/recordings/2026-10-14, trimmed to 3.3 MB); 715 tests
+open_questions: read docs/HANDOFF.md first. Next from Claude, two plans for the human: (1) D-054's minor fixes (paper fee check, stuck-exit timing, stale marks, entry_delay clock, skip-reason order, polling budget, dirty-tree flag); (2) the shadow entry on gap-through trigger bars together with the trigger-minute rule (D-042: shadow R between -0.31 and +0.14 for longs; bar-open entries lower both bounds), then restate D-042's shadow numbers and H4; both land before G4b, since Book B's veto value and the review are judged on shadow outcomes. H0.2 open until doctor's claude checks pass (claude's folder added to PATH; CLAUDE_TOKEN_CREATED); Phase 1 done-checks pending (stream, news, filings); Q2 open (run 2: 14 symbols x trades+quotes = 28, under 30, no 405; a 405 at 16 or more symbols would mean channels count toward the 30), Q6 partly answered
 eval_epoch: 0
 ```
 
@@ -137,7 +137,7 @@ Specs referenced: ARCHITECTURE.md (A§), STRATEGY.md (S§), RISK.md (R§).
   - long-only leg stats and long+short shadow stats;
   - mean R by rel_vol bucket (H4 sanity).
   Run it on at least 6 months of history. **Never include the LLM in a backtest.**
-- [ ] 🛑 **HUMAN GATE G3:** The human approves running Book A in paper for one supervised session: `uv run trader run-day --books A`. Afterwards, Claude Code reviews the journal and report with the human, and adds a golden replay test from that recorded day.
+- [x] 🛑 **HUMAN GATE G3:** The human approves running Book A in paper for one supervised session: `uv run trader run-day --books A`. Afterwards, Claude Code reviews the journal and report with the human, and adds a golden replay test from that recorded day. **Passed 2026-10-14 on run 2.** Run 1 had a P1 (D-052, D-053); the verdict, D-053 at the open and the golden replay are in D-054.
 
 **Done when:**
 

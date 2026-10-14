@@ -1,0 +1,38 @@
+{
+ "signal": [
+  "20261014-AADX-orb5 long triggered 11.03 10.96",
+  "20261014-ARWR-orb5 shadow_short not_armed 57.94 58.16",
+  "20261014-BSP-orb5 long expired 58.54 58.26",
+  "20261014-BWA-orb5 long triggered 60.13 59.95",
+  "20261014-CIFR-orb5 long triggered 10.84 10.72",
+  "20261014-CRWG-orb5 shadow_short not_armed 10.99 11.18",
+  "20261014-FAST-orb5 long triggered 49.75 49.65",
+  "20261014-FNGU-orb5 shadow_short not_armed 35.83 35.98",
+  "20261014-GENB-orb5 shadow_short not_armed 12.18 12.28",
+  "20261014-GSG-orb5 shadow_short not_armed 36.65 36.72",
+  "20261014-KBH-orb5 long triggered 41.65 41.51",
+  "20261014-KLRA-orb5 long triggered 10.55 10.45",
+  "20261014-NTRS-orb5 long expired 163.71 163.39",
+  "20261014-PGR-orb5 shadow_short not_armed 205.63 206.04",
+  "20261014-PHM-orb5 shadow_short not_armed 109.02 109.31",
+  "20261014-STT-orb5 long triggered 163.55 163.22",
+  "20261014-VRNS-orb5 long triggered 48.33 48.14",
+  "20261014-VSTM-orb5 shadow_short not_armed 7.72 7.78",
+  "20261014-XHB-orb5 long expired 93.70 93.49",
+  "20261014-XYZ-orb5 shadow_short not_armed 75.34 75.55"
+ ],
+ "decision": [
+  "20261014-AADX-orb5 A 0 chased",
+  "20261014-BWA-orb5 A 1 taken",
+  "20261014-CIFR-orb5 A 0 capacity_positions",
+  "20261014-FAST-orb5 A 1 taken",
+  "20261014-KBH-orb5 A 0 entry_unfilled",
+  "20261014-KLRA-orb5 A 0 chased",
+  "20261014-STT-orb5 A 0 insufficient_settled_cash",
+  "20261014-VRNS-orb5 A 0 entry_unfilled"
+ ],
+ "trade": [
+  "A-20261014-BWA-orb5 8 60.25 59.92 stop",
+  "A-20261014-FAST-orb5 10 49.79 49.639 stop"
+ ]
+}

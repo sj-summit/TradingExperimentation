@@ -1,0 +1,151 @@
+# settings.example.yaml → copy to config/settings.yaml
+# Operational settings. Risk limits live in risk.yaml; hard ceilings in src/trader/risk/caps.py.
+# All times are America/New_York. Unknown keys are an error.
+# Changing strategy/llm/data values during an evaluation epoch starts a new epoch (STRATEGY.md §9).
+
+mode: paper                      # paper | live   (live requires the full gate in RISK.md §7 — human only)
+timezone: America/New_York
+
+books:
+  A:
+    enabled: true
+    policy: baseline             # rules only (STRATEGY.md §4)
+    account_env_prefix: ALPACA_PAPER_A   # reads ALPACA_PAPER_A_KEY_ID / ALPACA_PAPER_A_SECRET_KEY
+  B:
+    enabled: true
+    policy: llm_filtered         # rules + Claude veto (STRATEGY.md §5)
+    account_env_prefix: ALPACA_PAPER_B
+
+data:
+  feed: iex                      # iex (free, single venue) | sip ($99/mo plan) — see DECISIONS D-006
+  credentials_env_prefix: ALPACA_DATA   # falls back to Book B's keys if ALPACA_DATA_* are empty
+  stream_symbol_limit: 30        # free-plan WebSocket symbol limit
+  rest_rate_limit_per_min: 180   # stay under the plan limit (verify current value in Alpaca docs)
+  rest_batch_symbols: 200        # symbols per multi-symbol REST request
+  regime_symbols: [SPY, QQQ, IWM]
+  stale_warn_s: 30
+
+strategy:
+  name: orb5_sip_long
+  universe:
+    exchanges: [NYSE, NASDAQ, AMEX, ARCA, BATS]
+    exclude_symbol_chars: [".", "/", "-", " "]
+    min_adv14: 1000000           # shares/day, SIP daily bars, 14 prior sessions
+    min_atr14: 0.50              # $, Wilder ATR, 14 prior sessions
+    min_history_sessions: 14
+    exclude_corporate_action_days: 1   # skip if split/reverse split effective today or yesterday
+  selection:
+    or_minutes: 5
+    scan_at: "09:35:03"
+    scan_deadline: "09:36:30"
+    min_open_price: 5.00
+    rel_vol_min: 1.0
+    rel_vol_lookback_sessions: 14
+    top_n: 20
+    min_or_volume: 1000          # feed shares; IEX noise guard (set 0 when feed: sip)
+    min_or_vol_avg: 200          # feed shares; IEX noise guard (set 0 when feed: sip)
+    record_shadow_shorts: true
+  entry:
+    trigger_offset: 0.01         # trigger = OR high + $0.01
+    limit_buffer_pct: 0.10       # limit = ceil_cent(max(trigger, last) × 1.0010), ≥ trigger + $0.02, ≤ max_chase_price (risk.yaml max_chase_pct)
+    min_limit_buffer: 0.02
+    entry_timeout_s: 10
+  exit:
+    stop_atr_fraction: 0.10      # stop = floor_cent(trigger − 0.10 × ATR14)
+    take_profit_r: null          # none — winners run to flatten time (paper's rule)
+  shadow:
+    slippage_fixed: 0.01
+    slippage_pct: 0.02
+
+schedule:                        # normal days; early-close days shift per ARCHITECTURE.md §3
+  universe_refresh: "07:30"
+  boot: "08:30"
+  premarket_scan: "09:00"
+  premarket_brief: "09:05"
+  premarket_brief_deadline: "09:28"
+  last_entry: "15:30"            # min(this, close − 30 min)
+  flatten: "15:55"               # close − 5 min
+  eod_reconcile: "16:05"
+  shadow_outcomes: "16:12"       # SIP bars must be >15 min old; the 15:55 bar qualifies from ~16:11
+  postclose_review: "16:15"
+  reports: "16:30"
+
+llm:
+  enabled: true                  # Book B only; Book A never depends on the LLM
+  provider: claude_cli           # claude_cli (subscription token) | anthropic_api (API key, billed per token)
+  claude_bin: claude             # tests point this at scripts/fake_claude.py
+  min_cli_version: "2.1.268"
+  config_dir: runtime/claude-config    # isolated CLAUDE_CONFIG_DIR (DECISIONS D-002)
+  sandbox_dir: runtime/llm_sandbox     # empty cwd for every call
+  max_calls_per_day: 12
+  max_concurrent: 1              # Book B degradation threshold lives in risk.yaml (llm_failures_degrade_after)
+  roles:
+    premarket:
+      model: opus
+      effort: high
+      timeout_s: 600
+      max_turns: 3
+      allow_web: false           # E5 experiment; when true, tools = WebSearch,WebFetch and max_turns 12
+      max_candidates: 40
+      max_news_per_symbol: 8
+    vet:
+      model: sonnet
+      effort: low
+      timeout_s: 60
+      max_turns: 3
+      max_wait_s: 60             # Book B pending policy (STRATEGY.md §5.4)
+      revet_premarket: false
+      anonymize_entities: false  # E1 experiment
+      max_news_per_symbol: 5
+    review:
+      model: opus
+      effort: high
+      timeout_s: 600             # repair attempt only if it can finish by 16:29 (reports at 16:30)
+      max_turns: 3
+      history_days: 10           # past daily summaries recalled into the review pack (STRATEGY.md §6.6)
+      notable_untraded: 5        # extra triggered signals reviewed: largest |shadow_r| that no book traded (§6.5)
+      max_news_per_target: 5
+
+lessons:
+  min_n_per_side: 20
+  min_effect_r: 0.10
+  ci_level: 0.90
+  bootstrap_resamples: 10000
+  bootstrap_seed: 20261008
+  max_playbook_lessons: 15
+
+news:
+  alpaca_stream: true
+  premarket_lookback_hours: 18
+  vet_lookback_hours: 24
+
+edgar:
+  user_agent_env: SEC_EDGAR_USER_AGENT   # REQUIRED by SEC fair-access policy: "Your Name your-email@domain" in .env
+  max_rps: 5
+  lookback_days: 5
+  flag_forms: ["S-1", "S-1/A", "S-3", "S-3ASR", "F-1", "F-3", "424B1", "424B2", "424B3", "424B4", "424B5", "424B7", "8-K", "6-K", "DEF 14A", "10-Q", "10-K"]
+
+notify:
+  provider: none                 # none | ntfy | discord
+  ntfy_server: https://ntfy.sh
+  ntfy_topic_env: NTFY_TOPIC     # topic name is a secret-ish value; keep it in .env
+  discord_webhook_env: DISCORD_WEBHOOK_URL
+  daily_summary: true
+
+fees:                            # sell-side estimates; Alpaca is commission-free but passes these through (DECISIONS D-019)
+  sec_fee_per_million_sold: 20.60      # SEC Section 31, effective 2026-04-04
+  finra_taf_per_share_sold: 0.000195   # FINRA TAF: paused (0) 2026-10-01..2026-12-31; this rate from 2027-01-01
+  finra_taf_max_per_trade: 9.79
+
+storage:
+  db_path: runtime/trader.db
+  logs_dir: runtime/logs
+  recordings_dir: runtime/recordings
+  reports_dir: runtime/reports
+  llm_artifacts_dir: runtime/llm
+  retention_days: 60
+  db_backups_keep: 30
+
+live:                            # used only in Phase 7, human-configured
+  size_multiplier: 0.5
+  first_sessions_at_half_size: 10

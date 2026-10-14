@@ -1138,6 +1138,134 @@ Append-only. Each entry records context, the decision, its consequences, and sou
   - **`trader replay --date 2026-10-13` now diverges by design:** the fixed code makes calls that recording lacks. G3 run 2's recording becomes the golden replay.
   - **Tests:** SimBroker 9, config 2, service 15, flatten 5, orchestrator 1, counting the review follow-ups. With the old service, the slow-open scenario reproduces G3 run 1's P1. 714 tests pass.
 
+## D-054 — G3 run 2 (2026-10-14): passed; D-053 at the open; the golden replay; review findings
+- **Date:** 2026-10-14 · **Status:** **G3 passed** (the human, 2026-10-14), on the condition that `trader doctor --quick` shows Book A with 0 positions and 0 orders. The fixes below await a plan.
+- **The run:**
+  - Boot 08:11:54 (skew 0.165 s), DONE 16:30. 1,559 eligible; the scan took 2.53 s with a 0.34 s bar wait; 20 selected, 11 longs armed, 9 shadow shorts.
+  - **8 triggered:**
+    - VRNS, KBH, BWA and FAST were taken.
+    - KLRA and AADX were `chased`.
+    - CIFR was `capacity_positions` (R-006, R-007).
+    - STT was `insufficient_settled_cash`.
+    - BSP, NTRS and XHB expired at 15:30.
+  - **Trades:**
+    - VRNS and KBH didn't fill; their timeouts cancelled them.
+    - BWA (8 @ 60.25) and FAST (10 @ 49.79) filled. Their OTO legs stopped them out at 10:11 and 10:14: −$2.64 (−1.10 R) and −$1.51 (−1.08 R).
+    - Net −$4.21 with fee estimates; equity went from 1000.29 to 996.08.
+  - **One incident:** P3 `partial_fill_protected` (FAST). The log has no warning or error lines.
+  - **Flat from 10:14:02.** The 15:55 flatten pass and the after-close pass found nothing to do.
+- **Pass criteria:** all held.
+  - The run reached DONE with no P1, and the report and journal were written.
+  - The recording shows no positions or open orders at 15:55, 16:00 and 16:05.
+  - `trader replay --date 2026-10-14` matches: 2 min 27 s on the full 81 MB recording.
+- **How D-053 behaved at the open** (from `broker-A.jsonl.gz`):
+  - **Acceptance, measured from submission:** VRNS took 12.13 s (09:35:30.39 → 42.52, broker time). Later in the morning: KBH 0.056 s, BWA 0.009 s, FAST 0.015 s.
+  - **The timeout counted from acceptance:**
+    - VRNS's cancel went out 10.5 s after acceptance (09:35:52.86), after `get_order` reported `new`. The old rule would have sent it at about 09:35:40, during `pending_new`, as it did with FIGS.
+    - KBH's cancel also went out 10.5 s after acceptance. Polls ran every 1.05 s.
+  - **Cancels:**
+    - VRNS showed `pending_cancel` from the DELETE until it was cancelled 11.1 s later. That status isn't one that triggers a re-send, so nothing was sent again.
+    - KBH's cancel landed in 20–35 ms.
+    - There were two cancel calls all day, no `cancel rejected` and no `entry_stuck`.
+  - **The partial fill:**
+    - FAST filled 5 of 10 shares at 09:44:00.77 (broker time) and the other 5 shares 1.04 s later.
+    - Its OTO leg was `accepted` 3 ms after the completing fill and `new` after 20 ms.
+    - No cancel was pending, so the 5 s limit applied, not the 20 s allowance. The 5 shares were bare 1.04 s, and the P3 followed as D-032 intends. No cancel, standalone stop or sell was needed.
+  - **Not exercised live:** these remain covered only by SimBroker tests:
+    - the 20 s allowance and its landing;
+    - a standalone stop, `stop_breached`, or an exit at work;
+    - re-sends and `cancel rejected`;
+    - the 30 s acceptance cap and `entry_stuck`;
+    - a flatten with a position open.
+- **Alpaca facts (new or confirmed):**
+  - **`pending_cancel` never comes on the trade stream;** only REST shows it, as on 10-13.
+  - **The open-orders list:**
+    - It trailed `get_order` on every change read within 0.1 s, by at least 17–60 ms.
+    - It never lists `held` legs.
+    - Once it mixed a stale entry row with a fresh leg row.
+  - **REST order payloads now carry `group_id` and `group_role`:** every 10-14 answer has them, and no 10-12 or 10-13 answer does. Stream payloads still lack them. D-051's note that live orders carry neither is out of date for REST.
+  - **`submitted_at` is rewritten at acceptance,** for legs too. BWA's leg went 31.278 → 31.932 → 31.964.
+  - **Fees:**
+    - The overnight charge from 10-13 to 10-14 was $0.02 again (1000.29 → 1000.27, with no trades), against our $0.01 estimate.
+    - Intraday, cash moved exactly by the fill notionals.
+    - Tomorrow's boot cash (996.12 less tonight's charge) will show the charging unit for 5 sell fills on 2 orders.
+  - **The PC clock** ran 0.20–0.22 s behind Alpaca at the open and 0.41 s behind exchange time by 16:00, a drift of about 33 ms/h. Boot measured 0.165 s.
+  - **Q2 is still open:** 14 symbols (SPY, QQQ, IWM and 11 longs) × 2 channels = 28, under 30. No 405.
+  - **The order-API budget:**
+    - Busy polling ran at 182–186 calls/min with one entry working, against the limiter's 180/min plus a burst of 10.
+    - The steady state was 27/min, with no 429s.
+- **The golden replay** (G3's last step):
+  - **The fixture:** `tests/golden/recordings/2026-10-14/` holds:
+    - the recording, with the stream cut to every trade plus at most one quote per symbol every 10 s (81 MB → 2.1 MB; 3.3 MB in all);
+    - the three config files that ran, whose SHA-256s matched `boot.json`;
+    - the live journal's signals, final decisions and trades.
+    - `tests/fixtures/g3_day.py` rebuilds all of it.
+  - **Quotes don't matter to the replay:** they feed only R-016's quote age, which the trades keep fresh. Trades only, quotes every 10 s and quotes every 1 s all replay identically.
+  - **The test:** `test_the_g3_day_replays_as_it_was_recorded` runs in 22 s. It requires:
+    - DONE, with no divergence;
+    - the recorded rows reproduced;
+    - the replay's journal equal to `tests/golden/g3_2026-10-14.json` (`UPDATE_GOLDEN=1` rewrites it).
+    - It gives the same result under two hash seeds.
+  - **Against the live journal:**
+    - Fills, trades and the ledger are reproduced exactly.
+    - Orders, decisions, risk checks, signals, shadow outcomes and the P3 match apart from timestamps that differ by milliseconds.
+    - Only `max_intraday_dd` differs (8.96 vs 9.47), because it samples marked equity every 10 s.
+  - **The code that ran is commit cc6eb60.** `boot.json` says 24c7814 because the tree was uncommitted.
+- **Review findings:**
+  - Four reviewers each covered one area, and a separate verifier tried to refute every finding. None was refuted, and none blocks G3.
+  - **Major (measurement, not trading): shadow entries on a gap-through trigger bar.**
+    - S§7.2 books the trigger price even when the trigger bar opened past it.
+    - CRWG's shadow short was booked at +5.08 R. Entered at the bar's open, it's +3.07 R.
+    - A verifier re-simulated the backtest cache:
+      - 562 of 2,260 triggered signals (25%) gapped through their trigger;
+      - with bar-open entries, mean shadow R falls by 0.11 R for longs and 0.17 R for shorts;
+      - D-042's optimistic long bound falls from +0.135 to +0.022.
+    - **The human chose to plan this together with the trigger-minute rule.**
+  - **Minor:**
+    1. **Paper charges fees, but D-034's paper cash check leaves estimates out.**
+       - The difference (−0.04 at the 10-14 EOD) grows by each day's fees and reaches the $1 tolerance in about 20–50 sessions.
+       - From then on every EOD halts the book with `cash_mismatch`. This is D-052 item 5.
+    2. **`_exit_covers` times its 20 s from Alpaca's `submitted_at`,** which paper rewrites at acceptance.
+       - An exit accepted after 10 s counts as cover for about 30 s.
+       - SimBroker doesn't rewrite `submitted_at`, so its test can't see this.
+    3. **`exposure()` marks a symbol at cost when its IEX price is stale,** not at the broker's mark as D-047 says.
+       - BWA's price was stale for 369 s of a 1,715 s hold, which hid up to −$1.28.
+    4. **`trades.entry_delay_ms` subtracts a PC time from a broker time.**
+       - BWA stored 892 ms (about 695 ms on one clock); FAST stored 1175 ms (about 977 ms).
+       - The skew is checked only at boot.
+    5. **The book's pre-gate cash skip makes the reason depend on price.**
+       - STT got `insufficient_settled_cash` although R-007 also bound; the right reason would be `capacity_entries`.
+       - D-044 ranks capacity first. The backtest uses the same order.
+    6. **Busy polling uses the whole 180/min limiter with one entry.** Two entries at the open exceed it; run 1's P1 window was limiter-paced.
+    7. **`boot.json` records only HEAD's SHA,** not whether the tree was dirty.
+  - **Notes:**
+    - **Counts and statistics:**
+      - `daily_stats.n_signals` and `n_triggered` count shorts and live triggers, unlike S§7.1. Today they equal the SIP counts.
+      - `max_intraday_dd` is the sampled peak-to-trough of marked equity, on a fee-excluded basis. Today's 9.47 is FAST's +$5.4 unrealized given back plus the loss. The specs don't define it.
+      - Fee estimates are rounded per fill: 0.06 today, against 0.04 per order or 0.03 per day.
+      - Trade P&L and VWAPs are unquantized when fills have mixed prices.
+    - **Protection timing:**
+      - `pending_new` stops count as cover (D-032), while acceptance at the open takes 10–14 s.
+      - The 1 s grace and R-020 compare broker times with local now; the gap was 0.2–0.4 s today.
+      - R-016's quote age is clamped to 0, because exchange timestamps run ahead of the PC.
+    - **Records, logs and the report:**
+      - The backup is taken before DONE is journaled.
+      - The report's "regime in force (prior session)" line includes today's calendar tags.
+      - No log line marks entry cancels, exits or the flatten passes.
+      - The P3 doesn't give the bare time or what covered the shares.
+      - Armed longs that never trigger get no decision row; `signals.status = expired` is their record.
+    - **Triggers and data:**
+      - IEX lag and the odd-lot rule delayed 4 of 8 live triggers by 1–7 minutes. KLRA (+1.14 R on SIP) was chased as a result.
+      - IEX and SIP opening ranges disagreed on 5 of 20 directions, and 8 of 11 long triggers lay inside the SIP range.
+      - The pessimistic trigger-minute rule stored BWA and FAST as stopped in their trigger minute. Live, they held 29–30 minutes, with the same R.
+      - Eight sub-$1 symbols were eligible, with ATR above their price. 29 of the 192 `no_bar` symbols are under $5.
+    - **Config:** `partial_fill_cancel_max_s` has a floor but no ceiling in `caps.py`; setting one is the human's call.
+- **Next:**
+  - **Phase 3 is done.** Its done-when list is met: this session, its replay, and the backtest with H4's direction noted in D-042.
+  - A plan for the minor fixes.
+  - A plan for the shadow-entry rule together with the trigger-minute decision; it restates D-042's shadow numbers and H4.
+  - Both land before G4b, because Book B's veto value and the review are judged on shadow outcomes. Neither blocks Phase 4's coding.
+
 ---
 
 ## Open questions to resolve during the build (record answers as new entries)

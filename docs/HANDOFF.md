@@ -1,29 +1,42 @@
-# HANDOFF: G3 run 1 not passed (one P1); fixes done (D-053); next G3 run 2 (updated 2026-10-13, evening)
+# HANDOFF: G3 passed (run 2, 2026-10-14); next, two plans for the human (updated 2026-10-14, evening)
 
 **Latest:**
-- **G3 run 1 (D-052):** it reached DONE, the book was flat from 09:36, the report was written, and `trader replay` matches. One P1, so the human ruled it not passed.
-  - FIGS sat 13 s in `pending_new`. Our 10 s timeout cancel was queued by paper, and the order filled 16 of 26 shares meanwhile.
-  - The shares stayed bare past R-020's 5 s.
-- **D-053 (fixes, approved by the human):**
-  - the timeout counts from acceptance;
-  - cancels are sent again while the order works;
-  - R-020 allows up to 20 s while a partly filled entry's cancel is pending;
-  - a market sell at work counts as cover;
-  - a flatten never cancels its own exit;
-  - SimBroker models the open.
-- **Tests:** 714 pass. The slow-open scenario reproduces run 1's P1 on the old code and passes on the new.
-- **State now** (2026-10-13 evening):
-  - The human resumed Book A (19:49) and built the 2026-10-14 universe (1,559 eligible).
-  - The live-versus-final opening-range check passed (D-053).
-  - Uncommitted: D-052's records and all of D-053; commit only if asked.
-- **Next:** 🛑 G3 run 2 on 2026-10-14, with the runbook below.
-  - Still pending: the fee check, the trigger-minute decision, and D-051's deferred items.
+- **G3 passed on run 2 (D-054).** The run reached DONE with no P1, Book A was flat from 10:14, the report and journal were written, and `trader replay` matches.
+  - **The day:** 4 entries. VRNS and KBH didn't fill; BWA and FAST stopped out. Net −$4.21.
+  - **D-053 at the open:**
+    - VRNS waited 12.1 s for acceptance, and its cancel went 10.5 s after it, never during `pending_new`.
+    - FAST's partial fill was bare 1.04 s, which gave the expected P3.
+  - **Not yet exercised live:** the 20 s partial-fill allowance, re-sends, `cancel rejected`, `entry_stuck`, and a flatten with a position open.
+  - **The human's last check:** `uv run trader doctor --quick` should show Book A with `0 positions, 0 orders`. The recording already shows it flat at 16:05.
+- **Commits:**
+  - `cc6eb60` is the D-052/D-053 tree, exactly what ran.
+  - Uncommitted: D-054, the golden replay test and fixture, and these PLAN and HANDOFF updates. Commit only if asked.
+- **Golden replay:**
+  - The fixture is `tests/golden/recordings/2026-10-14/` (3.3 MB): the stream is trimmed to every trade plus at most one quote per symbol every 10 s.
+  - Rebuilder: `tests/fixtures/g3_day.py`. Pinned journal: `tests/golden/g3_2026-10-14.json`.
+  - The test is `test_the_g3_day_replays_as_it_was_recorded` (22 s). 715 tests pass.
+- **Next** (Claude, in plan mode; the human approves each plan):
+  1. **D-054's minor fixes:**
+     - the paper fee check, before about session 15;
+     - stuck-exit timing from our own send;
+     - stale marks from the broker's price;
+     - `entry_delay_ms` on one clock, plus a periodic skew reading;
+     - the skip-reason order;
+     - the polling budget;
+     - a dirty-tree flag in `boot.json`;
+     - small log and report items.
+  2. **The shadow entry on gap-through trigger bars, together with the trigger-minute rule.** The human chose to decide them together.
+     - Compare bar-open entry with resolving from the SIP trade tape, with backtest numbers for each; the human picks.
+     - Then restate D-042's shadow numbers and H4.
+  - **Timing:** Phase 3's done-when list is met, since D-042 already notes H4's direction. Both plans must land before G4b, Phase 4's first live session, because Book B's veto value and the review are judged on shadow outcomes. Neither blocks Phase 4's coding.
+  - **Still pending:** H0.2 (the Claude token, needed for G4a) and Q2 (14 symbols didn't reach the limit).
 
-To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, and the Phase 3 plan at `C:\Users\Admin\.claude\plans\squishy-popping-honey.md`. Everything below the line further down is the older G2 handoff, kept for its environment notes and the Phase 2 code map.
+To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, and D-052 to D-054. The G3 runbook below served both runs and is the template for G4b. Everything below the line further down is the older G2 handoff, kept for its environment notes and the Phase 2 code map.
 
 ## Where Phase 3 stands
 
-- **Done:** P3.1–P3.9. The records are D-040 to D-050. The repo is git; Phase 3 was committed as b2f9f09 by the user. The D-051 changes are uncommitted; commit only when the user asks.
+- **Done:** P3.1–P3.9 and G3. The records are D-040 to D-054.
+- **Commits:** the repo is git. The user committed Phase 3 as b2f9f09 and D-051 as 24c7814; D-052 and D-053 are cc6eb60. Commit only when the user asks.
 - **G3 prerequisites (2026-10-12 evening):**
   - **P1.8 is done:** the human verified every date in `events.yaml`.
   - **Universe:** built for 2026-10-13, with 1,587 eligible.

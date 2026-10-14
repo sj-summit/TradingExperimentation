@@ -2,8 +2,10 @@
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -12,9 +14,10 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
+from tests.fixtures import g3_day
 from tests.fixtures.days import DAY
 from tests.fixtures.exec_harness import RISK, SETTINGS
-from tests.fixtures.golden import GOLDEN, dumps, golden_run, golden_snapshot
+from tests.fixtures.golden import GOLDEN, dumps, golden_run, golden_snapshot, snapshot
 from tests.helpers import REPO
 from trader.cli import app
 from trader.core.clock import ET, SimClock, fmt_iso
@@ -22,7 +25,7 @@ from trader.core.models import OrderIntent
 from trader.execution.broker import OrderNotCancelable, OrderRejected
 from trader.execution.replay import ReplayBroker
 from trader.execution.sim_broker import SimBroker
-from trader.orchestrator.replay import replay_day
+from trader.orchestrator.replay import comparable, diff, replay_day
 from trader.orchestrator.simdrive import drive
 
 D = Decimal
@@ -102,6 +105,31 @@ def test_trader_replay_compares_with_the_journal(repo: Path) -> None:
     missing = CliRunner().invoke(app, ["--root", str(repo), "replay", "--date", "2026-10-14"])
     assert missing.exit_code == 1
     assert "no recording to replay" in missing.output
+
+
+@pytest.mark.timeout(300)  # a whole real day: about 30 s
+async def test_the_g3_day_replays_as_it_was_recorded(tmp_path: Path) -> None:
+    """G3 run 2 (2026-10-14; D-054): Alpaca paper's real answers, replayed through the current
+    engine, give the journal the live session wrote, and the engine asks nothing the recording
+    lacks. The replay's own journal is pinned too; ``UPDATE_GOLDEN=1`` rewrites it."""
+    report = await replay_day(
+        recordings=g3_day.RECORDINGS,
+        day=g3_day.G3_DAY,
+        out=tmp_path / "replay",
+        settings=g3_day.settings(),
+        risk=g3_day.risk(),
+        events=g3_day.events(),
+    )
+    assert report.state == "DONE"
+    assert report.divergences == []
+    with closing(sqlite3.connect(tmp_path / "replay" / "trader.db")) as conn:
+        conn.row_factory = sqlite3.Row
+        assert diff(g3_day.recorded(), comparable(conn, g3_day.G3_DAY)) == []
+        got = dumps(snapshot(conn))
+    if os.environ.get("UPDATE_GOLDEN") == "1":
+        g3_day.GOLDEN.write_text(got + "\n", encoding="utf-8")
+    want = g3_day.GOLDEN.read_text(encoding="utf-8")
+    assert got + "\n" == want, "run UPDATE_GOLDEN=1 if intended"
 
 
 # ---------------------------------------------------------------- ReplayBroker
