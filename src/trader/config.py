@@ -282,6 +282,7 @@ class RiskConfig(_Model):
     max_chase_pct: Dec = Field(ge=0)
     entry_timeout_s: StrictInt = Field(gt=0)
     unprotected_position_max_s: StrictInt = Field(gt=0)
+    partial_fill_cancel_max_s: StrictInt = Field(gt=0)  # R-020 while an entry's cancel pends
     entry_window_start: ClockTime
     data_stale_halt_s: StrictInt = Field(gt=0)
     symbol_quote_max_age_s: StrictInt = Field(gt=0)
@@ -474,6 +475,11 @@ def consistency_problems(settings: Settings, risk: RiskConfig) -> list[str]:
         )
     if not risk.min_price < risk.max_price:
         out.append(f"risk.min_price ({risk.min_price}) must be below risk.max_price")
+    if risk.partial_fill_cancel_max_s < risk.unprotected_position_max_s:
+        out.append(
+            f"risk.partial_fill_cancel_max_s ({risk.partial_fill_cancel_max_s}) must be at least "
+            f"risk.unprotected_position_max_s ({risk.unprotected_position_max_s})"
+        )
     entry_timeout = settings.strategy.entry.entry_timeout_s
     if entry_timeout != risk.entry_timeout_s:
         out.append(

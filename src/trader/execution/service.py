@@ -92,8 +92,10 @@ async def flatten_account(
     heartbeat: Callable[[], Awaitable[object]] | None = None,
     poll_s: float = FLATTEN_POLL_S,
 ) -> FlattenResult:
-    """Make the account flat: cancel every order, wait until each is final, re-read the
-    positions, sell the shares no order holds, and repeat until flat or ``deadline``.
+    """Make the account flat: cancel every order except a market sell already at work (the
+    exit itself, D-053), wait until each is final, re-read the positions, sell the shares no
+    order holds, and repeat until flat or ``deadline``. A symbol whose buy, stop or cancel isn't
+    final yet waits (Alpaca refuses a sell while a buy is open, D-030); the others are sold.
 
     The caller has already halted the book, so nothing new is submitted meanwhile. Every sell
     it places carries ``purpose`` (D-044).
@@ -114,21 +116,24 @@ async def flatten_account(
         open_orders = await broker.open_orders()
         for order in open_orders:
             await records.apply(order)
+        waiting = False
         for order in _with_legs(open_orders):
             watched.add(order.id)
+            if exit_at_work(order):
+                continue  # the exit itself: let it fill
+            waiting = True
             await _cancel_quietly(broker, order)
-        if open_orders:
+        if waiting:
             await clock.sleep_until(clock.now() + poll)
-            if await broker.open_orders():
-                if clock.now() >= deadline:
-                    await _refresh(broker, records, watched)
-                    return FlattenResult(flat=False, remaining=await _held(broker))
-                continue
+            open_orders = await broker.open_orders()
+        blocked = {o.symbol for o in _with_legs(open_orders) if not exit_at_work(o)}
         held = await _held_positions(broker)
-        if not held:
+        if not held and not open_orders:
             await _refresh(broker, records, watched)
             return FlattenResult(flat=True)
         for position in held:
+            if position.symbol in blocked:
+                continue  # a buy, a stop or a cancel on it isn't final yet
             if position.qty > 0 and position.qty_available > 0:  # never sell into a short
                 sold = await _sell(broker, records, clock, position, purpose)
                 if sold is not None:
@@ -136,7 +141,8 @@ async def flatten_account(
         if clock.now() >= deadline:
             await _refresh(broker, records, watched)
             return FlattenResult(flat=False, remaining={p.symbol: p.qty for p in held})
-        await clock.sleep_until(clock.now() + poll)
+        if not (waiting and blocked):  # a pass that waited on a cancel has slept already
+            await clock.sleep_until(clock.now() + poll)
 
 
 async def _sell(
@@ -280,18 +286,26 @@ def _overnight_stop(order: Order) -> bool:
     return order.side == "sell" and order.time_in_force == "gtc" and stop_is_working(order)
 
 
+def exit_at_work(order: Order) -> bool:
+    """A market sell on its way to the market: the exit itself. It is never cancelled by a
+    flatten, and its shares count as covered (D-053). One in ``pending_cancel`` isn't."""
+    return order.side == "sell" and order.type == "market" and order.status in WORKING_STOP_STATUSES
+
+
 async def _held_positions(broker: BrokerAdapter) -> list[Position]:
     return [p for p in await broker.positions() if p.qty != 0]
-
-
-async def _held(broker: BrokerAdapter) -> dict[str, int]:
-    return {p.symbol: p.qty for p in await _held_positions(broker)}
 
 
 # ---------------------------------------------------------------- the book's executor
 
 PARTIAL_FILL_GRACE_S = 1.0  # a partly filled entry gets this long to finish (D-032)
 ENTRY_POLL_S = 1.0  # open entries are polled over REST, whatever the stream says
+ACCEPT_WAIT_MAX_S = 30.0  # an entry the broker hasn't accepted by then is cancelled (D-053)
+CANCEL_RESEND_S = 2.0  # a cancel the order outlives is sent again at most this often (D-053)
+ENTRY_STUCK_S = 60.0  # still open this long after its first cancel: a P2 (D-053)
+WAITING_STATUSES = frozenset({"pending_new", "accepted"})  # received, not yet at the venue
+LIVE_STATUSES = frozenset({"new", "partially_filled", "filled"})
+RESEND_STATUSES = frozenset({"new", "accepted", "partially_filled"})  # working after a cancel
 PROTECTION_REFRESH_S = 5.0  # positions and open orders are re-read at least this often (A§3)
 RECONCILE_S = 60.0
 RECONCILE_CONFIRM_S = 5.0  # a difference must show on a second pass this much later (D-037)
@@ -363,6 +377,11 @@ class _Entry:
     filled_qty: int = 0
     first_fill_at: datetime | None = None
     cancel_requested: bool = False
+    cancel_sent_at: datetime | None = None  # the last cancel sent (D-053)
+    first_cancel_at: datetime | None = None
+    stuck_reported: bool = False
+    seen_waiting: bool = False  # this process saw it before the broker accepted it
+    live_at: datetime | None = None  # accepted at the venue: the entry timeout counts from here
     give_up_at: datetime | None = None  # an uncertain entry is called lost after this
 
     @property
@@ -414,6 +433,11 @@ class ExecutionService:
         self._bare: dict[str, datetime] = {}  # symbol -> when its unprotected time started
         self._covered_once: set[str] = set()
         self._stop_pending: set[str] = set()
+        # R-020's allowance (D-053): symbol -> None while its entry's cancel is pending, then
+        # when the cancel landed.
+        self._cancel_wait: dict[str, datetime | None] = {}
+        # Entries get_order saw final: an order list that lags mustn't bring them back.
+        self._finished: set[str] = set()
         self._partial: set[str] = set()  # protected after a partial fill: a P3 note
         self._p1_symbols: set[str] = set()
         self._closing = False  # no new entries for the rest of the day
@@ -535,7 +559,7 @@ class ExecutionService:
             return EntryResult("broker_rejected", check, reason=str(exc))
         await self._adopt(entry, order)
         if self._closing:  # a halt began while this submit was in flight
-            await _cancel_quietly(self._broker, order)
+            await self._send_cancel(entry, order, self._clock.now())
         return EntryResult("submitted", check, order)
 
     async def _uncertain(self, entry: _Entry, check: RiskCheck) -> EntryResult:
@@ -561,6 +585,16 @@ class ExecutionService:
         if entry is None or (is_final(entry.status) and not order.final):
             return
         entry.status, entry.order_id = order.status, order.id
+        if order.status in WAITING_STATUSES:
+            entry.seen_waiting = True
+        elif entry.live_at is None and order.status in LIVE_STATUSES:
+            # Only an acceptance this process saw restarts the clock: a restart or an
+            # adoption keeps counting from the submission (D-053).
+            now = self._clock.now()
+            entry.live_at = now if entry.seen_waiting else entry.submitted_at
+            if entry.seen_waiting:
+                waited = round((now - entry.submitted_at).total_seconds(), 1)
+                log.info("entry accepted", client_order_id=entry.client_order_id, waited_s=waited)
         entry.filled_qty = max(entry.filled_qty, order.filled_qty)
         if order.filled_qty and entry.first_fill_at is None:
             first = min((fill.at for fill in booked), default=None)
@@ -639,10 +673,11 @@ class ExecutionService:
         order = await self._broker.get_order(row.broker_order_id)
         if order.final:
             return False
-        await _cancel_quietly(self._broker, order)
         entry = self._entries.get(client_order_id)
         if entry is not None:
-            entry.cancel_requested = True
+            await self._send_cancel(entry, order, self._clock.now())
+        else:
+            await _cancel_quietly(self._broker, order)
         self._last_refresh = None
         self._wake.set()
         return True
@@ -679,6 +714,7 @@ class ExecutionService:
                 self._last_refresh = None
             if result.flat:
                 self._bare.clear()
+                self._cancel_wait.clear()
             return result
 
     # ---------------------------------------------------------------- the loops
@@ -692,6 +728,8 @@ class ExecutionService:
                     booked = await self._records.apply_update(event)
                     self._note(event.order, booked)
                     self._last_refresh = None
+                    if event.event == "order_cancel_rejected":
+                        self._cancel_rejected(event.order)
                 else:
                     # Someone else's order in this account: never adopt it, reconcile (D-037).
                     log.warning("foreign order", book=self.book, order=event.order.client_order_id)
@@ -720,7 +758,7 @@ class ExecutionService:
     def _next_wake(self) -> datetime:
         now = self._clock.now()
         wake = now + timedelta(seconds=ENTRY_POLL_S if self._busy() else PROTECTION_REFRESH_S)
-        deadlines = [since + self._unprotected_max for since in self._bare.values()]
+        deadlines = [self._deadline(symbol, since) for symbol, since in self._bare.items()]
         if self._confirm_at is not None:
             deadlines.append(self._confirm_at)
         return min([wake, *(d for d in deadlines if d > now)])
@@ -765,7 +803,6 @@ class ExecutionService:
     # ---------------------------------------------------------------- entry tracking
 
     async def _poll_entries(self, now: datetime) -> None:
-        timeout = timedelta(seconds=self._risk.entry_timeout_s)
         for entry in list(self._entries.values()):
             if entry.status == "submitting":
                 continue  # its submit is still in flight
@@ -777,20 +814,87 @@ class ExecutionService:
             order = await self._broker.get_order(entry.order_id)
             await self._adopt(entry, order)
             if order.final:
+                self._finished.add(entry.client_order_id)
                 del self._entries[entry.client_order_id]
                 continue
-            unfilled_too_long = not order.filled_qty and now >= entry.submitted_at + timeout
+            if entry.cancel_requested:
+                await self._follow_cancel(entry, order, now)
+                continue
             partial_done_waiting = (
                 order.filled_qty > 0
                 and entry.first_fill_at is not None
                 and now >= entry.first_fill_at + timedelta(seconds=PARTIAL_FILL_GRACE_S)
             )
-            if (unfilled_too_long or partial_done_waiting or self._closing) and (
-                not entry.cancel_requested
-            ):
-                await _cancel_quietly(self._broker, order)
-                entry.cancel_requested = True
-                self._last_refresh = None
+            if self._unfilled_too_long(entry, order, now) or partial_done_waiting or self._closing:
+                await self._send_cancel(entry, order, now)
+
+    def _unfilled_too_long(self, entry: _Entry, order: Order, now: datetime) -> bool:
+        """S§3.3's entry timeout, counted from the broker's acceptance; an order the broker
+        hasn't accepted within ACCEPT_WAIT_MAX_S is cancelled too (D-053)."""
+        if order.filled_qty:
+            return False
+        if entry.live_at is not None:
+            return now >= entry.live_at + timedelta(seconds=self._risk.entry_timeout_s)
+        if now < entry.submitted_at + timedelta(seconds=ACCEPT_WAIT_MAX_S):
+            return False
+        log.warning(
+            "entry not accepted in time: cancelling",
+            client_order_id=entry.client_order_id,
+            status=order.status,
+        )
+        return True
+
+    async def _send_cancel(self, entry: _Entry, order: Order, now: datetime) -> None:
+        """Every cancel of one of our entries goes through here (D-053)."""
+        await _cancel_quietly(self._broker, order)
+        entry.cancel_requested, entry.cancel_sent_at = True, now
+        if entry.first_cancel_at is None:
+            entry.first_cancel_at = now
+        self._last_refresh = None
+
+    async def _follow_cancel(self, entry: _Entry, order: Order, now: datetime) -> None:
+        """A cancel the order outlives. Alpaca queues a cancel sent before acceptance and the
+        order shows as working meanwhile (2026-10-13), so the cancel is sent again while the
+        order works, at most every CANCEL_RESEND_S; never while it waits for acceptance, where
+        the first is still queued (D-053)."""
+        resend_due = entry.cancel_sent_at is None or now >= entry.cancel_sent_at + timedelta(
+            seconds=CANCEL_RESEND_S
+        )
+        if order.status in RESEND_STATUSES and resend_due:
+            log.warning(
+                "entry cancel sent again: the order is still working",
+                client_order_id=entry.client_order_id,
+                status=order.status,
+            )
+            await self._send_cancel(entry, order, now)
+        first = entry.first_cancel_at
+        if (
+            not entry.stuck_reported
+            and first is not None
+            and now >= first + timedelta(seconds=ENTRY_STUCK_S)
+        ):
+            entry.stuck_reported = True
+            waited = int((now - first).total_seconds())
+            await self._incident(
+                "P2",
+                "entry_stuck",
+                f"{entry.symbol}: entry {entry.client_order_id} still {order.status} "
+                f"{waited} s after its cancel",
+            )
+
+    def _cancel_rejected(self, order: Order) -> None:
+        """``order_cancel_rejected``: harmless once the order is final; otherwise the next
+        poll sends the cancel again at once (D-053)."""
+        log.warning(
+            "cancel rejected",
+            client_order_id=order.client_order_id,
+            side=order.side,
+            type=order.type,
+            status=order.status,
+        )
+        entry = self._entries.get(order.client_order_id)
+        if entry is not None and not order.final:
+            entry.cancel_sent_at = None
 
     async def _chase(self, entry: _Entry, now: datetime) -> None:
         """An uncertain entry: look for it each tick; call it lost after its deadline."""
@@ -821,6 +925,7 @@ class ExecutionService:
             if symbol not in positions:
                 del self._bare[symbol]
                 self._stop_pending.discard(symbol)
+                self._cancel_wait.pop(symbol, None)
 
     async def _protect(self, position: Position, view: _View, now: datetime) -> None:
         symbol, qty = position.symbol, position.qty
@@ -829,7 +934,8 @@ class ExecutionService:
         covered = sum(
             order.qty - order.filled_qty
             for order in view.open_orders
-            if order.symbol == symbol and self._stop_works(order, view)
+            if order.symbol == symbol
+            and (self._stop_works(order, view) or self._exit_covers(order, now))
         )
         if covered >= qty:
             if self._bare.pop(symbol, None) is not None and symbol in self._partial:
@@ -839,20 +945,72 @@ class ExecutionService:
                 )
             self._covered_once.add(symbol)
             self._stop_pending.discard(symbol)
+            self._cancel_wait.pop(symbol, None)
             return
         since = self._bare.get(symbol)
         if since is None:
             since = self._bare[symbol] = await self._bare_since(symbol, now)
-        buys = [o for o in view.open_orders if o.symbol == symbol and o.side == "buy"]
+        buys = [
+            o
+            for o in view.open_orders
+            if o.symbol == symbol and o.side == "buy" and o.client_order_id not in self._finished
+        ]
         if buys:
             self._partial.add(symbol)  # its leg can't work until the buy is final
             await self._cut_short(buys, now)
-        elif symbol not in self._stop_pending and now < since + self._unprotected_max:
+        self._watch_cancel(symbol, buys, now)
+        deadline = self._deadline(symbol, since)
+        if not buys and symbol not in self._stop_pending and now < deadline:
             await self._cover(position, covered)
-        if now >= since + self._unprotected_max:
+        if now >= deadline:
             await self._fail_protection(
-                symbol, f"{symbol}: {qty - covered} shares without a working stop since {since}"
+                symbol,
+                f"{symbol}: {qty - covered} shares without a working stop since {since}"
+                f"{self._window_note(symbol)}",
             )
+
+    def _exit_covers(self, order: Order, now: datetime) -> bool:
+        """A market sell on its way out covers its shares, for ``partial_fill_cancel_max_s``
+        after it was sent: a stuck exit leaves them bare again, and R-020 acts (D-053)."""
+        if not exit_at_work(order):
+            return False
+        sent = order.submitted_at
+        return sent is None or now < sent + timedelta(seconds=self._risk.partial_fill_cancel_max_s)
+
+    def _watch_cancel(self, symbol: str, buys: list[Order], now: datetime) -> None:
+        """R-020's allowance for partly filled shares (D-053): while every open buy on the
+        symbol is our entry with its cancel requested or pending, the window is open; when
+        the cancel lands, the stop gets the usual limit from then on."""
+        if buys:
+            if all(self._cancelling(order) for order in buys):
+                self._cancel_wait[symbol] = None
+            else:
+                self._cancel_wait.pop(symbol, None)
+        elif symbol in self._cancel_wait and self._cancel_wait[symbol] is None:
+            self._cancel_wait[symbol] = now
+
+    def _cancelling(self, order: Order) -> bool:
+        entry = self._entries.get(order.client_order_id)  # only our own entries
+        return entry is not None and (entry.cancel_requested or order.status == "pending_cancel")
+
+    def _deadline(self, symbol: str, since: datetime) -> datetime:
+        """When bare shares become a P1: ``unprotected_position_max_s`` after the first fill;
+        with the allowance, ``partial_fill_cancel_max_s`` while the cancel is pending, then the
+        usual limit after it lands, never past the allowance (D-053)."""
+        normal = since + self._unprotected_max
+        if symbol not in self._cancel_wait:
+            return normal
+        cap = since + timedelta(seconds=self._risk.partial_fill_cancel_max_s)
+        landed = self._cancel_wait[symbol]
+        return cap if landed is None else min(cap, max(normal, landed + self._unprotected_max))
+
+    def _window_note(self, symbol: str) -> str:
+        if symbol not in self._cancel_wait:
+            return ""
+        landed = self._cancel_wait[symbol]
+        if landed is None:
+            return " (its entry's cancel was still pending)"
+        return f" (its entry's cancel landed at {landed:%H:%M:%S})"
 
     @staticmethod
     def _stop_works(order: Order, view: _View) -> bool:
@@ -888,9 +1046,10 @@ class ExecutionService:
                 continue
             first = entry.first_fill_at if entry is not None else None
             if first is None or now >= first + grace:
-                await _cancel_quietly(self._broker, order)
                 if entry is not None:
-                    entry.cancel_requested = True
+                    await self._send_cancel(entry, order, now)
+                else:
+                    await _cancel_quietly(self._broker, order)
                 self._last_refresh = None
 
     async def _cover(self, position: Position, covered: int) -> None:

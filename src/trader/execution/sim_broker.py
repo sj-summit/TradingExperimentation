@@ -13,6 +13,13 @@ a trade is at or below the limit; a stop triggers on a trade at or below it and 
 
 Faults are injected through the public ``fail_next_submit``, ``partial_next``, ``slow_cancels``
 and the stream controls, so every scenario is reproducible under SimClock.
+
+Alpaca paper at the open (DECISIONS D-053), each opt-in:
+- ``accept_delay``: a new order waits in ``pending_new`` (it can't fill) until accepted;
+- a cancel sent before acceptance is queued and processed ``queued_cancel_delay`` after it
+  (``pending_new_cancels="drop"`` never processes it); meanwhile the order shows ``new``;
+- a cancel that reaches an order already final comes back ``order_cancel_rejected``.
+``cancels`` lists every cancel call's order id.
 """
 
 import asyncio
@@ -80,6 +87,9 @@ class _SimOrder:
     filled_notional: Decimal = Decimal(0)
     filled_at: datetime | None = None
     cancel_at: datetime | None = None  # a slow cancel completes at this time
+    accept_at: datetime | None = None  # not yet at the venue: accepted at this time
+    queued_cancel: bool = False  # a cancel arrived before acceptance
+    queued_cancel_at: datetime | None = None  # ...and is processed at this time
 
     @property
     def remaining(self) -> int:
@@ -134,7 +144,11 @@ class SimBroker:
         self.reject_stop_legs = False
         self.reject_next_stop = False
         self.slow_cancels: timedelta | None = None
+        self.accept_delay: timedelta | None = None
+        self.pending_new_cancels: Literal["queue", "drop"] = "queue"
+        self.queued_cancel_delay = timedelta(0)
         self.submits: list[str] = []  # client_order_ids in submission order, faults included
+        self.cancels: list[str] = []  # order ids, one per cancel call
 
     # ---------------------------------------------------------------- fault injection
 
@@ -319,8 +333,9 @@ class SimBroker:
                 )
             )
             entry.leg_ids.append(leg.id)
+            arrived = self._arrive(entry)
             snapshot = self._snapshot(entry)
-            self._emit("new", entry)
+            self._emit(arrived, entry)
             self._match(symbol)
             return snapshot
 
@@ -346,8 +361,9 @@ class SimBroker:
 
         def create() -> Order:
             order = self._new_sell(symbol, qty, client_order_id, "stop", tif, stop_price)
+            arrived = self._arrive(order)
             snapshot = self._snapshot(order)
-            self._emit("new", order)
+            self._emit(arrived, order)
             last = self._last_trade.get(symbol)
             if last is not None and last.price <= stop_price:
                 self._match(symbol, trade=last)  # already through the stop: it triggers
@@ -364,10 +380,13 @@ class SimBroker:
 
         def create() -> Order:
             order = self._new_sell(symbol, qty, client_order_id, "market", "day", None)
+            arrived = "new"
             if not self._market_open(self._clock.now()):
                 order.status = "accepted"  # queued for the next session (Alpaca, after 16:00)
+            else:
+                arrived = self._arrive(order)
             snapshot = self._snapshot(order)
-            self._emit("new", order)
+            self._emit(arrived, order)
             self._match(symbol)
             return snapshot
 
@@ -375,12 +394,17 @@ class SimBroker:
 
     async def cancel(self, order_id: str) -> None:
         self._advance()
+        self.cancels.append(order_id)
         order = self._orders.get(order_id)
         if order is None:
             raise OrderNotFound(order_id)
         if is_final(order.status):
             raise OrderNotCancelable(f"{order_id} is already {order.status}")
         if order.status == "pending_cancel":
+            return
+        if order.accept_at is not None:  # not at the venue yet: queued until accepted
+            order.status, order.queued_cancel = "pending_cancel", True
+            self._emit("pending_cancel", order)
             return
         if self.slow_cancels is not None:
             order.status = "pending_cancel"
@@ -520,8 +544,8 @@ class SimBroker:
                 self._fill(order, price)
 
     def _fill_price(self, order: _SimOrder, trade: Trade | None) -> Decimal | None:
-        if order.status in ("held", "accepted"):
-            return None  # an inactive leg, or a sell queued for the next session
+        if order.accept_at is not None or order.status in ("held", "accepted"):
+            return None  # not at the venue yet, an inactive leg, or queued for the next session
         if order.side == "buy":
             # A trade at or below the limit fills it even while the quoted ask is higher.
             reference = trade.price if trade is not None else self._ask_or_last(order.symbol)
@@ -547,7 +571,10 @@ class SimBroker:
         order.filled_qty += qty
         order.filled_notional += qty * price
         order.filled_at = now if order.remaining == 0 else order.filled_at
-        order.status = "filled" if order.remaining == 0 else "partially_filled"
+        if order.remaining == 0:
+            order.status = "filled"
+        elif order.status != "pending_cancel":  # a pending cancel survives a partial fill
+            order.status = "partially_filled"
         order.updated_at = now
         held, cost = self._positions.get(order.symbol, (0, Decimal(0)))
         if order.side == "buy":
@@ -595,9 +622,49 @@ class SimBroker:
         for pending in due:
             pending.create()
         for order in list(self._orders.values()):
-            due_cancel = order.cancel_at is not None and order.cancel_at <= now
-            if order.status == "pending_cancel" and due_cancel:
-                self._cancel_group(order)
+            if order.accept_at is not None and order.accept_at <= now:
+                self._accept(order)
+            if order.queued_cancel_at is not None and order.queued_cancel_at <= now:
+                order.queued_cancel_at = None
+                self._finish_cancel(order, dropped=self.pending_new_cancels == "drop")
+            if order.cancel_at is not None and order.cancel_at <= now:
+                order.cancel_at = None
+                self._finish_cancel(order, dropped=False)
+
+    def _accept(self, order: _SimOrder) -> None:
+        """The venue accepts the order. A cancel queued meanwhile now waits its delay, while
+        the order shows ``new`` and can fill (Alpaca paper, 2026-10-13)."""
+        accepted_at, order.accept_at = order.accept_at, None
+        if is_final(order.status):  # it ended while it waited (expired at the close, say)
+            order.queued_cancel = False
+            return
+        if order.queued_cancel and accepted_at is not None:  # timed from the acceptance itself
+            order.queued_cancel = False
+            order.queued_cancel_at = accepted_at + self.queued_cancel_delay
+        if (
+            order.type == "market"
+            and accepted_at is not None
+            and not self._market_open(accepted_at)
+        ):
+            self._set_status(order, "accepted", "accepted")  # queued for the next session
+            return
+        self._set_status(order, "new", "new")
+        self._match(order.symbol)
+
+    def _finish_cancel(self, order: _SimOrder, *, dropped: bool) -> None:
+        if dropped or is_final(order.status):
+            self._emit("order_cancel_rejected", order)
+            return
+        self._cancel_group(order)
+
+    def _arrive(self, order: _SimOrder) -> str:
+        """A new order's first status and event: ``pending_new`` until accepted when
+        ``accept_delay`` is set, else ``new``."""
+        if self.accept_delay is None:
+            return "new"
+        order.status = "pending_new"
+        order.accept_at = self._clock.now() + self.accept_delay
+        return "pending_new"
 
     # ---------------------------------------------------------------- internals: helpers
 

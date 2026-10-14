@@ -1055,6 +1055,89 @@ Append-only. Each entry records context, the decision, its consequences, and sou
   - **Live v2 orders carry no `group_id`/`group_role`.** D-030 assumed they do. Legs are tied through the nested `legs`. SimBroker sets the fields, so its group branches aren't the live path. To fix after G3.
   - **Alpaca also checks an OTO stop against the current price,** not only against the limit. A fast reversal before the submit becomes `broker_rejected`, which fails safe.
 
+## D-052 — G3 run 1 (2026-10-13): what Alpaca paper did at the open
+- **Date:** 2026-10-13 · **Status:** Findings recorded. The G3 verdict and the fixes below await the human.
+- **The run:**
+  - It started at 08:12 and reached DONE at 16:30. Boot, both streams, the 09:29 and 09:35 subscriptions and the scan all worked on real data.
+    - Subscriptions: 11 symbols on trades and quotes, with no 405.
+    - Scan: 2.3 s, with a 0.32 s bar wait; 20 selected, 8 longs armed, 7 triggered.
+  - EOD, the shadow outcomes (20), the report and the backup ran. The book was flat from 09:36:03.
+  - `trader replay` matches the recorded day: 5.7 M events in 4 minutes.
+- **Pass criteria:** every one held except "no P1".
+  - A P1 `unprotected_position` on FIGS at 09:35:48 halted Book A for the day.
+  - QLD, CNH and QMCO were then declined as `book_halted`. QLD's shadow R was +2.97.
+  - FIGS's 16 shares were sold at 09:36:03 for +$0.32.
+- **What Alpaca paper did at the open** (from `broker-A.jsonl.gz`):
+  - **Acceptance took up to 13 s.** FIGS's OTO sat in `pending_new` from 09:35:29.97 to 43.00, and the exit market sell for 9.7 s.
+  - **Cancels took 4–13 s:** FIGS 48.10 → 52.18 (4.1 s), RNG 31.12 → 44.05 (12.9 s).
+  - **A cancel sent to a `pending_new` order can be dropped.** FIGS showed `pending_cancel` at 42.1, then `new` at 43.0. It filled 13 and then 3 of its 26 shares, and the cancel was reported `order_cancel_rejected` at 59.1.
+  - **A partly filled entry's stop leg stays `held`** for the full 26 shares. `qty_available` equalled the filled shares (13, then 16).
+  - **Fees:** with no trades, cash fell $0.02 overnight (999.99 → 999.97), a fee for G2's one-share round trip. The paper-trading docs say paper "does not account for regulatory fees". Our ledger estimated $0.01, and D-034 leaves estimates out of the paper cash check. The drift is far inside the $1 tolerance, but it accumulates.
+- **Our defects:**
+  1. **A cancel that doesn't take is never re-sent.**
+     - `cancel_requested` stays set, so `_cut_short` skips the entry.
+     - D-032's step 2 waits for every buy to be final before covering. The 16 shares stayed bare until the P1 at 5 s.
+     - Nothing handles `order_cancel_rejected`.
+  2. **`flatten_account` cancels its own working market sell on its next pass** (09:35:54). The sell filled first (09:36:03), but a faster cancel would have made the loop sell again.
+  3. **The entry timeout counts from submission,** so it cancelled FIGS before paper had accepted it. Its 10 s never ran at the exchange.
+- **The constraint:** wash-trade protection (D-030) rejects a stop or market sell while the buy is open. A partial fill can't be covered before its remainder is cancelled. With 4–13 s cancels at the open, R-020's 5 s can't always be met, even with defect 1 fixed.
+- **Also learned:**
+  - **IEX trade conditions seen** (D-043):
+    - `' '` and `@` (regular sales);
+    - `I` (odd lot; 64% of trades, already excluded from triggers);
+    - `F` (intermarket sweep);
+    - `T` (extended hours; 92 trades, all outside the trading window).
+  - **Q2 is still open:** 11 symbols × 2 channels = 22, under 30 either way.
+- **Proposed** (for the human):
+  1. Re-send a cancel whose order is seen open again (`new`, `accepted` or `partially_filled`), at most once a second.
+  2. During market hours, `flatten_account` never cancels a working market sell.
+  3. The entry timeout counts from the broker's acceptance, not from submission (an S§3.3 clarification).
+  4. **R-020 for partial fills (risk; the human's call):** either allow longer than 5 s while the remainder's cancel is pending at the broker, or keep 5 s and accept occasional P1s at the open.
+  5. Later: confirm the fee from Alpaca's FEE activities, then count fee estimates in the paper cash check and round them as Alpaca does (amends D-034).
+
+## D-053 — G3 fixes: slow acceptance and slow cancels at the open (resolves D-052)
+- **Date:** 2026-10-13 · **Status:** Accepted. The human chose the R-020 rule and approved the plan on 2026-10-13.
+- **Correction to D-052: the FIGS cancel was queued, not dropped.**
+  - Alpaca holds a cancel sent while an order is `pending_new` and processes it seconds after acceptance. Meanwhile the order shows `new` and can fill.
+  - RNG shows it: one cancel during `pending_new`, `new` at 34.40, cancelled at 44.05, with no re-send.
+  - FIGS's queued cancel was overtaken by the flatten's (48.10 → 52.18). Its `order_cancel_rejected` (59.09) carried the status `canceled`.
+  - Alpaca also rewrites `submitted_at` to the acceptance time.
+- **Decisions:**
+  1. **The entry timeout counts from acceptance** (S§3.3 clarified).
+     - The 10 s run from the broker accepting the order. An order not accepted within 30 s of submission is cancelled anyway.
+     - Only an acceptance this process saw restarts the clock. After a restart or an adoption, the timeout counts from submission.
+  2. **Cancels go through one helper.**
+     - A cancel is sent again at most every 2 s while the order shows as working (`new`, `accepted`, `partially_filled`), and never while it is `pending_new`, where the first is still queued.
+     - `order_cancel_rejected` is logged. It allows an early re-send if the order is still open.
+     - An entry still open 60 s after its first cancel is a P2 `entry_stuck`.
+  3. **R-020's allowance for partial fills** (the human's choice):
+     - While every open buy on the symbol is our entry with its cancel requested or pending, partly filled shares get up to `partial_fill_cancel_max_s` (20) from the first fill.
+     - Once the cancel lands, the stop gets `unprotected_position_max_s` from then, never past the 20 s. Otherwise the limit stays 5 s.
+     - It is a new required `risk.yaml` key; config checks that it is ≥ 5. `caps.py` is unchanged.
+     - The P1 message says which limit applied.
+  4. **Our market sell already at work counts as cover,** in R-020 and on the `stop_breached` path. Paper took 9.7 s to accept FIGS's exit.
+  5. **`flatten_account` never cancels a market sell at work.**
+     - Per symbol, it sells only when every open order on that symbol is such a sell. It waits for buys and pending cancels, and sells the other symbols meanwhile.
+     - A pass's timing is unchanged, so the golden day is identical. After the close nothing changes.
+  6. **SimBroker gets opt-in faults:** `accept_delay`, queued cancels (`queued_cancel_delay`, or `drop`), `order_cancel_rejected`, and a `cancels` log. It also no longer loses a slow cancel to a partial fill (an old bug).
+  7. **An adversarial review of this diff found no blocker.** It led to:
+     - **A lagging order list:** Alpaca's list trailed `get_order` by 0.3–0.6 s on 10-13. An entry `get_order` saw final would still be listed as an open buy, read as someone else's, and collapse the allowance to a P1 at the cancel's landing. Such entries are now remembered and left out of the buys.
+     - **A stuck exit:** an exit at work counts as cover only for `partial_fill_cancel_max_s` after it was sent. After that, R-020 acts again.
+     - **SimBroker** no longer revives an order that turned final while it waited for acceptance. A market sell accepted after the close stays queued.
+     - **The log line is `cancel rejected`,** with the side and type, since it also appears for stops.
+- **Amends:**
+  - **D-032:** step 2's wait, and the fallback timing above.
+  - **D-036:** steps 1–2; a market sell at work is kept.
+  - **D-037:** a bare partial after a restart is a P1 at once unless its entry's cancel is still pending, in which case the allowance applies.
+- **Also:**
+  - `eval_epoch` stays 0, since nothing has been evaluated yet.
+  - **Live versus final opening-range bars** (checked after the 10-14 universe build, which stored 10-13's final IEX bars):
+    - The 09:35 scan's bars matched the final ones for 1,352 of 1,353 symbols. The odd one out was a late print: volume 2.3% lower live, and the high one tick lower.
+    - The top 20 is the same either way.
+    - D-040's 09:34 readiness wait works on real data.
+  - **`trader replay --date 2026-10-13` now diverges by design:** the fixed code makes calls that recording lacks. G3 run 2's recording becomes the golden replay.
+  - **Tests:** SimBroker 9, config 2, service 15, flatten 5, orchestrator 1, counting the review follow-ups. With the old service, the slow-open scenario reproduces G3 run 1's P1. 714 tests pass.
+
 ---
 
 ## Open questions to resolve during the build (record answers as new entries)

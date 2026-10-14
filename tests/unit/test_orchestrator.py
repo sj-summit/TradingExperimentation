@@ -516,6 +516,31 @@ async def test_after_the_close_a_failed_gtc_stop_is_tried_again(tmp_path: Path) 
     await run.close()
 
 
+async def test_a_slow_open_is_not_a_p1(tmp_path: Path) -> None:
+    """G3 run 1's open (D-052, D-053): paper took 13 s to accept an entry and 4 s to cancel
+    one, held a cancel sent before acceptance for 9.6 s, and filled an entry in part."""
+    run = await DayRun(tmp_path, standard_day()).open()
+
+    def slow_paper() -> None:
+        sim = run.sims["A"]
+        sim.accept_delay, sim.slow_cancels = timedelta(seconds=13), timedelta(seconds=4)
+        sim.queued_cancel_delay = timedelta(seconds=9.6)
+        sim.partial_next(13)
+
+    run.at("09:35:49", slow_paper)  # WIN triggers at 09:35:50
+    outcome = await run.run()
+    assert outcome is not None
+    assert outcome.state == "DONE"
+    assert [code for severity, code in await run.incidents() if severity == "P1"] == []
+    assert await run.halts() == []
+    assert (await run.trades())["WIN"][3] == "eod_flatten"
+    buys = await run.rows(
+        "SELECT filled_at FROM fills WHERE symbol = 'WIN' AND side = 'buy' ORDER BY filled_at"
+    )
+    assert buys[0]["filled_at"][11:19] >= "09:36:03"  # filled only once accepted
+    await run.close()
+
+
 # ---------------------------------------------------------------- the stream
 
 

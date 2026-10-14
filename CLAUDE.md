@@ -26,7 +26,7 @@ This is paper trading only until the human completes the go-live gate in `docs/P
    - set `mode: live` or add live credentials;
    - create or edit `config/LIVE_APPROVED`;
    - loosen any value in `src/trader/risk/caps.py` or `config/risk.yaml` (raise a limit, lower a floor, shorten a blackout, or disable a check).
-3. **No naked positions.** Every open position has a broker-side stop at all times. An unprotected position is flattened within `unprotected_position_max_s` (RISK.md R-020).
+3. **No naked positions.** Every open position has a broker-side stop at all times. An unprotected position is flattened within `unprotected_position_max_s` (RISK.md R-020). The one exception: partly filled shares whose entry's cancel is still pending at the broker get up to `partial_fill_cancel_max_s` (D-053).
 4. **Cash-account semantics, whatever the broker account type:**
    - long only, no leverage, whole shares only;
    - buy only with settled cash, as tracked by `risk/ledger.py`.

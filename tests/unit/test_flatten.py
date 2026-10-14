@@ -229,3 +229,99 @@ async def test_after_the_close_a_slow_cancel_is_waited_for_before_the_gtc_stop(
 
 async def test_flat_already_is_quick(clock: SimClock, records: Records) -> None:
     assert await flatten(SimBroker(clock=clock), records, clock) == FlattenResult(flat=True)
+
+
+# ---------------------------------------------------------------- the exit at work (D-053)
+
+
+async def test_its_own_slow_market_sell_is_never_cancelled(
+    clock: SimClock, records: Records, journal: Journal
+) -> None:
+    sim = SimBroker(clock=clock)
+    await hold(sim, records)
+    sim.accept_delay = timedelta(seconds=9.7)  # paper took 9.7 s to accept FIGS's exit
+    result = await flatten(sim, records, clock)
+    assert result.flat
+    exits = [cid for cid in sim.submits if "-exit-" in cid]
+    assert exits == ["A-20261009-XYZ-exit-1"]  # sold once
+    entry = await sim.order_by_client_id("A-20261009-XYZ-entry-1")
+    assert entry is not None
+    leg = (await sim.get_order(entry.id)).stop_leg
+    assert leg is not None
+    assert sim.cancels == [leg.id]  # the stop leg only, never the exit
+    assert (await statuses(journal))["A-20261009-XYZ-exit-1"] == "filled"
+
+
+async def test_one_symbols_working_sell_does_not_hold_up_another(
+    clock: SimClock, records: Records
+) -> None:
+    sim = SimBroker(clock=clock)
+    sim.feed(Quote(symbol="ABC", ts=T0, bid=D("20.00"), bid_size=5, ask=D("20.02"), ask_size=5))
+    sim.hold("ABC", 10, D("20.00"))  # bare shares, no orders
+    sim.hold("XYZ", 40, D("12.30"))
+    sim.feed(quote("12.30", "12.32"))
+    sim.accept_delay = timedelta(seconds=9.7)
+    manual = await sim.submit_market_sell("XYZ", 40, "manual-exit-1")  # e.g. `trader flatten`
+    started = clock.now()
+    result = await flatten(sim, records, clock)
+    assert result.flat
+    assert manual.id not in sim.cancels  # the other process's exit was left to fill
+    abc = await sim.order_by_client_id("A-20261009-ABC-exit-1")
+    assert abc is not None
+    assert abc.submitted_at - started < timedelta(seconds=1)  # sold in the first pass
+
+
+async def test_an_open_buy_blocks_only_its_own_symbol(
+    clock: SimClock, records: Records, journal: Journal
+) -> None:
+    sim = SimBroker(clock=clock)
+    sim.feed(Quote(symbol="ABC", ts=T0, bid=D("20.00"), bid_size=5, ask=D("20.02"), ask_size=5))
+    sim.hold("ABC", 10, D("20.00"))
+    sim.partial_next(15)
+    await hold(sim, records)  # XYZ: 15 of 40 filled, the rest still open
+    sim.feed(quote("12.40", "12.50"))  # the rest can't fill
+    sim.slow_cancels = timedelta(seconds=2)  # the buy's cancel takes 2 s
+    started = clock.now()
+    result = await flatten(sim, records, clock)
+    assert result.flat
+    abc = await sim.order_by_client_id("A-20261009-ABC-exit-1")
+    assert abc is not None
+    assert abc.submitted_at - started < timedelta(seconds=1)  # not held up by XYZ's buy
+    xyz = await sim.order_by_client_id("A-20261009-XYZ-exit-1")
+    assert xyz is not None
+    assert xyz.submitted_at - started >= timedelta(seconds=2)  # after the buy was final
+    rows = await journal.fetch_all("SELECT 1 FROM orders WHERE status = 'rejected'")
+    assert rows == []  # no sell was tried while the buy was open
+
+
+async def test_a_market_sell_being_cancelled_is_waited_for(
+    clock: SimClock, records: Records
+) -> None:
+    sim = SimBroker(clock=clock)
+    sim.hold("XYZ", 40, D("12.30"))
+    sim.feed(quote("12.30", "12.32"))
+    sim.accept_delay = timedelta(seconds=5)
+    manual = await sim.submit_market_sell("XYZ", 40, "manual-exit-1")
+    await sim.cancel(manual.id)  # queued: at acceptance the sell fills first (FIGS's exit)
+    sim.accept_delay = None
+    result = await flatten(sim, records, clock)
+    assert result.flat
+    assert (await sim.get_order(manual.id)).status == "filled"
+    assert [cid for cid in sim.submits if cid.startswith("A-")] == []  # nothing sold over it
+    assert sim.cancels == [manual.id]  # never cancelled twice
+
+
+async def test_after_the_close_a_queued_market_sell_is_still_cancelled(
+    clock: SimClock, records: Records
+) -> None:
+    sim = SimBroker(clock=clock, market_open=lambda _now: False)
+    await hold(sim, records)
+    sim.expire_day_orders()  # 16:00: the day stop leg is gone
+    await clock.advance_to(datetime(2026, 10, 9, 16, 1, tzinfo=ET))
+    queued = await sim.submit_market_sell("XYZ", 40, "manual-exit-1")  # waits for the open
+    assert queued.status == "accepted"
+    result = await flatten(sim, records, clock)
+    assert result.protected == {"XYZ": D("12.21")}
+    assert (await sim.get_order(queued.id)).status == "canceled"
+    stops = [o for o in await sim.open_orders() if o.time_in_force == "gtc"]
+    assert [(o.qty, o.stop_price) for o in stops] == [(40, D("12.21"))]

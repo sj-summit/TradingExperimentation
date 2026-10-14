@@ -247,11 +247,16 @@ class BrokerAdapter(Protocol):
   - A marketable limit buy fills at `min(limit, ask_or_last + sim_slippage)` once a quote or trade at or below the limit is seen.
   - Stop legs trigger when a trade is at or below the stop and fill at `min(stop, trade) − sim_slippage`.
   - Optional random partial fills (seeded).
+  - Optional faults modelled on Alpaca paper at the open (D-053), each opt-in:
+    - acceptance delays (`pending_new`);
+    - cancels queued until after acceptance, or dropped;
+    - slow cancels that survive a partial fill;
+    - `order_cancel_rejected` when a cancel finds the order final.
   - Deterministic under `SimClock`.
 - **`ExecutionService` (one per book):**
   1. Submit after approval.
   2. Track state through trade updates.
-  3. Cancel unfilled entries after `entry_timeout_s`.
+  3. Cancel entries still unfilled `entry_timeout_s` after the broker accepted them (or 30 s after submission if never accepted). Re-send a cancel while the order keeps working (D-053).
   4. Run the R-020 protection loop.
   5. Flatten and verify.
   6. Never blind-retry a submit: on timeout or error, query `order_by_client_id` before any resubmission.
@@ -686,7 +691,7 @@ Per-role contents:
 |---|---|
 | REST GET (data, account) | Retry up to 3× with jittered backoff on 429/5xx/timeouts; respect `Retry-After` |
 | Order submit | Never blind-retry. On a timeout or 5xx, `order_by_client_id`. If present, adopt it. If absent: an **entry** is never resubmitted; it stays pending until resolved or marked lost (D-033). An exit or stop is resubmitted with the next attempt number. |
-| Cancel | Retry until the order is terminal; treat 422 "not cancelable" as terminal after re-reading the order |
+| Cancel | Retry until the order is terminal: sent again at most every 2 s while the order shows as working (never while `pending_new`, where Alpaca queues it; D-053); treat 422 "not cancelable" as terminal after re-reading the order. A flatten never cancels a market sell already at work |
 | WebSocket | Reconnect with backoff (1, 2, 4 … 30 s), resubscribe, backfill bars; incident if down for more than 60 s during regular hours |
 | `claude -p` | No automatic retry except the single schema-repair call; fall back per role |
 | EDGAR | 3 retries; on failure the candidate gets `filings_unavailable: true` |

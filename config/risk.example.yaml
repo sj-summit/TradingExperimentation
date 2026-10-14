@@ -20,6 +20,7 @@ max_stop_distance_pct: 5.0         # of price
 max_chase_pct: 0.30                # over trigger price
 entry_timeout_s: 10
 unprotected_position_max_s: 5      # R-020
+partial_fill_cancel_max_s: 20      # R-020: partly filled shares, while their entry's cancel is pending at the broker (D-053)
 
 entry_window_start: "09:35:03"
 # last_entry and flatten times come from settings.yaml schedule (bounded by caps relative to close)

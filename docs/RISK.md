@@ -47,8 +47,9 @@ Every layer must work even if the layers above it fail.
 | `min_stop_distance` | 0.03 | $ per share |
 | `max_stop_distance_pct` | 5.0 | Of price |
 | `max_chase_pct` | 0.30 | Over `trigger_price` |
-| `entry_timeout_s` | 10 | Cancel an unfilled entry |
+| `entry_timeout_s` | 10 | Cancel an entry still unfilled this long after the broker accepted it (D-053) |
 | `unprotected_position_max_s` | 5 | Flatten a position with no active stop leg after this many seconds |
+| `partial_fill_cancel_max_s` | 20 | Partly filled shares whose entry's remaining cancel is pending at the broker get up to this long from the first fill; once the cancel lands, the stop gets `unprotected_position_max_s` from then (D-053) |
 | `data_stale_halt_s` | 120 | No market data during regular hours → halt new entries |
 | `drawdown_breaker_pct` | 10.0 | Peak-to-trough equity per book → halt until a human resumes |
 | `consecutive_losing_days_breaker` | 5 | → halt until a human resumes |
@@ -80,7 +81,7 @@ Every `OrderIntent` passes through `RiskGate.check(intent, state)`. The gate ret
 | R-017 | **Tradability.** The symbol isn't halted (if a status feed is available), and wasn't flagged by a corporate action today. |
 | R-018 | **Idempotency.** `client_order_id` is unused, and no open order exists for this signal and book. |
 | R-019 | **Account sanity.** Broker equity is within ±20% of ledger equity. In live mode, equity ≤ `LIVE_MAX_ACCOUNT_EQUITY`. |
-| R-020 | **No naked positions.** Every existing position has an active stop leg; otherwise reject new entries and trigger the unprotected-position handler. |
+| R-020 | **No naked positions.** Every existing position has an active stop leg (or our own market sell already on its way out, D-053); otherwise reject new entries and trigger the unprotected-position handler. |
 | R-021 | **Event blackout.** Now is outside the blackout window around every `impact: high` event in `events.yaml`. |
 
 ## 4. Cash-account ledger (`risk/ledger.py`)
@@ -123,9 +124,11 @@ Property tests (`hypothesis`) must show:
   - No events for 120 s → halt new entries. Existing positions stay protected by broker stops.
   - Reconnect, then backfill bars over REST.
 - **Unprotected position.** A filled position without an active stop leg (leg rejected, cancelled, or missing):
-  1. If the last price is already at or below the planned stop, market-sell immediately.
+  1. If the last price is already at or below the planned stop, market-sell immediately. While that sell is on its way out, its shares count as covered.
   2. Otherwise submit a standalone stop at the planned stop price.
+     - A partly filled entry must be final first: Alpaca refuses a sell while a buy is open (D-030). So its remainder is cancelled after a 1 s grace, and the cancel is sent again while the order keeps working (D-053).
   3. If the stop isn't accepted within `unprotected_position_max_s`, market-sell.
+     - For partly filled shares whose entry's cancel is pending at the broker, the limit is `partial_fill_cancel_max_s` from the first fill. Once that cancel lands, the stop gets `unprotected_position_max_s` from then, never past `partial_fill_cancel_max_s` (D-053).
   4. P1 incident.
 - **Reconciliation mismatch.** Positions or orders differ between broker and journal → halt new entries for both books, alert, and write reconciliation details to the incident.
 - **Flatten verification.** After `flatten_time`, every book must be flat by close − 2 min:

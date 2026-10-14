@@ -31,6 +31,7 @@ def test_example_configs_load(repo: Path) -> None:
     assert cfg.settings.schedule.flatten == time(15, 55)
     assert cfg.risk.entry_window_start == time(9, 35, 3)
     assert cfg.risk.max_risk_per_trade_pct == Decimal("1.0")
+    assert cfg.risk.partial_fill_cancel_max_s == 20  # the human's R-020 choice (D-053)
 
 
 def test_decimals_are_exact(repo: Path) -> None:
@@ -161,6 +162,21 @@ def test_schedule_must_be_in_order(repo: Path) -> None:
 def test_entry_timeout_defined_twice_must_match(repo: Path) -> None:
     set_yaml(repo / SETTINGS, "strategy.entry.entry_timeout_s", 20)
     assert has(problems_of(repo), "entry_timeout_s", "risk.yaml is authoritative")
+
+
+def test_the_partial_fill_allowance_is_required(repo: Path) -> None:
+    path = repo / RISK
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    path.write_text(
+        "".join(line for line in lines if not line.startswith("partial_fill_cancel_max_s")),
+        encoding="utf-8",
+    )
+    assert has(problems_of(repo), "risk.partial_fill_cancel_max_s")
+
+
+def test_the_partial_fill_allowance_is_never_below_the_normal_one(repo: Path) -> None:
+    set_yaml(repo / RISK, "partial_fill_cancel_max_s", 3)
+    assert has(problems_of(repo), "partial_fill_cancel_max_s", "unprotected_position_max_s")
 
 
 def test_book_a_is_rules_only(repo: Path) -> None:

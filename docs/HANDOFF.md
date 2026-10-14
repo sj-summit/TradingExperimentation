@@ -1,4 +1,23 @@
-# HANDOFF: Phase 3 done, G3 set for Tuesday 2026-10-13 (updated 2026-10-12, late evening)
+# HANDOFF: G3 run 1 not passed (one P1); fixes done (D-053); next G3 run 2 (updated 2026-10-13, evening)
+
+**Latest:**
+- **G3 run 1 (D-052):** it reached DONE, the book was flat from 09:36, the report was written, and `trader replay` matches. One P1, so the human ruled it not passed.
+  - FIGS sat 13 s in `pending_new`. Our 10 s timeout cancel was queued by paper, and the order filled 16 of 26 shares meanwhile.
+  - The shares stayed bare past R-020's 5 s.
+- **D-053 (fixes, approved by the human):**
+  - the timeout counts from acceptance;
+  - cancels are sent again while the order works;
+  - R-020 allows up to 20 s while a partly filled entry's cancel is pending;
+  - a market sell at work counts as cover;
+  - a flatten never cancels its own exit;
+  - SimBroker models the open.
+- **Tests:** 714 pass. The slow-open scenario reproduces run 1's P1 on the old code and passes on the new.
+- **State now** (2026-10-13 evening):
+  - The human resumed Book A (19:49) and built the 2026-10-14 universe (1,559 eligible).
+  - The live-versus-final opening-range check passed (D-053).
+  - Uncommitted: D-052's records and all of D-053; commit only if asked.
+- **Next:** 🛑 G3 run 2 on 2026-10-14, with the runbook below.
+  - Still pending: the fee check, the trigger-minute decision, and D-051's deferred items.
 
 To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, and the Phase 3 plan at `C:\Users\Admin\.claude\plans\squishy-popping-honey.md`. Everything below the line further down is the older G2 handoff, kept for its environment notes and the Phase 2 code map.
 
@@ -24,18 +43,22 @@ To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, and
   - `ReplayBroker` matches reads by the nearest recorded call, unused answers first (D-049 says why).
 - **Then 🛑 G3 on 2026-10-13**, with the runbook below; the human has it. Not pending: H0.2 isn't needed for Book A.
 
-## 🛑 G3: the supervised paper session, Tuesday 2026-10-13 (runbook as given to the human)
+## 🛑 G3: the supervised paper session (run 1 on 2026-10-13; this runbook is for run 2)
 
-**Before 08:25** (the human, in PowerShell at the repo root):
+**The evening before** (the human, in PowerShell at the repo root):
+- `uv run trader resume --book A` (type `RESUME A`). This clears run 1's `p1_incident` halt.
+- `uv run trader universe build` for the session day.
+
+**Before 08:25** on the session day:
 1. **Machine:**
    - Set sleep to Never while plugged in, and keep the PC on AC power.
-   - Pause Windows Update for a week. 10-13 is Patch Tuesday.
+   - Keep Windows Update paused.
    - Run the session in a standalone PowerShell window. A VS Code restart kills its integrated terminal, and run-day with it.
 2. **Pre-flight:** run `uv run trader run-day --books A --dry-run` at about 08:10. Expect:
-   - `session 2026-10-13`;
+   - the session's date;
    - `clock skew … (ok)`;
-   - `universe: 1587 eligible`;
-   - `Book A: cash 999.99, equity 999.99, 0 positions, 0 open orders; ledger E 999.98; halts none`;
+   - the universe's eligible count;
+   - `Book A: cash about 1000.3, 0 positions, 0 open orders; ledger E 1000.29; halts none`. Broker cash may sit a few cents below the ledger: paper charges fees overnight (D-052);
    - no `KILL FILE PRESENT` line.
 3. **Start:** `uv run trader run-day --books A`. Within about 30 s, look for `stream connected … /v2/iex`.
 
@@ -45,11 +68,15 @@ To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, and
 - **Milestones:**
   - 09:29 `subscribed`, then 09:35 `scan done` and the armed signals.
   - At 15:30 (or right after the scan if nothing was armed), `day state FLATTEN` means waiting for 15:55.
-  - Then 16:05 EOD, 16:12 shadow outcomes, 16:30 the report, and `run-day 2026-10-13: DONE`.
+  - Then 16:05 EOD, 16:12 shadow outcomes, 16:30 the report, and `run-day <date>: DONE`.
 - **Expected, not a problem:**
   - one P2 `subscription_limited` near 09:35 (that's Q2's answer);
   - a `broker_rejected` decision (the price reversed before the order);
-  - a P3 `scan_slow`.
+  - a P3 `scan_slow`;
+  - from D-053 at the open:
+    - `entry accepted waited_s=…` (paper can take 10–13 s);
+    - warnings `entry cancel sent again` or `cancel rejected` (the latter also for a stop that fills during the 15:55 flatten);
+    - a P3 `partial_fill_protected`.
 - **Stop and paste:** copy the lines and paste them to Claude, and leave run-day running. Do this for:
   - any P1 or traceback;
   - `not_flat`, `scan_deadline_missed` or `state_failed`;
@@ -67,20 +94,19 @@ To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, and
   - A restart costs the replay criterion.
 
 **Pass:**
-- the last line is `run-day 2026-10-13: DONE`;
-- no P1 incidents (`runtime\reports\2026-10-13.md` lists them);
+- the last line is `run-day <date>: DONE`;
+- no P1 incidents (`runtime\reports\<date>.md` lists them);
 - Book A is flat: after DONE, `uv run trader doctor --quick` shows `0 positions, 0 orders` for Book A;
 - the report exists;
 - the journal has signals, decisions, shadow outcomes and `daily_stats` (orders, fills and trades if anything triggered);
-- if the day ran with no restart, kill or halt, `uv run trader replay --date 2026-10-13` ends with `the replay matches the recorded day`. It prints nothing until it's done.
+- if the day ran with no restart, kill or halt, `uv run trader replay --date <date>` ends with `the replay matches the recorded day`. It prints nothing until it's done (about 4 minutes for a full day).
 
 **Afterwards (Claude):**
 - review the journal, the log and the report with the human;
 - add the day as a golden replay test;
 - record G3 in DECISIONS, including:
-  - the real IEX trade condition codes seen (D-043 left them unverified);
-  - the Q2 answer;
-  - whether the live 09:35 opening-range bars matched the final ones (compare `or_scan.parquet` with `or_bars` after the next universe build);
+  - the Q2 answer, if the day subscribed enough symbols to tell (run 1's 11 didn't);
+  - how D-053 behaved at the open (acceptance waits, re-sent cancels, partial fills);
 - clear any halt with `uv run trader resume --book A` before the next session.
 
 ## Phase 3 code map

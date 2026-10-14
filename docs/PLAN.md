@@ -11,7 +11,7 @@
 ```
 STATUS
 current_phase: 3 (plan approved 2026-10-12: C:\Users\Admin\.claude\plans\squishy-popping-honey.md; order P3.1, P3.3, P3.6a, P3.9, P3.2, P3.4, P3.6b, P3.7, P3.8a, P3.5, P3.8b, G3)
-last_completed_task: P1.8 (the human verified events.yaml 2026-10-12) and the G3 pre-flight fixes (D-051); every Phase 3 task is done; next is G3 (human gate), set for 2026-10-13 (runbook in docs/HANDOFF.md)
+last_completed_task: G3 run 1 on 2026-10-13 (D-052: not passed, one P1) and its fixes (D-053: timeout from acceptance, cancels sent again, R-020 allowance of 20 s while an entry's cancel is pending, flatten keeps its exits; review follow-ups); 714 tests; next is G3 run 2 (human gate) after `trader resume --book A`
 open_questions: read docs/HANDOFF.md first. H0.2 open until doctor's claude checks pass (claude's folder added to PATH; CLAUDE_TOKEN_CREATED); Phase 1 done-checks pending (stream, news, filings; universe build done 2026-10-12: 1,587 eligible for 2026-10-13); Q2 open (G3 answers it: a 405 on about 23 symbols x trades+quotes means channels count toward the 30), Q6 partly answered; backtest verdict hangs on the trigger-minute rule (D-042 results: shadow R between -0.31 and +0.14 for longs), human to decide on resolving it from the trade tape
 eval_epoch: 0
 ```

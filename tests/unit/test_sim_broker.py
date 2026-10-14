@@ -328,3 +328,148 @@ async def test_seeded_partial_fills_are_reproducible(clock: SimClock) -> None:
     first = await run(7)
     assert first == await run(7)
     assert any(qty < 10 for qty in first)  # some entries were only partly filled
+
+
+# ---------------------------------------------------------------- Alpaca paper at the open (D-053)
+
+
+async def test_an_order_waits_in_pending_new_until_accepted(
+    sim: SimBroker, clock: SimClock
+) -> None:
+    sim.accept_delay = timedelta(seconds=13)
+    accepted = await sim.submit_entry_oto(intent())
+    assert accepted.status == "pending_new"
+    sim.feed(quote("12.30", "12.32"))  # marketable, but not yet at the venue
+    assert (await sim.get_order(accepted.id)).filled_qty == 0
+    await clock.advance(timedelta(seconds=13))
+    entry = await sim.get_order(accepted.id)
+    assert (entry.status, entry.filled_qty) == ("filled", 40)  # accepted, then filled
+    assert kinds(await drain(sim)) == [
+        ("pending_new", "limit"),
+        ("new", "limit"),
+        ("fill", "limit"),
+        ("new", "stop"),
+    ]
+
+
+async def test_a_cancel_before_acceptance_is_queued_until_after_it(
+    sim: SimBroker, clock: SimClock
+) -> None:
+    """RNG on 2026-10-13: one cancel while pending_new; the order showed new, then was
+    cancelled seconds after acceptance."""
+    sim.accept_delay, sim.queued_cancel_delay = timedelta(seconds=3), timedelta(seconds=9.6)
+    accepted = await sim.submit_entry_oto(intent(limit="12.10", stop="11.90"))  # not marketable
+    await clock.advance(timedelta(seconds=1))
+    await sim.cancel(accepted.id)
+    assert (await sim.get_order(accepted.id)).status == "pending_cancel"
+    await clock.advance(timedelta(seconds=2))  # accepted: the queued cancel shows new
+    assert (await sim.get_order(accepted.id)).status == "new"
+    await clock.advance(timedelta(seconds=9.5))
+    assert (await sim.get_order(accepted.id)).status == "new"
+    await clock.advance(timedelta(seconds=0.1))
+    entry = await sim.get_order(accepted.id)
+    assert entry.status == "canceled"
+    assert entry.stop_leg is not None
+    assert entry.stop_leg.status == "canceled"
+    assert sim.cancels == [accepted.id]
+
+
+async def test_a_queued_cancel_that_finds_the_order_filled_is_rejected(
+    sim: SimBroker, clock: SimClock
+) -> None:
+    sim.accept_delay, sim.queued_cancel_delay = timedelta(seconds=3), timedelta(seconds=5)
+    accepted = await sim.submit_entry_oto(intent())  # marketable once accepted
+    await sim.cancel(accepted.id)
+    await clock.advance(timedelta(seconds=8))
+    assert (await sim.get_order(accepted.id)).status == "filled"
+    events = [e for e in await drain(sim) if isinstance(e, TradeUpdate)]
+    rejected = [e for e in events if e.event == "order_cancel_rejected"]
+    assert [e.order.status for e in rejected] == ["filled"]
+
+
+async def test_drop_mode_never_cancels(sim: SimBroker, clock: SimClock) -> None:
+    sim.accept_delay, sim.pending_new_cancels = timedelta(seconds=3), "drop"
+    accepted = await sim.submit_entry_oto(intent(limit="12.10", stop="11.90"))
+    await sim.cancel(accepted.id)
+    await clock.advance(timedelta(seconds=30))
+    assert (await sim.get_order(accepted.id)).status == "new"  # still working
+    events = [e for e in await drain(sim) if isinstance(e, TradeUpdate)]
+    assert [e.order.status for e in events if e.event == "order_cancel_rejected"] == ["new"]
+
+
+async def test_a_cancel_after_acceptance_overtakes_the_queued_one(
+    sim: SimBroker, clock: SimClock
+) -> None:
+    """FIGS on 2026-10-13: the queued cancel was still waiting when a second, sent to the
+    accepted order, cancelled it; the queued one then came back rejected."""
+    sim.accept_delay, sim.queued_cancel_delay = timedelta(seconds=3), timedelta(seconds=10)
+    sim.slow_cancels = timedelta(seconds=4)
+    sim.partial_next(13)
+    accepted = await sim.submit_entry_oto(intent())
+    await sim.cancel(accepted.id)  # queued
+    await clock.advance(timedelta(seconds=3))  # accepted: 13 fill at once
+    entry = await sim.get_order(accepted.id)
+    assert (entry.status, entry.filled_qty) == ("partially_filled", 13)
+    await clock.advance(timedelta(seconds=1))
+    await sim.cancel(accepted.id)  # the second cancel, to a working order
+    assert (await sim.get_order(accepted.id)).status == "pending_cancel"
+    await clock.advance(timedelta(seconds=4))
+    entry = await sim.get_order(accepted.id)
+    assert (entry.status, entry.filled_qty) == ("canceled", 13)
+    await clock.advance(timedelta(seconds=10))
+    assert (await sim.get_order(accepted.id)).status == "canceled"  # the queued one is due
+    events = [e for e in await drain(sim) if isinstance(e, TradeUpdate)]
+    assert [e.order.status for e in events if e.event == "order_cancel_rejected"] == ["canceled"]
+    assert sim.cancels == [accepted.id, accepted.id]
+
+
+async def test_a_fill_during_a_slow_cancel_keeps_the_cancel(
+    sim: SimBroker, clock: SimClock
+) -> None:
+    accepted = await sim.submit_entry_oto(intent(limit="12.10", stop="11.90"))  # resting
+    sim.slow_cancels = timedelta(seconds=2)
+    await sim.cancel(accepted.id)
+    sim.partial_next(15)
+    sim.feed(trade("12.08"))  # 15 fill while the cancel is pending
+    entry = await sim.get_order(accepted.id)
+    assert (entry.status, entry.filled_qty) == ("pending_cancel", 15)
+    await clock.advance(timedelta(seconds=2))
+    entry = await sim.get_order(accepted.id)
+    assert (entry.status, entry.filled_qty) == ("canceled", 15)  # not lost to the fill
+
+
+async def test_a_pending_new_market_sell_holds_its_shares(sim: SimBroker, clock: SimClock) -> None:
+    sim.hold("F", 16, D("12.00"))
+    sim.accept_delay = timedelta(seconds=9.7)
+    sold = await sim.submit_market_sell("F", 16, "A-20261009-F-exit-1")
+    assert sold.status == "pending_new"
+    (position,) = await sim.positions()
+    assert (position.qty, position.qty_available) == (16, 0)
+    await clock.advance(timedelta(seconds=9.7))
+    assert (await sim.get_order(sold.id)).status == "filled"
+    assert await sim.positions() == []
+
+
+async def test_an_order_that_turns_final_before_acceptance_stays_final(
+    sim: SimBroker, clock: SimClock
+) -> None:
+    sim.accept_delay = timedelta(seconds=5)
+    accepted = await sim.submit_entry_oto(intent())
+    sim.expire_day_orders()  # the session ends while it waits
+    await clock.advance(timedelta(seconds=5))
+    entry = await sim.get_order(accepted.id)
+    assert (entry.status, entry.filled_qty) == ("expired", 0)
+    assert await sim.positions() == []
+
+
+async def test_a_market_sell_accepted_after_the_close_waits_for_the_open(
+    clock: SimClock,
+) -> None:
+    sim = SimBroker(clock=clock, market_open=lambda now: now < T0 + timedelta(seconds=3))
+    sim.feed(quote("12.30", "12.32"))
+    sim.hold("F", 16, D("12.00"))
+    sim.accept_delay = timedelta(seconds=5)
+    sold = await sim.submit_market_sell("F", 16, "A-20261009-F-exit-1")  # before the close
+    await clock.advance(timedelta(seconds=5))  # accepted after it
+    assert (await sim.get_order(sold.id)).status == "accepted"  # queued, not filled
+    assert (await sim.positions())[0].qty == 16

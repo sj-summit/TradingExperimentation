@@ -12,7 +12,7 @@ from tests.fixtures.exec_harness import NEXT_OPEN, TIMES, Harness
 from trader.core.clock import ET, SimClock
 from trader.core.models import OrderIntent
 from trader.execution import service as service_module
-from trader.execution.broker import Order
+from trader.execution.broker import Order, OrderRejected
 from trader.execution.sim_broker import SimBroker
 from trader.risk.killswitch import KillSwitch
 
@@ -169,6 +169,287 @@ async def test_already_through_the_stop_means_sell_now(tmp_path: Path) -> None:
         assert await h.status("A-20261009-XYZ-exit-1") == "filled"
         assert await h.status("A-20261009-XYZ-stop-1") is None
         assert (await sells(h))["A-20261009-XYZ-exit-1"] == ("stop_breached", SIGNAL)
+
+
+# ---------------------------------------------------------------- Alpaca paper at the open (D-053)
+
+
+async def messages(h: Harness, code: str) -> list[str]:
+    rows = await h.journal.fetch_all("SELECT message FROM incidents WHERE code = ?", (code,))
+    return [r["message"] for r in rows]
+
+
+async def entry_id(h: Harness) -> str:
+    row = await h.records.order(ENTRY)
+    assert row is not None
+    assert row.broker_order_id is not None
+    return row.broker_order_id
+
+
+def reject_every_stop(h: Harness) -> None:
+    async def refuse(*args: Any, **kwargs: Any) -> Order:
+        raise OrderRejected("stop refused (test)", status=403)
+
+    h.sim.submit_stop = refuse  # type: ignore[method-assign]
+
+
+async def test_a_cancel_landing_after_5_s_leaves_time_for_the_stop(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        h.quote("12.30", "12.32")
+        h.sim.partial_next(15)
+        h.sim.slow_cancels = timedelta(seconds=7)  # the remainder's cancel takes 7 s
+        await h.enter()
+        h.quote("12.40", "12.50")  # moves away: the rest can't fill
+        await h.advance(12)
+        assert await h.held() == {"XYZ": 15}
+        assert await h.working_stops() == [(15, D("12.21"), "new")]
+        assert await h.status(ENTRY) == "canceled"
+        assert await h.incidents() == [("P3", "partial_fill_protected")]
+
+
+async def test_the_open_13_s_to_accept_and_4_s_to_cancel_is_not_a_p1(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        h.sim.accept_delay, h.sim.slow_cancels = timedelta(seconds=13), timedelta(seconds=4)
+        h.quote("12.30", "12.32")
+        h.sim.partial_next(13)
+        await h.enter()
+        await h.advance(13.25)  # accepted: 13 fill at once
+        assert await h.held() == {"XYZ": 13}
+        h.quote("12.40", "12.50")
+        await h.advance(10)
+        assert await h.held() == {"XYZ": 13}
+        assert [(q, p) for q, p, _ in await h.working_stops()] == [(13, D("12.21"))]
+        assert await h.incidents() == [("P3", "partial_fill_protected")]
+        assert h.sim.cancels == [await entry_id(h)]  # the timeout never fired before acceptance
+
+
+async def test_a_cancel_the_order_outlives_is_sent_again(tmp_path: Path) -> None:
+    """FIGS at the open: the cancel sent before acceptance never took effect, and the order
+    filled after it. Sent again once the order is working, the shares get their stop."""
+    async with running(tmp_path) as h:
+        h.sim.accept_delay = timedelta(seconds=35)  # past the 30 s acceptance limit
+        h.sim.pending_new_cancels = "drop"  # the worst case: the queued cancel never takes
+        h.sim.slow_cancels = timedelta(seconds=4)
+        h.quote("12.30", "12.32")
+        h.sim.partial_next(16)
+        await h.enter()
+        await h.advance(31)
+        order_id = await entry_id(h)
+        assert h.sim.cancels == [order_id]  # cancelled at 30 s, while still pending_new
+        await h.advance(5)  # accepted at 35 s: 16 fill, the queued cancel is rejected
+        h.quote("12.40", "12.50")
+        await h.advance(10)
+        assert h.sim.cancels.count(order_id) == 2  # sent again, once
+        assert await h.status(ENTRY) == "canceled"
+        assert await h.held() == {"XYZ": 16}
+        assert [(q, p) for q, p, _ in await h.working_stops()] == [(16, D("12.21"))]
+        assert await h.incidents() == [("P3", "partial_fill_protected")]
+
+
+async def test_no_cancel_is_sent_again_while_the_order_waits_for_acceptance(
+    tmp_path: Path,
+) -> None:
+    async with running(tmp_path) as h:
+        h.sim.accept_delay = timedelta(seconds=50)
+        h.quote("12.30", "12.40")  # not marketable
+        await h.enter()
+        await h.advance(49)
+        assert h.sim.cancels == [await entry_id(h)]  # one, at 30 s: queued at the broker
+        await h.advance(2)  # accepted at 50 s, and the queued cancel takes effect
+        assert await h.status(ENTRY) == "canceled"
+        assert len(h.sim.cancels) == 1
+
+
+async def test_a_cancel_that_never_lands_is_a_p1_at_20_s_not_5(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        h.quote("12.30", "12.32")
+        h.sim.partial_next(15)
+        h.sim.slow_cancels = timedelta(seconds=120)
+        await h.enter()
+        h.quote("12.40", "12.50")
+        await h.advance(19.5)
+        assert await h.incidents() == []
+        await h.advance(1)
+        assert ("P1", "unprotected_position") in await h.incidents()
+        assert "cancel was still pending" in (await messages(h, "unprotected_position"))[0]
+        assert "p1_incident" in await reasons(h)
+
+
+async def test_once_the_cancel_lands_the_stop_has_5_s(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        h.quote("12.30", "12.32")
+        h.sim.partial_next(15)
+        h.sim.slow_cancels = timedelta(seconds=6)  # sent at 1 s, lands at 7 s
+        reject_every_stop(h)
+        await h.enter()
+        h.quote("12.40", "12.50")
+        await h.advance(11.5)
+        assert await h.incidents() == []
+        await h.advance(1)
+        assert ("P1", "unprotected_position") in await h.incidents()
+        assert "cancel landed at" in (await messages(h, "unprotected_position"))[0]
+
+
+async def test_without_a_pending_cancel_the_limit_is_still_5_s(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        h.sim.reject_stop_legs = True
+        reject_every_stop(h)
+        h.quote("12.30", "12.32")
+        await h.enter()  # fills at once; its leg is rejected and no stop is accepted
+        await h.advance(4.75)
+        assert await h.incidents() == []
+        await h.advance(0.75)
+        assert ("P1", "unprotected_position") in await h.incidents()
+
+
+async def test_someone_elses_pending_buy_gets_no_extra_time(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        h.sim.reject_stop_legs = True
+        reject_every_stop(h)
+        h.quote("12.30", "12.32")
+        await h.enter()  # 40 bare shares
+        h.quote("12.20", "12.25")  # a resting buy below the market
+        resting = h.intent(
+            client_order_id="manual-1",
+            signal_id="manual",
+            qty=1,
+            entry_limit=D("12.10"),
+            stop_price=D("11.90"),
+        )
+        foreign = await h.sim.submit_entry_oto(resting)
+        h.sim.slow_cancels = timedelta(seconds=60)
+        await h.sim.cancel(foreign.id)  # pending at the broker, but not ours
+        await h.advance(5.5)
+        assert ("P1", "unprotected_position") in await h.incidents()
+
+
+async def test_the_entry_timeout_counts_from_acceptance(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        h.sim.accept_delay = timedelta(seconds=8)
+        h.quote("12.30", "12.40")  # not marketable
+        await h.enter()
+        await h.advance(10.5)
+        assert h.sim.cancels == []  # live for 2.5 s only
+        assert await h.status(ENTRY) == "new"
+        await h.advance(8.5)
+        assert h.sim.cancels == [await entry_id(h)]
+        assert await h.status(ENTRY) == "canceled"
+
+
+async def test_an_entry_never_accepted_is_cancelled_at_30_s_and_reported_if_stuck(
+    tmp_path: Path,
+) -> None:
+    async with running(tmp_path) as h:
+        h.sim.accept_delay = timedelta(seconds=200)
+        h.quote("12.30", "12.40")
+        await h.enter()
+        await h.advance(29.5)
+        assert h.sim.cancels == []
+        await h.advance(1)
+        assert h.sim.cancels == [await entry_id(h)]
+        assert (await h.service.exposure()).symbols == {"XYZ"}  # still counts while open
+        await h.advance(60)
+        assert await h.incidents() == [("P2", "entry_stuck")]
+        await h.advance(110)  # accepted at 200 s: the queued cancel takes effect
+        assert await h.status(ENTRY) == "canceled"
+        assert (await h.service.exposure()).entries_today == 0
+
+
+async def test_a_restart_does_not_give_an_entry_a_fresh_timeout(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        h.sim.accept_delay = timedelta(seconds=5)
+        h.quote("12.30", "12.40")
+        await h.enter()
+        await h.service.stop()  # dies while the order waits for acceptance
+        await h.clock.advance(timedelta(seconds=12))  # accepted at 5 s, while down
+        await h.start()
+        await h.advance(1)
+        assert h.sim.cancels == [await entry_id(h)]  # past submission + 10 s: at once
+
+
+async def test_a_restart_during_a_slow_cancel_waits_for_it(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        h.quote("12.30", "12.32")
+        h.sim.partial_next(15)
+        h.sim.slow_cancels = timedelta(seconds=10)  # sent at 1 s, lands at 11 s
+        await h.enter()
+        h.quote("12.40", "12.50")
+        await h.advance(2)
+        await h.service.stop()
+        await h.clock.advance(timedelta(seconds=2))
+        await h.start()
+        await h.advance(14)
+        assert ("P1", "unprotected_position") not in await h.incidents()
+        assert [(q, p) for q, p, _ in await h.working_stops()] == [(15, D("12.21"))]
+
+
+async def test_a_sell_on_its_way_out_counts_as_cover(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        h.sim.reject_stop_legs = True
+        h.sim.accept_delay = timedelta(seconds=9)  # every order waits 9 s to be accepted
+        h.prices.last["XYZ"] = D("12.20")  # already through the 12.21 stop: sell at once
+        h.quote("12.30", "12.32")
+        await h.enter()
+        await h.advance(9.25)  # accepted: 40 fill, the leg is rejected, the exit is sent
+        assert await h.held() == {"XYZ": 40}
+        await h.advance(7)  # the exit waits for acceptance past the 5 s limit
+        assert ("P1", "unprotected_position") not in await h.incidents()
+        await h.advance(4)
+        assert await h.held() == {}
+        assert (await sells(h))["A-20261009-XYZ-exit-1"] == ("stop_breached", SIGNAL)
+
+
+class LaggingList(SimBroker):
+    """The order list trails get_order: an order that turns final stays listed, as it last
+    was, for half a second (Alpaca's list lagged by 0.3-0.6 s on 2026-10-13)."""
+
+    LAG = timedelta(seconds=0.5)
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._listed: dict[str, Order] = {}
+        self._gone: dict[str, datetime] = {}
+
+    async def open_orders(self) -> list[Order]:
+        now = self._clock.now()
+        current = await super().open_orders()
+        ids = {o.id for o in current}
+        for order_id in list(self._listed):
+            if order_id not in ids and now - self._gone.setdefault(order_id, now) >= self.LAG:
+                del self._listed[order_id], self._gone[order_id]
+        self._listed.update({o.id: o for o in current})
+        return current + [o for order_id, o in self._listed.items() if order_id not in ids]
+
+
+async def test_a_lagging_order_list_does_not_take_the_window_away(tmp_path: Path) -> None:
+    async with running(tmp_path, sim_class=LaggingList) as h:
+        h.quote("12.30", "12.32")
+        h.sim.partial_next(15)
+        h.sim.slow_cancels = timedelta(seconds=7)
+        await h.enter()
+        h.quote("12.40", "12.50")
+        await h.advance(12)
+        assert await h.incidents() == [("P3", "partial_fill_protected")]
+        assert [(q, p) for q, p, _ in await h.working_stops()] == [(15, D("12.21"))]
+
+
+class StuckSells(SimBroker):
+    """A market sell that is accepted but never fills (a halted symbol, a paper backlog)."""
+
+    def _fill_price(self, order: Any, trade: Any) -> Decimal | None:
+        return None if order.type == "market" else super()._fill_price(order, trade)
+
+
+async def test_a_stuck_exit_stops_counting_as_cover_after_20_s(tmp_path: Path) -> None:
+    async with running(tmp_path, sim_class=StuckSells) as h:
+        h.sim.reject_stop_legs = True
+        h.prices.last["XYZ"] = D("12.20")  # through the stop: the exit goes out at once
+        h.quote("12.30", "12.32")
+        await h.enter()
+        await h.advance(19)
+        assert await h.incidents() == []  # the exit is on its way: covered for now
+        await h.advance(8)
+        assert ("P1", "unprotected_position") in await h.incidents()
 
 
 # ---------------------------------------------------------------- uncertain submits (D-033)

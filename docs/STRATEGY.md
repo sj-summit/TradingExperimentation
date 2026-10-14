@@ -79,7 +79,7 @@ If the scan has not completed by **09:36:30**, no signals are armed today. Log a
 | Trigger | first stream trade at or above `trigger_price` during the window, while armed |
 | Order | marketable **limit** buy, priced at submission time: `limit = min(max(ceil_cent(max(trigger_price, last_price) × 1.0010), trigger_price + $0.02), max_chase_price)`; `time_in_force: day`; Alpaca `order_class: oto` with a **stop_loss** leg. Sizing uses this actual limit. |
 | Chase guard | `max_chase_price = trigger_price × 1.0030`. If the last price exceeds it when an entry is about to be submitted, skip with reason `chased` |
-| Unfilled entry | cancel if not filled within 10 s (`entry_timeout`), reason `entry_unfilled` |
+| Unfilled entry | cancel if not filled within 10 s of the broker accepting the order (`entry_timeout`); an order the broker hasn't accepted within 30 s is cancelled too (D-053); reason `entry_unfilled` |
 | Re-entry | **one entry per symbol per day per book**; no re-entry after a stop-out |
 | Already above trigger at arming | treat as triggered immediately if within the chase guard, else `missed_at_arm` |
 
