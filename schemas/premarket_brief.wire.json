@@ -1,0 +1,124 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "pack_id": {
+      "type": "string",
+      "description": "matching the pattern ^[A-Za-z0-9-]{1,64}$"
+    },
+    "day_mode": {
+      "enum": [
+        "normal",
+        "reduced",
+        "no_trade"
+      ],
+      "type": "string"
+    },
+    "day_mode_reason": {
+      "type": "string",
+      "description": "at most 300 characters"
+    },
+    "market_notes": {
+      "type": "string",
+      "description": "at most 600 characters"
+    },
+    "assessments": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "symbol": {
+            "type": "string",
+            "description": "matching the pattern ^[A-Z]{1,6}$"
+          },
+          "catalyst_type": {
+            "enum": [
+              "earnings",
+              "guidance",
+              "fda_regulatory",
+              "clinical_trial",
+              "m_and_a",
+              "contract_partnership",
+              "product_launch",
+              "analyst_action",
+              "offering_dilution",
+              "reverse_split",
+              "legal_regulatory",
+              "management_change",
+              "macro_sector",
+              "sympathy_move",
+              "social_meme",
+              "crypto_related",
+              "no_identifiable_news",
+              "other"
+            ],
+            "type": "string"
+          },
+          "catalyst_fresh": {
+            "type": "boolean"
+          },
+          "catalyst_confirmed": {
+            "type": "boolean"
+          },
+          "risk_flags": {
+            "items": {
+              "enum": [
+                "dilution_offering",
+                "shelf_or_atm",
+                "reverse_split_recent",
+                "promotional_or_pump",
+                "stale_news",
+                "rumor_unconfirmed",
+                "binary_event_today",
+                "earnings_after_close_today",
+                "halt_or_luld_risk",
+                "extreme_gap",
+                "sympathy_only",
+                "conflicting_reports",
+                "suspicious_content"
+              ],
+              "type": "string"
+            },
+            "type": "array",
+            "description": "at most 8 items"
+          },
+          "verdict": {
+            "enum": [
+              "allow",
+              "neutral",
+              "veto"
+            ],
+            "type": "string"
+          },
+          "confidence": {
+            "type": "number",
+            "description": "from 0 to 1"
+          },
+          "reason": {
+            "type": "string",
+            "description": "at most 240 characters"
+          }
+        },
+        "required": [
+          "symbol",
+          "catalyst_type",
+          "catalyst_fresh",
+          "catalyst_confirmed",
+          "risk_flags",
+          "verdict",
+          "confidence",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "type": "array",
+      "description": "at most 60 items"
+    }
+  },
+  "required": [
+    "pack_id",
+    "day_mode",
+    "day_mode_reason",
+    "market_notes",
+    "assessments"
+  ],
+  "type": "object"
+}

@@ -1,0 +1,62 @@
+{
+  "pack_id": "20261103-review-1",
+  "summary": "Book A took XYZ (+2.1R) and QRST (-1.0R); Book B vetoed ABCD, which stopped out in the shadow.",
+  "signal_reviews": [
+    {
+      "signal_id": "20261103-XYZ-orb5",
+      "went_well": "The earnings catalyst carried the move to the flatten.",
+      "went_badly": "",
+      "why": "Raised guidance; the price held above the opening range all day (MAE -0.3R).",
+      "factors": ["catalyst_strong", "trend_continuation"],
+      "knowable_at_decision": "partly",
+      "b_process": "good_process",
+      "b_note": "Allowed on a confirmed, fresh catalyst."
+    },
+    {
+      "signal_id": "20261103-ABCD-orb5",
+      "went_well": "The veto avoided a stop-out.",
+      "went_badly": "",
+      "why": "A discounted offering priced overnight; the gap faded within ten minutes.",
+      "factors": ["dilution_or_offering", "faded_gap"],
+      "knowable_at_decision": "yes",
+      "b_process": "good_process",
+      "b_note": "The 424B5 was in the pack before the open."
+    }
+  ],
+  "process_issues": [
+    {
+      "existing_issue_id": null,
+      "severity": "info",
+      "component": "news",
+      "description": "Two headlines for XYZ were duplicates from different sources."
+    },
+    {
+      "existing_issue_id": 3,
+      "severity": "warn",
+      "component": "vet",
+      "description": "The vet pack again lacked filings for one candidate."
+    }
+  ],
+  "lesson_proposals": [
+    {
+      "statement": "Longs with an offering filed overnight underperform.",
+      "rationale": "Three of the last four such signals stopped out within ten minutes.",
+      "evidence_query": {
+        "filters": [
+          {"field": "risk_flags", "op": "contains", "value": "dilution_offering"},
+          {"field": "gap_pct", "op": "gte", "value": 10}
+        ],
+        "compare_to": "complement",
+        "metric": "shadow_r"
+      },
+      "claimed_direction": "subset_worse",
+      "suggested_use": "veto_hint"
+    }
+  ],
+  "human_notes": [
+    {
+      "existing_note_id": null,
+      "note": "Consider whether the vet should see the prior day's after-hours filings."
+    }
+  ]
+}

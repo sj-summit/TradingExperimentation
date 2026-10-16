@@ -129,7 +129,7 @@ With a $1,000 book, typical numbers are a risk budget of $10, a notional cap of 
 | Exit at 16:00 | Flatten at close − 5 min | Reliable exit before the closing auction |
 | Entries all day | No new entries after close − 30 min | Little time left; risk control |
 | Relative volume on consolidated volume | IEX-to-IEX on the free plan | Data cost. Recheck if upgraded to SIP |
-| Commission $0.0035/share | Commission-free; SEC/FINRA fees estimated per sale, then replaced by the fees Alpaca charged, a CAT fee among them (D-055, D-058) | Alpaca pricing |
+| Commission $0.0035/share | Commission-free; the SEC fee and FINRA TAF estimated per sell fill, then replaced by the fees Alpaca charged, a daily CAT fee among them (D-055, D-058, D-060) | Alpaca pricing |
 
 ---
 

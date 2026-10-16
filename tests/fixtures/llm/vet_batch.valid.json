@@ -1,0 +1,25 @@
+{
+  "pack_id": "20261103-vet-1",
+  "assessments": [
+    {
+      "symbol": "QRST",
+      "catalyst_type": "no_identifiable_news",
+      "catalyst_fresh": false,
+      "catalyst_confirmed": false,
+      "risk_flags": ["sympathy_only"],
+      "verdict": "neutral",
+      "confidence": 0.4,
+      "reason": "No news in the last 24 h; it is moving with its sector."
+    },
+    {
+      "symbol": "LMNOP",
+      "catalyst_type": "fda_regulatory",
+      "catalyst_fresh": true,
+      "catalyst_confirmed": true,
+      "risk_flags": [],
+      "verdict": "allow",
+      "confidence": 0.65,
+      "reason": "FDA approval announced at 07:30, confirmed by the company's press release."
+    }
+  ]
+}

@@ -256,7 +256,7 @@ def fee_reconciliation(
         if (
             e.is_fee_estimate
             and e.trade_date < today
-            and any(_posted_after_close(f, e.trade_date) for f in posted)
+            and any(_retires(f, e.trade_date) for f in posted)
         ):
             estimates[(e.trade_date, e.settle_date)] += e.amount
     for (trade, settle), total in sorted(estimates.items()):
@@ -302,6 +302,13 @@ def _charge_day(fee: FeeActivity) -> date:
     if fee.created_at is None:
         return fee.date
     return min(fee.date, fee.created_at.astimezone(ET).date())
+
+
+def _retires(fee: FeeActivity, day: date) -> bool:
+    """Whether booking ``fee`` shows ``day``'s own charge has posted: it posted after ``day``'s
+    close, and it can't be an earlier day's (its cash left on ``day`` or later). An older day's
+    charge posting late doesn't retire a later day's estimates (D-060)."""
+    return _charge_day(fee) >= day and _posted_after_close(fee, day)
 
 
 def _posted_after_close(fee: FeeActivity, day: date) -> bool:

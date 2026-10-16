@@ -26,6 +26,7 @@ trader = "trader.cli:app"
 [dependency-groups]
 dev = [
     "hypothesis>=6.100",
+    "jsonschema>=4.23",
     "mypy>=1.10",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

@@ -1,0 +1,15 @@
+{
+  "pack_id": "20261103-vet-1",
+  "assessments": [
+    {
+      "symbol": "qrst",
+      "catalyst_type": "no_identifiable_news",
+      "catalyst_fresh": false,
+      "catalyst_confirmed": false,
+      "risk_flags": [],
+      "verdict": "veto",
+      "confidence": 0.4,
+      "reason": "A symbol that is not 1-6 upper-case letters."
+    }
+  ]
+}

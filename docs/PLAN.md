@@ -11,8 +11,8 @@
 ```
 STATUS
 current_phase: 4 (plan approved 2026-10-14: C:\Users\Admin\.claude\plans\squishy-popping-honey.md; order P4.0a, P4.0b, P4.0c, P4.1-P4.6, G4a, P4.7-P4.10, G4b)
-last_completed_task: P4.0c's code (D-057): shadow entries at max(trigger, open); ambiguous trigger minutes from the SIP tape (live job and backtest); reviewed, every finding fixed; P4.0a (D-055) and P4.0b (D-056) done before it; 799 tests; all uncommitted (HEAD 0226783). P4.0c stays open for the human's tape fetch and the D-042/H4 restatement; then P4.1. D-058 records the fee probe: paper lists its charges, and a dry run on a copy of the journal leaves a $0.00 residual
-open_questions: read docs/HANDOFF.md first. Human steps in Phase 4: the SIP-tape fetch, now due: `uv run trader backtest --start 2026-04-01 --end 2026-10-09 --tape` after 16:30 ET or on a non-trading day (`--force` only while no run-day is running; about 605 requests); H0.2 before G4a; the Phase 1 checks (news, filings, stream --news) and ALPACA_DATA_* keys before G4b. Q2 open (run 2: 14 symbols x trades+quotes = 28, under 30, no 405; a 405 at 16 or more symbols would mean channels count toward the 30), Q4 open until G4a, Q6 partly answered
+last_completed_task: P4.0c (D-057, D-059): shadow entries at max(trigger, open); ambiguous trigger minutes from the SIP tape; the human's tape fetch ran 2026-10-15 and D-059 restates D-042 (Book A -16.8%, not -20.2%; shadow longs -0.072R, -0.183R without MRNA's +126.7R signal; H4: ranks 1-5 best, no gradient below them, thin evidence). P4.0a (D-055) and P4.0b (D-056) done before it; D-058 records the fee probe; D-060 fixes a fee-retirement edge case found verifying it. P4.1 done (D-061): strict output models echoing the pack_id, wire schemas (full and wire_safe), filter-clamp-validate, schemas/*.json; reviewed. The human committed P4.0a-P4.0c and D-055 to D-058 as 542efee (2026-10-15 21:51 ET); D-059 to D-061 and P4.1's files are uncommitted; 853 tests. Next: P4.2
+open_questions: read docs/HANDOFF.md first. Human steps in Phase 4: H0.2 before G4a; the Phase 1 checks (news, filings, stream --news) and ALPACA_DATA_* keys before G4b. Q2 open (run 2: 14 symbols x trades+quotes = 28, under 30, no 405; a 405 at 16 or more symbols would mean channels count toward the 30), Q4 open until G4a, Q6 partly answered
 eval_epoch: 0
 ```
 
@@ -158,16 +158,16 @@ The plan approved on 2026-10-14 adds three tasks first, all due before G4b: D-05
   - `boot.json` carries a source hash and capabilities;
   - migration 0005 adds `daily_stats.cash_residual`; each later Phase 4 part brings its own migration (D-055).
 
-  Fees come from Alpaca's FEE activities; the human's read-only `trader fees` probe showed paper lists them (D-058). The EOD cash check counts them as they post: never today's estimates, which post overnight.
+  Fees come from Alpaca's FEE activities; the human's read-only `trader fees` probe showed paper lists them (D-058). The EOD cash check counts them once booked, and never today's estimates: a day's charges post that evening, after EOD.
 - [x] **P4.0b** D-054's fixes, part 2:
   - a skip names R-006 or R-007 when it also binds (labels only);
   - the order-API limiter keeps capacity in reserve for submits, cancels and sells;
   - busy polling is trimmed.
-- [ ] **P4.0c** Shadow outcomes:
+- [x] **P4.0c** Shadow outcomes (D-057; restated in D-059):
   - entry at max(trigger, the trigger minute's open), plus slippage;
   - the ambiguous trigger minutes resolved from the SIP trade tape;
   - the backtest re-run from its cache, with D-042's numbers and H4 restated.
-- [ ] **P4.1** Write `llm/schemas.py` (A§5), the schema generator to `schemas/*.json` (refs inlined, each file under 8 KB), and tests that the generated schemas validate the fixtures.
+- [x] **P4.1** Write `llm/schemas.py` (A§5), the schema generator to `schemas/*.json` (refs inlined, each file under 8 KB), and tests that the generated schemas validate the fixtures.
 - [ ] **P4.2** Write `llm/sanitize.py`: HTML strip, truncation, injection heuristics → `suspicious`, optional entity anonymization. Write tests with adversarial headlines.
 - [ ] **P4.3** Write `llm/context.py`: the premarket, vet, and review packs (A§8), plus size-cap tests.
 - [ ] **P4.4** Write `llm/claude_cli.py` per A§7: isolated env and cwd, exact flags, timeout handling, envelope parsing, one repair retry, artifact persistence, and `llm_calls` rows. Add `llm/budget.py`. Test everything with `scripts/fake_claude.py` scenarios.

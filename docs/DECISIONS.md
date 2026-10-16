@@ -1566,8 +1566,6 @@ Append-only. Each entry records context, the decision, its consequences, and sou
   - **The human's tape fetch:** `uv run trader backtest --start 2026-04-01 --end 2026-10-09 --tape`, outside 09:00–16:30 ET. About 605 requests, a few minutes.
   - **Then:** I re-run the report from the cache and restate D-042's numbers, its skip split (D-056) and H4 in a later entry.
 
----
-
 ## D-058 — D-055's fee probe: paper lists its FEE activities, dated the trade day and posted that evening
 - **Date:** 2026-10-15 · **Status:** Accepted. The human ran D-055's read-only probe, `trader fees --book A --days 5`, at 14:04 ET. No code changes.
 - **What paper listed** for Book A from 10-12 to 10-14:
@@ -1599,13 +1597,185 @@ Append-only. Each entry records context, the decision, its consequences, and sou
   - D-055's pending probe, now done, and its "settled cash stays conservative" (to within a cent a day);
   - S§3.6's fee row: Alpaca also charges a CAT fee.
 
+## D-059 — P4.0c closed: D-042's backtest restated under D-057's shadow rule; ranks 1–5 do best, with no gradient below them
+- **Date:** 2026-10-15 · **Status:** Accepted. The human ran `trader backtest --start 2026-04-01 --end 2026-10-09 --tape` at 21:49 ET. This restates D-042's results from the run's report and Parquet. No code changes.
+  - The run rewrote both files in place, so the report D-042 cites (`runtime/reports/backtest-2026-04-01-2026-10-09-iex.md`) now holds these numbers. D-042's own figures survive only in its text.
+- **The run:**
+  - It read the tape of all 605 ambiguous trigger minutes (313 longs, 292 shorts) in 7 minutes: 607 requests, all answered 200, two of them a second page. Apart from the calendar sync (one request), everything else came from the cache.
+  - The selection is D-042's: 133 sessions; 2,660 signals (1,322 long, 1,280 shadow short, 58 doji); 2,260 triggered.
+  - Trigger minutes: 1,655 settled by their bar and 605 by the tape. None fell back.
+- **Checked offline,** first by a scratch re-simulation from the cache and then by three independent verifiers, with no requests:
+  - It reproduces all 2,260 stored shadow R values exactly.
+  - With D-041's rule (entry at the trigger; any stop touch in the trigger minute is a stop), it gives D-042's figures exactly: longs −0.307, shorts −0.176, both −0.242, with 39% of longs and 36% of shorts stopped in their trigger minute.
+  - With D-042's optimistic rule, it gives D-042's +0.135 and +0.125, and +0.869 and +0.704 for ranks 1–5.
+  - **Book A's leg, re-run on D-041's outcomes, reproduces every D-042 total:** 265 trades, 11.7% winners, −0.295R, −$0.76 a trade, profit factor 0.68, $798.31, a 28.2% drawdown and a Sharpe of −2.44. D-042's own Parquet is gone, so the match is in totals, not trade by trade. Its leg already entered at the bar's open.
+- **Book A's long-only leg** (D-042 → now):
+  - 265 trades; winners 11.7% → 13.2%; mean gross R −0.295 → −0.243;
+  - expectancy −$0.76 → −$0.63 a trade, net of fee estimates; profit factor 0.68 → 0.742;
+  - $1,000 → $832.41 (−16.8%), not $798.31 (−20.2%); max drawdown 28.2% → 25.2%; daily Sharpe −2.44 → −1.84. SPY returned +19.7%.
+  - The tape is the whole change: 69 of the 265 trades had an ambiguous trigger minute.
+- **Skips, under D-056's labels.** Of the triggered longs, Book A didn't take 877:
+  - 540 for the day's entries (R-007), 242 for open positions (R-006), 94 chased, and 1 for settled cash (TMO at $656.24 on 09-18).
+  - D-042 counted settled cash 360, the day's entries 326, open positions 97 and chased 94: the same 877.
+  - **Two changes moved them.**
+    - Under D-041's outcomes, D-056's labels alone give 618, 164, 94 and 1: nearly every cash skip also hit a capacity rule, which D-056 now names.
+    - The tape's longer holds then move 78 skips from the day's entries to open positions: more positions are still open at a later trigger.
+  - **Every capacity skip is R-007's.** In this leg positions never outnumber the day's entries, and both caps are 2, so every open-positions skip also hit R-007. The label only says whether a position was still open, since R-006 is named first (`books/reasons.py`).
+- **Shadow R** (every triggered signal):
+
+  | | D-042, pessimistic | D-042, optimistic | now | now, winners |
+  |---|---|---|---|---|
+  | longs (1,142) | −0.307 | +0.135 | **−0.072** | 14.4% |
+  | shorts (1,118) | −0.176 | +0.116 (re-simulated; D-042 gave none) | **−0.211** | 15.2% |
+  | both (2,260) | −0.242 | +0.125 | **−0.141** | 14.8% |
+
+  - **Two changes pull opposite ways:**
+    - **Entering at the open.** 562 trigger minutes opened past the trigger (302 longs, 260 shorts), the 562 D-054 counted. 76 more opened exactly at it, which changes nothing.
+      - Entering the 562 at their open lowers the mean of all triggered longs by 0.110R, shorts by 0.171R and both by 0.140R. That is 0.42R, 0.74R and 0.56R per signal that opened past the trigger.
+      - Entered at the trigger, a price the minute had already opened past, the 562 averaged +0.369R; at their open, −0.195R.
+    - **The tape** gives back 0.345R to longs, 0.136R to shorts and 0.241R to both. In 441 of the 605 ambiguous minutes (221 of 313 longs, 220 of 292 shorts), it found the stop touch came before the entry.
+    - **Trigger-minute stops** fall from 39.2% to 19.9% of longs, and from 36.4% to 16.7% of shorts.
+    - **The bracket.** With D-057's entry and a trigger-minute stop at stop − $0.01, bars alone give:
+      - −0.417 (every ambiguous minute stopped) to +0.019 (none stopped) for longs;
+      - −0.347 to −0.128 for shorts;
+      - −0.382 to −0.053 for both.
+      - The tape lands 79%, 62% and 73% of the way up.
+      - These bracket the answer rather than strictly bound it: 124 of the tape's 164 trigger-minute stops filled below stop − $0.01, at the print.
+      - D-054's +0.022 for longs used D-042's optimistic rule, which also spares minutes that opened at or past the trigger. D-057 stops those.
+  - **One signal moves the long mean by 0.11R.** On 2026-08-19, MRNA (rank 1, gapped +84.5%) triggered at $122.10, with its stop $0.38 below.
+    - Book A didn't take it: TJX and FBIN had used the day's two entries at 09:35.
+    - Its trigger minute opened at $119.57. The first print at the trigger came at 09:37:53, and every usable print after it that minute stayed at or above $121.78, $0.06 over the stop. D-041's rule had stopped it at −1.02R.
+    - It then ran to $174.63 at the flatten: +126.7R.
+    - It is real by the rules and the data, so it stays. Without it, longs average −0.183R and both −0.197R.
+  - **The shape:** about 85% of triggered signals lose about 1R, and the median is −1.04R to −1.05R for both sides and in every rank bucket. The mean comes from the 5–6% that make more than 5R.
+- **H4** (mean shadow R by rel_vol rank):
+
+  | ranks | longs, D-042 | longs, now | both, D-042 | both, now |
+  |---|---|---|---|---|
+  | 1–5 | −0.213 | **+0.530** | −0.071 | **+0.184** |
+  | 6–10 | −0.291 | −0.382 | −0.248 | −0.278 |
+  | 11–15 | −0.498 | −0.310 | −0.382 | −0.295 |
+  | 16–20 | −0.205 | −0.087 | −0.267 | −0.174 |
+
+  - **Verdict: ranks 1–5 do best, but there is no gradient below them.**
+    - The report's H4 test (ranks 1–5 above ranks 16–20) passes, for longs and for both. Under D-041's rule, longs failed it.
+    - Below the top, longs' ranks 6–10, 11–15 and 16–20 average −0.382, −0.310 and −0.087: they rise as rel_vol falls.
+    - Across signals the rank correlation is about zero: Spearman +0.01 for longs and +0.03 for both, where H4 predicts a negative one.
+    - So the data show a top-bucket effect, not H4's ordering.
+  - **Even the top bucket is thin.** The 95% intervals below come from resampling the 133 days 10,000 times:
+    - Longs' ranks 1–5 average +0.530, interval −0.22 to +1.70. They beat the other three buckets' mean by 0.79R, interval +0.01 to +1.98.
+    - Without MRNA, longs' ranks 1–5 average +0.063, still the best bucket. They beat the rest by 0.32R, interval −0.06 to +0.73; the resampled advantage was zero or less 5% of the time. Both sides: −0.042, against −0.174 for ranks 16–20.
+    - With every R capped at +20, longs' ranks 1–5 average +0.137, still the best.
+    - So ranks 1–5 come first under every check, but a few large winners set the margin.
+- **D-057's entry limitation, measured.** Suppose each tape-read minute entered at its first print at or past the trigger, plus slippage, instead of at the trigger plus slippage:
+  - Longs would go from −0.072R to −0.084R, and shorts from −0.211R to −0.222R. H4's order wouldn't change.
+  - **R understates the cost.** A later entry also widens the risk, which lifts the R of every exit below the stop. In dollars, Book A's 265 trades at the same sizes would lose $20.17 more ($187.76, not $167.59).
+  - **Live, Book A would have skipped COGT, TRU and DNA as chased.** Through the leg, EWU, NBIL and LKQ take their places, and Book A ends at $827.04 instead of $832.41 (mean R −0.227, max drawdown 25.6%).
+  - **The first print** lay a median 0.017% past the trigger (90th percentile 0.16%, at most 0.71%).
+    - It lay past the 0.30% chase cap for eight longs: WFRD, COGT, AXGN, TWST, SAIL, TRU, DNA and EPAM.
+    - Seven of them lost 1.0R to 1.4R, and TWST made +21.8R.
+  - The effect is small ($5.37 on the book over six months), so the rule stays.
+- **For later phases** (facts; no change):
+  - **Over this window the rules lose.** Book A lost 16.8% while SPY gained 19.7%.
+    - Every mean shadow R here is negative except ranks 1–5 of longs (+0.530; +0.063 without MRNA) and of both sides (+0.184; −0.042 without MRNA).
+    - Shorts' ranks 1–5 average −0.139.
+  - **Book A's choice of trades isn't measurably worse.** Its trades averaged −0.243R, against −0.165R for the 876 triggered longs it didn't take, without MRNA. The gap, −0.08R, is noise: the day-resampled 95% interval runs from −0.45 to +0.30.
+  - **Book B's veto value** (Phase 5) will be measured on live shadow outcomes from this same rule. With 15% winners and a few outliers setting the mean, its intervals will be wide.
+    - S§7.3 names no resampling unit. Resampling by day, as here, is a proposal for P5.1.
+    - S§7.3's intervals are 90%; this entry's are 95%.
+- **Statements of current behavior this updates:**
+  - **D-042:**
+    - its results, all restated here;
+    - its "Until then, quote both bounds" no longer applies;
+    - its "about 850 small requests": it took 605 tape reads (607 requests);
+    - the report and Parquet it cites now hold this run's.
+  - **D-054:** its bar-open optimistic bound (+0.022 for longs) used D-042's optimistic rule.
+  - **D-056:** its pending restatement of D-042's skip split, now done.
+  - **D-057:** its pending restatement, now done.
+
+## D-060 — D-058's follow-ups: a charge retires only its own day's estimates and earlier ones; CAT is not negligible
+- **Date:** 2026-10-15 · **Status:** Accepted. Three independent agents verified D-058 offline. They confirmed every figure and found what follows. D-058 is committed, so its corrections are recorded here.
+- **A fix in `fee_reconciliation`** (`risk/ledger.py`; the test came first):
+  - **The flaw.** D-055 retired a trade date's estimates once *any* booked charge had posted after that day's close.
+    - So an older day's charge posting late, after a later day's close, retired the later day's estimates before its own charge had posted.
+    - That day then counted as charged nothing until its charge came: its whole fee, not a cent, and with no alert.
+  - **The fix.** A charge now retires a day's estimates only if it posted after that day's close and its cash left that day or later (`_charge_day`, D-055's dating).
+    - So an older day's late charge leaves a later day's estimates alone.
+    - Every earlier case is unchanged: next-day dating, a day with no charge of its own, and a charge with no posting time.
+  - **Whether it happens:** only with out-of-order posting, which the probe didn't show (each day's charges posted that evening).
+  - **D-058's dry run** on the real journal gives the same nine rows and a $0.00 residual.
+  - **Test:** `test_an_older_days_late_charge_leaves_a_later_days_estimates` fails on the old rule.
+- **Corrections to D-058:**
+  - **D-019** listed the CAT fee ($0.000003 a share, "under $0.001 for this bot's sizes") and ignored it as negligible. Rounded up per day, it costs a cent every trading day. D-058 should have named D-019 among the statements it updates.
+  - **D-058's "holds to within a cent a day, and only when a booking fails"** (of D-055's "settled cash stays conservative") was too narrow.
+    - An estimate also stands in, with no alert, whenever a booking runs before that day's charges post: at EOD by design, and at any boot that comes before them.
+    - The cent bound holds in every case. The SEC fee and TAF, rounded up per fill, never come to less than the REG charge, which Alpaca rounds per order or per day. Only CAT is missing.
+- **Docs:**
+  - S§3.6's fee row now says "per sell fill" and names the daily CAT fee.
+  - PLAN's P4.0a note says when a day's charges post: that evening, after EOD.
+  - Q5 says what D-058 found about CAT.
+- **Tests:** 1 new (fees).
+
+## D-061 — P4.1: Claude's output models and schemas: strict, echoing the `pack_id`, in `full` and `wire_safe` modes; filter, clamp, then validate
+- **Date:** 2026-10-15 · **Status:** Accepted (the Phase 4 plan, decision 7).
+- **The models** (`llm/schemas.py`, A§5):
+  - **Enums:** S§5.5's catalyst types (18) and risk flags (13), S§6.2's DSL fields (17) and ops (8), and S§6.5's outcome factors (19). A test parses STRATEGY.md and requires the same lists in the same order; a value added there in any spelling fails it.
+  - **`pack_id`:** `PremarketBrief`, `VetBatch` and `DailyReview` start with `pack_id` (`^[A-Za-z0-9-]{1,64}$`), which Claude copies from the pack.
+    - Pydantic always checks the format. Validated with the pack's id in the context (`context={"pack_id": ...}`), it checks the value too, so an answer about any other pack fails and gets the one repair.
+    - The error doesn't name the expected id: a repair has to read it from the pack.
+    - **For P4.3:** a pack id must match the pattern and carry a part that can't be guessed (a prefix of the pack's SHA-256, say), or the echo proves nothing. A§8's example gains `pack_id` then.
+  - **Closed and strict.** The models refuse extra fields: a fixture's assessment that sets a `size_multiplier` is rejected. They are strict, so pydantic is never looser than the schema the call sent.
+    - In its default lax mode, pydantic took "yes" and 1 for `true`, "0.7" for a number and "3" for an issue id, all of which the schema refuses.
+    - Strict, it also refuses a few things a Python Draft-7 validator lets through: a trailing newline under `$`, NaN against a range, 3.0 for an integer and a lone surrogate. Of these, only the surrogate can come through the CLI, at the cost of one repair.
+  - **Unbounded, as in A§5:** `signal_id` and a filter's `value`. A review of anything but a target is dropped (A§7.3), and S§6.2's evaluator checks values.
+- **The wire schemas** (`wire_schema(model, mode)`):
+  - **Shape:** every `$ref` inlined, titles and defaults dropped, every object closed (`additionalProperties: false`, unless a dict field gives its value schema there).
+    - The transforms recurse into schemas, never into the `properties` mapping, so a field named like a keyword survives.
+    - They name no `$schema`: nothing in them differs between draft-07 and 2020-12. The tests check them with a Draft-7 validator, and the review compiled all six with ajv (draft-07).
+  - **`full`** keeps the lengths, counts, ranges and patterns.
+  - **`wire_safe`** states them in each property's description (e.g. "at most 240 characters") and makes every property required. The optional ones stay satisfiable by being nullable (`existing_issue_id`) or constant (`compare_to`).
+    - It is the subset strict structured outputs accept, held for G4a: if the CLI refuses `full`, `llm.schema_mode` (P4.4) switches.
+    - It may be more cautious than needed, since it also drops `pattern` and `minItems`. G4a will show.
+  - **Size, compacted:** vet 1.4 KB, brief 1.6 KB, review 3.2 KB in `full`; at most 3.6 KB in `wire_safe`, and 4.2 KB once Windows quotes it. The limit is 8 KB.
+  - **Key order:** the models' field order, not sorted like the repo's other JSON.
+    - A schema's order is roughly the order Claude writes in. Sorted, an assessment would give its reason before its symbol, and a review its notes before its signal id.
+    - So `--check` compares exact text, key order included. A checkout's CRLF line ends don't count.
+- **Filter, clamp, then validate** (amends A§7.3; the runner is P4.4's):
+  - **First, drop what doesn't belong:** assessments of symbols that aren't candidates, and reviews of signals that aren't targets.
+  - **Then clamp** (`clamp_to_schema`, with the `full` schema): over-long free text, and the tails of the free lists (risk flags, factors, process issues, notes, lesson proposals). Each cut is counted (`llm_calls.clamped`).
+  - **Never clamped, so they go to validation and the one repair.** Plan decision 7 says "lengths and counts are clamped; enums never are"; the review showed where cutting a count changes the answer.
+    - **Numbers:** a confidence read on a 0–100 scale would have become 1.0, the highest.
+    - **A string with a pattern:** cutting an identifier can't make it right.
+    - **The lists whose items count as a set:**
+      - a lesson's filters are ANDed, so dropping one tests a broader subset than the proposal states;
+      - assessments (one per candidate) and reviews (one per target): a stray entry ahead of a real one would push it out.
+  - The clamp walks the schema, never the data beyond it, and builds new containers. So a deeply nested value reaches validation instead of raising `RecursionError`.
+- **Files:**
+  - `schemas/{premarket_brief,vet_batch,daily_review}.json` (`full`) and their `.wire.json` twins (`wire_safe`).
+    - `python -m trader.llm.schemas --write` writes them.
+    - `--check` exits 1 on a stale or missing file, or a JSON file there the code doesn't make.
+  - `tests/fixtures/llm/` holds one valid output per role and seven invalid ones: an enum, a symbol, a type, a `pack_id`, an extra field, a missing field and a DSL field that isn't whitelisted. The envelopes come with P4.4's fake CLI.
+- **Review.** Two reviewers (the semantics; the spec and tests) found no blocker. Every finding is fixed, and each fix's test fails without it (nine mutations, all caught). The findings:
+  - The clamp clamped numbers, cut ANDed filters, and let a stray assessment or review push a real one out. A§7.3 now filters by membership first, and the clamp leaves those alone.
+  - A well-formed but wrong `pack_id` passed; now the context checks it.
+  - `deepcopy` raised `RecursionError` on deeply nested junk.
+  - The transforms treated `properties` as a schema. It was latent, for fields named like keywords.
+  - A patterned string could be cut.
+  - The STRATEGY parsers missed names with digits, or without backticks.
+  - No test reached the clamp's `anyOf` path, the 8 KB limit or a stray file.
+  - The wording on agreement, file names and key order was off.
+- **`jsonschema` 4.26 is a new dev dependency,** for tests only (Draft-7). It touches neither trading, risk nor credentials. The lock gained it and four of its dependencies, and changed nothing else.
+- **Tests:** 53 in `test_llm_schemas.py`. 853 tests pass.
+
+---
+
 ## Open questions to resolve during the build (record answers as new entries)
 
 - **Q1 (P1.2):** Is Alpaca's `movers` (top market movers) endpoint available on the free plan? If not, use the IEX snapshot gap scan. **Partly answered: D-024** (the 09:00 scan uses snapshots either way); doctor's `data.movers` check records availability once keys exist. **Answered by doctor on 2026-10-10: available** (`data.movers` PASS; the screener returned 10 gainers).
 - **Q2 (P1.5):** The concurrent market-data WebSocket connection limit on the free plan, and whether a trading-status/halts channel is available on the IEX feed.
 - **Q3 (P2.1):** Exact alpaca-py request classes for OTO with a `stop_loss` leg; confirm that close-position cancels the related open orders. **Answered: D-030** (the trading client uses httpx, not alpaca-py; `DELETE /v2/positions/{symbol}` does not cancel open orders, so flattening cancels first).
 - **Q4 (G4a):** Does `--tools ""` work with `--json-schema`? What are the envelope fields and the exit codes on usage-limit or auth errors?
-- **Q5 (P0.2):** Current SEC Section 31 fee rate and FINRA TAF per share, for fee estimates (set in `fees:`). **Answered: D-019.** D-058 adds Alpaca's CAT fee, a cent a trading day so far, which the estimates leave out.
+- **Q5 (P0.2):** Current SEC Section 31 fee rate and FINRA TAF per share, for fee estimates (set in `fees:`). **Answered: D-019.** D-058 and D-060: the CAT fee, which D-019 judged negligible, costs a cent a trading day once Alpaca rounds it up; the estimates leave it out.
 - **Q6 (P1.4):** Typical count of eligible symbols, and the IEX OR-volume distribution, to sanity-check the liquidity guards. **Partly answered: D-042's results** (about 1,675 eligible symbols a day in 2026-04..10); the IEX OR-volume distribution is still to look at.
 - **Q7 (P1.2):** Can the human's Alpaca account type fetch SIP historical bars (older than 15 min)? If not: open a regular account, or record a new decision to fall back to IEX history with rescaled ADV thresholds and IEX-based shadow outcomes (noisier). **Doctor's `data.sip_history` check answers this once keys exist.** **Answered by doctor on 2026-10-10: yes** (`data.sip_history` PASS: SPY daily SIP bars through 2026-10-09), so no IEX fallback is needed.
 - **Q8 (P2.3):** Should the cash ledger settle on Alpaca's `settlement_date`, which skips bank holidays (D-022), or on T+1 trading days as RISK.md §4 says? Alpaca's date matches real cash-account behavior; the human decides. **Answered: D-034** (the human chose Alpaca's settlement date).

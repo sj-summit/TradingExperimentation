@@ -176,6 +176,18 @@ def test_a_day_retires_only_once_a_charge_posted_after_its_close() -> None:
     assert [r.ref for r in rows] == ["fee:r12", "fee-est-reversal:2026-10-12:2026-10-13"]
 
 
+def test_an_older_days_late_charge_leaves_a_later_days_estimates() -> None:
+    """Verification of D-058 (D-060): 10-12's charge posts a day late, after 10-13's close,
+    and 10-13's own charge hasn't posted by the 14th's boot. Posted after 10-13's close, the
+    late charge used to retire 10-13's estimate too, counting 10-13 as charged nothing until
+    its charge came. A charge only retires the days it could belong to: its own and earlier."""
+    late = fee("r12", D12, "-0.02", created=datetime.combine(D13, EVENING, ET))
+    entries = [SEED, *F_SALE, *FIGS_SALE]
+    rows = fee_reconciliation(entries, [late], book="A", today=D14)
+    assert [r.ref for r in rows] == ["fee:r12", "fee-est-reversal:2026-10-12:2026-10-13"]
+    assert cash([*entries, *rows]) == D("1312.12")  # 10-13's 0.01 estimate still counts
+
+
 def test_without_a_posting_time_only_a_later_dated_charge_retires_a_day() -> None:
     charged = [fee("r13", D13, "-0.02", created=None)]
     rows = fee_reconciliation([SEED, *F_SALE, *FIGS_SALE], charged, book="A", today=D14)

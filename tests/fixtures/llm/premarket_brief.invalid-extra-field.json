@@ -1,0 +1,19 @@
+{
+  "pack_id": "20261103-premarket-1",
+  "day_mode": "normal",
+  "day_mode_reason": "An assessment that tries to set its own size.",
+  "market_notes": "",
+  "assessments": [
+    {
+      "symbol": "XYZ",
+      "catalyst_type": "earnings",
+      "catalyst_fresh": true,
+      "catalyst_confirmed": true,
+      "risk_flags": [],
+      "verdict": "allow",
+      "confidence": 0.9,
+      "reason": "Strong beat.",
+      "size_multiplier": 2
+    }
+  ]
+}

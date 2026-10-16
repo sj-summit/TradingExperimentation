@@ -1,0 +1,28 @@
+{
+  "pack_id": "20261103-premarket-1",
+  "day_mode": "normal",
+  "day_mode_reason": "No high-impact event before 14:00; index futures are flat.",
+  "market_notes": "SPY -0.2% and QQQ -0.3% pre-market; FOMC decision at 14:00.",
+  "assessments": [
+    {
+      "symbol": "XYZ",
+      "catalyst_type": "earnings",
+      "catalyst_fresh": true,
+      "catalyst_confirmed": true,
+      "risk_flags": [],
+      "verdict": "allow",
+      "confidence": 0.7,
+      "reason": "Q3 beat and raised guidance, confirmed by an 8-K filed at 16:05 yesterday."
+    },
+    {
+      "symbol": "ABCD",
+      "catalyst_type": "offering_dilution",
+      "catalyst_fresh": true,
+      "catalyst_confirmed": true,
+      "risk_flags": ["dilution_offering", "shelf_or_atm"],
+      "verdict": "veto",
+      "confidence": 0.8,
+      "reason": "Priced a discounted offering after the close (424B5)."
+    }
+  ]
+}

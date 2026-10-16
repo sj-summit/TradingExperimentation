@@ -1,0 +1,20 @@
+{
+  "pack_id": "20261103-review-1",
+  "summary": "A lesson over an outcome field, which S§6.2's whitelist leaves out.",
+  "signal_reviews": [],
+  "process_issues": [],
+  "lesson_proposals": [
+    {
+      "statement": "Winners keep winning.",
+      "rationale": "Filters on the outcome itself.",
+      "evidence_query": {
+        "filters": [{"field": "shadow_r", "op": "gt", "value": 0}],
+        "compare_to": "complement",
+        "metric": "shadow_r"
+      },
+      "claimed_direction": "subset_better",
+      "suggested_use": "allow_hint"
+    }
+  ],
+  "human_notes": []
+}

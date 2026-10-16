@@ -1,8 +1,8 @@
-# HANDOFF: Phase 4 under way; P4.0a and P4.0b done, P4.0c's code done (updated 2026-10-15)
+# HANDOFF: Phase 4 under way; P4.0a–P4.0c and P4.1 done (updated 2026-10-15)
 
 **Latest:**
 - **Phase 4's plan is approved** (2026-10-14; `C:\Users\Admin\.claude\plans\squishy-popping-honey.md`). Order: P4.0a, P4.0b, P4.0c, P4.1–P4.6, 🛑 G4a, P4.7–P4.10, 🛑 G4b.
-- **P4.0a is done (D-055), uncommitted.**
+- **P4.0a is done (D-055).**
   - Fees are booked from Alpaca's FEE activities, at boot (before E) and at EOD. The EOD cash check is the same in paper and live, and stores its residual.
   - D-054's fixes:
     - #2: stuck-exit timing runs from our own send;
@@ -10,27 +10,30 @@
     - #4: entry delay is on the PC clock, plus an hourly skew reading;
     - #7: `boot.json` names the source by hash and lists the engine's capabilities.
   - An adversarial review, and a second pass on its fixes, found 2 major and 12 minor problems; all are fixed, each with a test that fails without its fix. 763 tests pass.
-- **P4.0b is done (D-056), uncommitted.**
+- **P4.0b is done (D-056).**
   - A size skip is named by R-006 or R-007 when one also binds (labels only; G3's STT now reads `capacity_entries`, pinned as `g3_day.CODE_CHANGES`).
   - Order submits, cancels and sells go ahead of polls in the rate limiter, and polls leave it 4 tokens; a working entry is read every 2 s, so two working entries make 120 calls a minute, not 240.
   - Its review found no blocker; the five minor findings are fixed and tested. 784 tests pass.
-- **P4.0c's code is done (D-057), uncommitted; the task stays open for the restatement.**
+- **P4.0c is done (D-057). D-059, uncommitted, restates the backtest from the human's tape fetch:**
+  - Book A −16.8% (D-042: −20.2%); shadow longs −0.072R, or −0.183R without one +126.7R signal Book A didn't take (MRNA, 2026-08-19).
+  - H4: ranks 1–5 do best under every check, but there is no gradient below them, and the evidence is thin.
   - Shadow outcomes enter at max(trigger, the trigger minute's open), so gap-throughs are fixed (CRWG: +3.07R, not +5.08R).
   - A trigger minute that opened below the trigger, touched the stop and closed above it is read from the SIP trade tape: live at 16:12 (one request each, capability `shadow_tape`) and in the backtest (`--tape`, cached in `bt_tape`).
   - Its review found no blocker; every finding is fixed, including a look-ahead in cached backtest reruns that predated it. 799 tests pass.
 - **The fee probe is done (D-058).**
   - Paper lists each trading day's CAT and REG charges, dated the trade day and posted that evening (20:05 and 20:15 ET).
   - A dry run on a copy of the journal books 6 charges and 3 reversals, with a $0.00 residual against the broker's $996.08.
-- **Commits:** HEAD is `0226783` (Phase 3 done). Everything since is uncommitted. Commit only if asked.
+- **D-060 (uncommitted):** verifying D-058 found a fee edge case: an older day's charge posting late could retire a later day's estimates before that day's own charge posted. Fixed in `fee_reconciliation`, with a test; D-058's dry run is unchanged.
+- **P4.1 is done (D-061), uncommitted.**
+  - Claude's output models and their schemas (`schemas/*.json`, `full` and `wire_safe`) are strict and closed, and each answer echoes the pack's `pack_id`.
+  - Over-long free text and free lists are clamped before validation; numbers, enums, patterns and set-like lists never are.
+  - `jsonschema` is a new dev dependency. Reviewed; 853 tests pass.
+- **Commits:** HEAD is `542efee` ("Pre phase 4 done", the human's commit of 2026-10-15 21:51 ET): P4.0a–P4.0c and D-055 to D-058. Uncommitted: D-059, D-060, P4.1's work and these doc updates. Commit only if asked.
 - **Waiting on the human:**
-  - **Now: the SIP-tape fetch,** `uv run trader backtest --start 2026-04-01 --end 2026-10-09 --tape`, after 16:30 ET or on a non-trading day.
-    - Between 09:00 and 16:30 ET on a trading day it refuses, as it did on 10-15 at 14:09.
-    - `--force` overrides it. That is safe only while no `run-day` is running, since the guard keeps a live session's share of the data rate limit.
-    - About 605 data requests, a few minutes. It ends by printing the report's path; paste the console output. I then restate D-042's numbers and H4 from the cache.
   - **Before G4a:** H0.2 (Claude Code ≥ 2.1.268, `claude setup-token`, the token in `.env`).
   - **Before G4b:** the Phase 1 checks (`trader news`, `trader filings`, `trader stream --news`) and the `ALPACA_DATA_*` keys.
   - `run-day` isn't needed between gates: it stays a human gate until Phase 6.
-- **Next (Claude):** after the tape fetch, the D-042/H4 restatement closes P4.0c; then P4.1 (schemas).
+- **Next (Claude):** P4.2 (sanitizer).
 - **New since G3, for the G4b runbook:**
   - **Log lines:**
     - `fees booked`, at boot and EOD. The first boot after 10-15 should book 10-12 to 10-14's 6 charges and 3 reversals (net $0.00), leaving E at $996.08 if no day trades before it;
@@ -46,7 +49,7 @@
   - **`--dry-run` prints the ledger's E before the fees are booked,** so it can differ by a few cents from the E boot uses.
   - **A size skip reads `capacity_positions` or `capacity_entries`** when R-006 or R-007 also binds (D-056), where it used to read `insufficient_settled_cash`.
 
-To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, the Phase 4 plan, and D-052 to D-055. The G3 runbook below served both runs and is the template for G4b. Everything below the line further down is the older G2 handoff, kept for its environment notes and the Phase 2 code map.
+To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, the Phase 4 plan, and D-052 to D-061. The G3 runbook below served both runs and is the template for G4b. Everything below the line further down is the older G2 handoff, kept for its environment notes and the Phase 2 code map.
 
 ## Where Phase 3 stands
 
@@ -60,7 +63,7 @@ To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, the
 - **D-051 (late 2026-10-12):** a read-only pre-flight review of the run-day path found no blockers. It led to eight fixes on failure paths, each with a test that fails on the old code.
   - The suite is now 682 tests. ruff, format and mypy are clean, and the gate is still at 100% coverage. A second review, of the fixes themselves, found no blocker; its minor points are fixed too (D-051 item 9).
   - The G3 runbook below includes the review's operator guidance.
-- **P3.9 (backtest) is done.** It ran 2026-04-01 to 2026-10-09; the results are at the end of D-042.
+- **P3.9 (backtest) is done.** It ran 2026-04-01 to 2026-10-09; the results are at the end of D-042. (Restated 2026-10-15 in D-059, with the trigger minutes read from the SIP tape: Book A −16.8%; longs average −0.07R.)
   - **Book A:** −20.2%; longs average −0.31R.
   - **But:** the shadow R for longs lies between −0.31 and +0.14 depending on how a trigger minute that touched both trigger and stop is read. The approved rule is the pessimistic end.
   - **Waiting on the human:** whether to resolve it from the SIP trade tape. (Decided 2026-10-14: yes, Phase 4's P4.0c, D-057.)

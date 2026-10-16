@@ -1,0 +1,301 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "pack_id": {
+      "pattern": "^[A-Za-z0-9-]{1,64}$",
+      "type": "string"
+    },
+    "summary": {
+      "maxLength": 2000,
+      "type": "string"
+    },
+    "signal_reviews": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "signal_id": {
+            "type": "string"
+          },
+          "went_well": {
+            "maxLength": 200,
+            "type": "string"
+          },
+          "went_badly": {
+            "maxLength": 200,
+            "type": "string"
+          },
+          "why": {
+            "maxLength": 300,
+            "type": "string"
+          },
+          "factors": {
+            "items": {
+              "enum": [
+                "catalyst_strong",
+                "catalyst_weak_or_none",
+                "catalyst_stale",
+                "dilution_or_offering",
+                "extreme_gap",
+                "thin_liquidity",
+                "sympathy_only",
+                "event_day",
+                "late_entry",
+                "entry_slippage",
+                "partial_fill",
+                "trend_continuation",
+                "false_breakout",
+                "faded_gap",
+                "stopped_by_noise",
+                "news_after_entry",
+                "market_tailwind",
+                "market_headwind",
+                "other"
+              ],
+              "type": "string"
+            },
+            "maxItems": 4,
+            "type": "array"
+          },
+          "knowable_at_decision": {
+            "enum": [
+              "yes",
+              "partly",
+              "no"
+            ],
+            "type": "string"
+          },
+          "b_process": {
+            "enum": [
+              "good_process",
+              "bad_process",
+              "unclear",
+              "not_applicable"
+            ],
+            "type": "string"
+          },
+          "b_note": {
+            "maxLength": 200,
+            "type": "string"
+          }
+        },
+        "required": [
+          "signal_id",
+          "went_well",
+          "went_badly",
+          "why",
+          "factors",
+          "knowable_at_decision",
+          "b_process",
+          "b_note"
+        ],
+        "type": "object"
+      },
+      "maxItems": 20,
+      "type": "array"
+    },
+    "process_issues": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "existing_issue_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "severity": {
+            "enum": [
+              "info",
+              "warn",
+              "error"
+            ],
+            "type": "string"
+          },
+          "component": {
+            "maxLength": 40,
+            "type": "string"
+          },
+          "description": {
+            "maxLength": 300,
+            "type": "string"
+          }
+        },
+        "required": [
+          "severity",
+          "component",
+          "description"
+        ],
+        "type": "object"
+      },
+      "maxItems": 10,
+      "type": "array"
+    },
+    "lesson_proposals": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "statement": {
+            "maxLength": 200,
+            "type": "string"
+          },
+          "rationale": {
+            "maxLength": 400,
+            "type": "string"
+          },
+          "evidence_query": {
+            "additionalProperties": false,
+            "properties": {
+              "filters": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "field": {
+                      "enum": [
+                        "catalyst_type",
+                        "risk_flags",
+                        "verdict",
+                        "verdict_source",
+                        "confidence",
+                        "gap_pct",
+                        "rel_vol",
+                        "rel_vol_rank",
+                        "or_range_atr",
+                        "or_return_pct",
+                        "price",
+                        "atr_pct",
+                        "minutes_to_trigger",
+                        "regime_spy_trend",
+                        "regime_vol_bucket",
+                        "day_of_week",
+                        "event_day"
+                      ],
+                      "type": "string"
+                    },
+                    "op": {
+                      "enum": [
+                        "eq",
+                        "ne",
+                        "gt",
+                        "gte",
+                        "lt",
+                        "lte",
+                        "in",
+                        "contains"
+                      ],
+                      "type": "string"
+                    },
+                    "value": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "boolean"
+                        },
+                        {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "field",
+                    "op",
+                    "value"
+                  ],
+                  "type": "object"
+                },
+                "maxItems": 4,
+                "minItems": 1,
+                "type": "array"
+              },
+              "compare_to": {
+                "const": "complement",
+                "type": "string"
+              },
+              "metric": {
+                "const": "shadow_r",
+                "type": "string"
+              }
+            },
+            "required": [
+              "filters"
+            ],
+            "type": "object"
+          },
+          "claimed_direction": {
+            "enum": [
+              "subset_worse",
+              "subset_better"
+            ],
+            "type": "string"
+          },
+          "suggested_use": {
+            "enum": [
+              "veto_hint",
+              "caution_hint",
+              "allow_hint"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "statement",
+          "rationale",
+          "evidence_query",
+          "claimed_direction",
+          "suggested_use"
+        ],
+        "type": "object"
+      },
+      "maxItems": 3,
+      "type": "array"
+    },
+    "human_notes": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "existing_note_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "note": {
+            "maxLength": 300,
+            "type": "string"
+          }
+        },
+        "required": [
+          "note"
+        ],
+        "type": "object"
+      },
+      "maxItems": 5,
+      "type": "array"
+    }
+  },
+  "required": [
+    "pack_id",
+    "summary",
+    "signal_reviews",
+    "process_issues",
+    "lesson_proposals",
+    "human_notes"
+  ],
+  "type": "object"
+}
