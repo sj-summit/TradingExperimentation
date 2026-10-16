@@ -39,3 +39,12 @@ def reason_from_violations(violations: Sequence[str]) -> str:
         if rule in violations:
             return code
     return f"risk_gate:{sorted(violations)[0]}" if violations else "risk_gate:unknown"
+
+
+def reason_for_no_size(capacity: Sequence[str], *, by_cash: int) -> str:
+    """Why sizing gave no shares, decided before the gate. A capacity rule that also binds
+    (R-006, R-007) names it, ranked as the gate ranks them (D-044); else the settled cash;
+    else the size rules. So the reason never depends on the price (D-054 #5, D-056)."""
+    if capacity:
+        return reason_from_violations(capacity)
+    return "insufficient_settled_cash" if by_cash < 1 else "qty_zero"

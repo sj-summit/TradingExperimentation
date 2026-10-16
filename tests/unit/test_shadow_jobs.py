@@ -11,11 +11,11 @@ from tests.fixtures.exec_harness import CALENDAR, RISK, SETTINGS
 from tests.fixtures.simtime import JumpClock
 from trader.core.calendar import day_times
 from trader.core.clock import ET
-from trader.core.models import Bar, Signal
-from trader.data.alpaca_rest import SipRecentError
+from trader.core.models import Bar, Signal, SipTrade
+from trader.data.alpaca_rest import AlpacaError, SipRecentError
 from trader.memory.journal import Journal
 from trader.memory.regime import ensure_regime, load_regime
-from trader.memory.shadow import ShadowParams, compute_shadow
+from trader.memory.shadow import ShadowParams, ShadowRun, compute_shadow
 from trader.strategy.orb_sip import save_signals
 
 D = Decimal
@@ -139,6 +139,90 @@ async def test_too_recent_data_is_retried_then_given_up(journal: Journal) -> Non
     result = await run(journal, JumpClock(at(16, 30)), stuck)
     assert not result.ok  # type: ignore[attr-defined]
     assert "recent SIP" in result.error  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------- the trigger minute's tape
+
+
+AMBIG = [m(9, 41, "9.95", "10.05", "9.85", "9.97"), m(15, 55, "10.30", "10.3", "10.3", "10.3")]
+
+
+def tick(ss: int, price: str) -> SipTrade:
+    return SipTrade(symbol="AMBG", ts=at(9, 41) + timedelta(seconds=ss), price=D(price), size=100,
+                    conditions=("@",))  # fmt: skip
+
+
+STOP_FIRST = [tick(5, "9.88"), tick(20, "10.02"), tick(50, "9.97")]
+
+
+class Taped(Minutes):
+    def __init__(self, bars: dict[str, list[Bar]], prints: list[SipTrade] | None) -> None:
+        super().__init__(bars)
+        self.prints = prints
+        self.tapes: list[tuple[tuple[str, ...], datetime, datetime, str]] = []
+
+    async def trades(self, symbols: Sequence[str], start: datetime, end: datetime, *,
+                     feed: str) -> dict[str, list[SipTrade]]:  # fmt: skip
+        self.tapes.append((tuple(symbols), start, end, feed))
+        if self.prints is None:
+            raise AlpacaError(500, "internal error", "/v2/stocks/trades")
+        return {"AMBG": self.prints}
+
+
+# Two that touched their stops in the trigger minute, yet the bars order them: no tape.
+GAPS = [m(9, 42, "10.02", "10.05", "9.85", "9.97"), m(15, 55, "10.3", "10.3", "10.3", "10.3")]
+SINKS = [m(9, 43, "9.95", "10.05", "9.85", "9.90"), m(15, 55, "9.8", "9.8", "9.8", "9.8")]
+
+
+async def taped_run(
+    journal: Journal, market: Taped, *, tape: bool = True, save: bool = True
+) -> ShadowRun:
+    signals = [*SIGNALS, sig("AMBG", 6), sig("GAPS", 7), sig("SINK", 8)]
+    if save:
+        await save_signals(journal, signals)
+    return await compute_shadow(journal=journal, market=market, clock=JumpClock(at(16, 12)),
+                                calendar=CALENDAR, day=DAY, times=TIMES, or_minutes=5,
+                                params=PARAMS, signals=signals, tape=tape)  # fmt: skip
+
+
+async def resolutions(journal: Journal) -> dict[str, str | None]:
+    rows = await journal.fetch_all("SELECT signal_id, trigger_resolution FROM shadow_outcomes")
+    return {r["signal_id"][9:-5]: r["trigger_resolution"] for r in rows}
+
+
+async def test_one_tape_request_per_ambiguous_trigger_minute(journal: Journal) -> None:
+    """D-057: only AMBG's trigger minute is ambiguous; its tape says the stop came first."""
+    market = Taped({**MARKET, "AMBG": AMBIG, "GAPS": GAPS, "SINK": SINKS}, STOP_FIRST)
+    result = await taped_run(journal, market)
+    assert market.tapes == [(("AMBG",), at(9, 41), at(9, 42), "sip")]
+    assert result.tape_unresolved == ()
+    assert result.outcomes["20261013-AMBG-orb5"].exit_reason == "flatten"
+    assert await resolutions(journal) == {
+        "LIVE": "bars", "SIPO": "bars", "NONE": None, "SHRT": "bars", "AMBG": "tape",
+        "GAPS": "bars", "SINK": "bars",
+    }  # fmt: skip
+    assert result.outcomes["20261013-GAPS-orb5"].exit_reason == "stop"  # opened past: entered
+    assert result.outcomes["20261013-SINK-orb5"].exit_reason == "stop"  # closed at the stop
+
+
+async def test_a_tape_that_cant_be_read_falls_back_and_says_so(journal: Journal) -> None:
+    result = await taped_run(journal, Taped({**MARKET, "AMBG": AMBIG}, None))
+    assert result.ok
+    assert result.outcomes["20261013-AMBG-orb5"].exit_reason == "stop"  # the pessimistic rule
+    assert (await resolutions(journal))["AMBG"] == "fallback"
+    assert len(result.tape_unresolved) == 1
+    assert result.tape_unresolved[0].startswith("AMBG: ")
+    empty = await taped_run(journal, Taped({**MARKET, "AMBG": AMBIG}, []), save=False)
+    assert empty.tape_unresolved == ("AMBG: no print at the trigger in its minute",)
+
+
+async def test_without_the_capability_no_tape_is_read(journal: Journal) -> None:
+    """A day recorded before D-057 made no tape request, so its replay must make none."""
+    market = Taped({**MARKET, "AMBG": AMBIG}, STOP_FIRST)
+    result = await taped_run(journal, market, tape=False)
+    assert market.tapes == []
+    assert result.tape_unresolved == ()  # nothing was asked for
+    assert (await resolutions(journal))["AMBG"] == "fallback"
 
 
 class Daily:

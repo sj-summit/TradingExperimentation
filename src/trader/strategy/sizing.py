@@ -36,8 +36,9 @@ def sizing(
     notional_pct: Decimal,
     multiplier: Decimal,
 ) -> Sizing:
-    """The size and the term that set it. On a tie, cash names the reason before notional and
-    risk, so a book out of settled cash reports ``insufficient_settled_cash``."""
+    """The size and the term that set it; on a tie, cash before notional and risk. A book
+    with no shares to buy names the reason with ``by_cash`` (books/reasons.py: a capacity rule
+    that also binds comes first, D-056)."""
     if limit <= ZERO or stop >= limit:
         return Sizing(qty=0, binding=None, by_risk=0, by_notional=0, by_cash=0)
     scale = max(multiplier, ZERO)
@@ -72,7 +73,7 @@ def binding_term(
     notional_pct: Decimal,
     multiplier: Decimal,
 ) -> SizeTerm | None:
-    """Which term set the size: it picks the reason code when the size is 0."""
+    """Which term set the size (cash, notional or risk)."""
     return sizing(
         limit, stop, equity, settled_available, risk_pct, notional_pct, multiplier
     ).binding

@@ -52,15 +52,18 @@ class Service:
     """The slice of ExecutionService a book uses, with a scripted outcome."""
 
     def __init__(self, outcome: str = "submitted", *, violations: tuple[str, ...] = (),
-                 equity: str = "1000", cash: str = "1000") -> None:  # fmt: skip
+                 equity: str = "1000", cash: str = "1000", held: tuple[str, ...] = (),
+                 entries: int = 0) -> None:  # fmt: skip
         self.outcome, self.violations = outcome, violations
         self.equity, self.cash = D(equity), D(cash)
+        self.held, self.entries = frozenset(held), entries
         self.intents: list[OrderIntent] = []
         self.states: list[GateState] = []
         self.accepting = True
 
     async def exposure(self, intent: OrderIntent | None = None) -> Exposure:
-        return Exposure(symbols=frozenset(), entries_today=0, symbols_entered_today=frozenset(),
+        return Exposure(symbols=self.held, entries_today=self.entries,
+                        symbols_entered_today=self.held,
                         available_cash=self.cash, equity_sod=self.equity,
                         realized_pnl_today=D(0), open_risk=D(0), ledger_equity=self.equity,
                         unprotected=frozenset(), client_order_id_used=False,
@@ -148,6 +151,27 @@ async def test_skips_before_the_gate(journal: Journal) -> None:
     assert broke.reason == "insufficient_settled_cash"
     assert await rows(journal) == [("A", 0, "chased"), ("A", 0, "qty_zero"),
                                    ("A", 0, "insufficient_settled_cash")]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("service", "reason"),
+    [
+        (Service(cash="5", entries=2), "capacity_entries"),  # STT on 10-14 (D-054 #5)
+        (Service(cash="5", held=("ABC", "DEF"), entries=2), "capacity_positions"),
+        (Service(equity="10", held=("ABC", "DEF")), "capacity_positions"),
+        (Service(cash="5", entries=1), "insufficient_settled_cash"),
+    ],
+)
+async def test_a_capacity_rule_that_also_binds_names_a_size_skip(
+    journal: Journal, service: Service, reason: str
+) -> None:
+    """D-056: the reason no longer depends on the price. R-006 and R-007 rank first, as in
+    the gate (D-044); a label only, as the skip happens either way."""
+    decision = await book(journal, service).on_trigger(event(), signal())
+    assert (decision.take, decision.reason) == (False, reason)
+    assert service.intents == []  # never sent to the gate
+    if reason.startswith("capacity"):
+        assert "; capacity: R-00" in decision.detail
 
 
 @pytest.mark.parametrize(

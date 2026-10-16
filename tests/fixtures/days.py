@@ -24,7 +24,7 @@ from typing import Any
 
 from tests.fixtures import nyse
 from trader.core.clock import ET, Clock
-from trader.core.models import Asset, Bar, Quote, Snapshot, Split, Trade
+from trader.core.models import Asset, Bar, Quote, SipTrade, Snapshot, Split, Trade
 from trader.data.alpaca_rest import Adjustment, Feed, Timeframe
 from trader.data.replay import RecordedEvent
 
@@ -342,6 +342,26 @@ class SyntheticMarket:
         await self._call("splits")
         return [s for s in self.day.splits if start <= s.ex_date <= end]
 
+    async def trades(
+        self, symbols: Sequence[str], start: datetime, end: datetime, *, feed: Feed
+    ) -> dict[str, list[SipTrade]]:
+        """The day's own prints as its SIP tape (D-057)."""
+        await self._call("trades")
+        out: dict[str, list[SipTrade]] = {}
+        for rec in self._events:
+            ev = rec.event
+            if isinstance(ev, Trade) and ev.symbol in symbols and start <= ev.ts <= end:
+                out.setdefault(ev.symbol, []).append(
+                    SipTrade(
+                        symbol=ev.symbol,
+                        ts=ev.ts,
+                        price=ev.price,
+                        size=ev.size,
+                        conditions=ev.conditions,
+                    )
+                )
+        return out
+
 
 # ---------------------------------------------------------------- the standard test day
 
@@ -361,7 +381,7 @@ def standard_day(day: date = DAY) -> SyntheticDay:
     | 5 | EXP | never reaches 60.41: expired at 15:30 |
     | 6 | SHORT | the opening range falls: a shadow short, never armed |
     | 7 | DOJI | opens and closes the range at 15.00: no direction |
-    | 8 | CAP | triggers 11:00:50, but the book's settled cash is spent: insufficient_settled_cash |
+    | 8 | CAP | triggers 11:00:50, after the day's two entries: the gate's R-007, capacity_entries |
     """
     return SyntheticDay(
         day=day,

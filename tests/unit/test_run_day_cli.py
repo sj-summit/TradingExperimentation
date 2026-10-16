@@ -1,6 +1,7 @@
 """`trader run-day` wiring (P3.5; DECISIONS D-048), offline: no market data, no orders."""
 
 import asyncio
+import hashlib
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -17,8 +18,10 @@ from trader.data.ws import StreamError
 from trader.execution.sim_broker import SimBroker
 from trader.memory.journal import Journal
 from trader.orchestrator import live
+from trader.orchestrator import replay as replay_module
 from trader.orchestrator.live import BookChoiceError, RunOptions, folders, parse_books, run_day
 from trader.orchestrator.lock import RunLock, RunLockError
+from trader.orchestrator.provenance import source_sha256
 
 D = Decimal
 MORNING = datetime(2026, 10, 13, 8, 31, tzinfo=ET)
@@ -143,3 +146,41 @@ def test_the_boot_record_names_the_commit_without_running_git(tmp_path: Path) ->
     assert live._git_sha(tmp_path) == "def456"
     info: dict[str, Any] = dict(live._boot_info(tmp_path, RunOptions(books=("A",), sim=True)))
     assert (info["git_sha"], info["sim"]) == ("def456", True)
+    assert info["source_sha256"] is None  # no source tree here
+
+
+def test_the_source_hash_names_the_code_whatever_the_line_endings(tmp_path: Path) -> None:
+    """An uncommitted tree still has a name in boot.json (D-055)."""
+    module = tmp_path / "src" / "trader" / "x.py"
+    module.parent.mkdir(parents=True)
+    module.write_bytes(b"a = 1\nb = 2\n")
+    first = source_sha256(tmp_path)
+    module.write_bytes(b"a = 1\r\nb = 2\r\n")  # the same file checked out on Windows
+    assert source_sha256(tmp_path) == first
+    module.write_bytes(b"a = 1\nb = 3\n")
+    assert source_sha256(tmp_path) not in (None, first)
+
+
+def test_the_source_hash_takes_files_in_posix_path_order(tmp_path: Path) -> None:
+    """Windows paths compare without case, and by part: a hash in that order would differ
+    from one made on Linux for the same tree (review, D-055)."""
+    names = ["src/trader/B.py", "src/trader/a.py", "src/trader/a/b.py"]  # POSIX string order
+    for name in names:
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_bytes(name.encode())
+    digest = hashlib.sha256()
+    for name in names:
+        digest.update(name.encode() + b"\0" + name.encode() + b"\0")
+    assert source_sha256(tmp_path) == digest.hexdigest()
+
+
+def test_a_replay_says_when_the_code_changed_since_the_recording(tmp_path: Path) -> None:
+    module = tmp_path / "src" / "trader" / "x.py"
+    module.parent.mkdir(parents=True)
+    module.write_text("a = 1\n", encoding="utf-8")
+    recorded = {"source_sha256": source_sha256(tmp_path)}
+    assert replay_module._notes(tmp_path, recorded, tmp_path) == []
+    module.write_text("a = 2\n", encoding="utf-8")
+    notes = replay_module._notes(tmp_path, recorded, tmp_path)
+    assert notes == ["the code changed since the recording"]
+    assert replay_module._notes(tmp_path, {}, tmp_path) == []  # recorded before D-055

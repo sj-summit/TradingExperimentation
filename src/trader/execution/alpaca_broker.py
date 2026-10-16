@@ -10,7 +10,7 @@ import asyncio
 import contextlib
 import random
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Self
 
@@ -38,6 +38,7 @@ from trader.execution.broker import (
     BrokerEvent,
     BrokerUnavailable,
     DuplicateClientOrderId,
+    FeeActivity,
     Order,
     OrderNotCancelable,
     OrderNotFound,
@@ -54,8 +55,11 @@ from trader.execution.trade_stream import TRADE_STREAM_PAPER_URL, AlpacaTradeStr
 log = structlog.get_logger(__name__)
 
 RATE_LIMIT_PER_MIN = 180  # Alpaca allows 200 trading-API calls per minute per account
+ORDER_RESERVE = 4  # tokens polls never take: they stay for submits, cancels and sells (D-056)
 ERR_DUPLICATE_CLIENT_ORDER_ID = 40010001
 MAX_ORDERS_PER_PAGE = 500
+ACTIVITIES_PER_PAGE = 100  # Alpaca's maximum page_size for account activities
+MAX_ACTIVITY_PAGES = 50
 
 
 class AlpacaBroker:
@@ -111,7 +115,7 @@ class AlpacaBroker:
             key.get_secret_value(),
             secret.get_secret_value(),
             clock=clock,
-            limiter=RateLimiter(RATE_LIMIT_PER_MIN),
+            limiter=RateLimiter(RATE_LIMIT_PER_MIN, reserve=ORDER_RESERVE),
         )
 
     async def aclose(self) -> None:
@@ -152,6 +156,36 @@ class AlpacaBroker:
             "limit": MAX_ORDERS_PER_PAGE,
         }
         return self._order_list(await self._read("/v2/orders", params))
+
+    async def fee_activities(self, after: datetime) -> list[FeeActivity]:
+        """``GET /v2/account/activities/FEE``, oldest first. A page holds at most 100; the
+        next page starts after the last id seen (``page_token``). ``after`` goes in whole
+        seconds, the form Alpaca documents. A row this can't read is a ``BrokerDataError``,
+        so the caller's "fees unavailable" path takes it (D-055)."""
+        found: list[FeeActivity] = []
+        params: dict[str, Any] = {
+            "after": rfc3339(after.replace(microsecond=0)),
+            "direction": "asc",
+            "page_size": ACTIVITIES_PER_PAGE,
+        }
+        for _ in range(MAX_ACTIVITY_PAGES):
+            try:
+                rows = await self._read("/v2/account/activities/FEE", params)
+            except _NotFound:
+                raise BrokerUnavailable("account activities: not found") from None
+            if not isinstance(rows, list):
+                raise BrokerUnavailable("unexpected account activities payload")
+            try:
+                found += [parse_fee(row) for row in rows]
+                last = str(rows[-1]["id"]) if rows else ""
+            except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+                raise BrokerDataError(
+                    f"unreadable fee activity: {type(exc).__name__}: {exc}"
+                ) from None
+            if len(rows) < ACTIVITIES_PER_PAGE:
+                return found
+            params = params | {"page_token": last}
+        raise BrokerUnavailable(f"over {MAX_ACTIVITY_PAGES} pages of fees: refusing to guess")
 
     async def get_order(self, order_id: str) -> Order:
         try:
@@ -312,6 +346,19 @@ def parse_account(raw: Mapping[str, Any]) -> AccountSnapshot:
         trade_suspended_by_user=bool(raw.get("trade_suspended_by_user")),
         shorting_enabled=bool(raw.get("shorting_enabled")),
         is_paper=True,  # paper keys only authenticate against the paper host (D-020)
+    )
+
+
+def parse_fee(raw: Mapping[str, Any]) -> FeeActivity:
+    """One non-trade activity of type FEE; its kind of fee is ``activity_sub_type``."""
+    return FeeActivity(
+        id=str(raw["id"]),
+        date=date.fromisoformat(str(raw["date"])[:10]),
+        sub_type=str(raw.get("activity_sub_type") or ""),
+        net_amount=Decimal(str(raw["net_amount"])),
+        status=str(raw.get("status") or "executed"),
+        symbol=raw.get("symbol") or None,
+        created_at=_timestamp(raw.get("created_at")),
     )
 
 

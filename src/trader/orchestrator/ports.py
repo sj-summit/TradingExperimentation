@@ -10,7 +10,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal, Protocol
 
-from trader.core.models import Asset, Bar, Quote, Snapshot, Split, Trade
+from trader.core.models import Asset, Bar, Quote, SipTrade, Snapshot, Split, Trade
 from trader.data.alpaca_rest import Adjustment, Feed, Timeframe
 from trader.data.stream import Channel, MarketEvent, Tap
 
@@ -52,3 +52,6 @@ class DayMarket(Protocol):
     ) -> dict[str, list[Bar]]: ...
     async def snapshots(self, symbols: Sequence[str], *, feed: Feed) -> dict[str, Snapshot]: ...
     async def splits(self, start: date, end: date) -> list[Split]: ...
+    async def trades(
+        self, symbols: Sequence[str], start: datetime, end: datetime, *, feed: Feed
+    ) -> dict[str, list[SipTrade]]: ...

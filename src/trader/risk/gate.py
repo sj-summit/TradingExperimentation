@@ -52,7 +52,7 @@ class GateState(BaseModel):
     equity_sod: Decimal  # E
     realized_pnl_today: Decimal = Decimal(0)  # net of fee estimates
     open_risk: Decimal = Decimal(0)  # positions and unfilled entries, down to their stops
-    ledger_equity: Decimal  # ledger cash before fee estimates, plus marked positions
+    ledger_equity: Decimal  # ledger cash less all but today's fee estimates, plus marks (D-055)
     broker_equity: Decimal | None  # None: unknown, which fails R-019
     # The symbol.
     asset: Asset | None  # None: Alpaca doesn't know it
@@ -168,12 +168,15 @@ class RiskGate:
 
     def _positions(self, intent: OrderIntent, qty: int, state: GateState) -> bool:
         """R-006: symbols held or being entered stay under the concurrency limit."""
-        limit = min(self._risk.max_concurrent_positions, caps.MAX_CONCURRENT_POSITIONS)
-        return len(state.exposure_symbols) < limit
+        return "R-006" not in capacity_violations(
+            self._risk, positions=len(state.exposure_symbols), entries_today=0
+        )
 
     def _entries(self, intent: OrderIntent, qty: int, state: GateState) -> bool:
         """R-007: today's entries stay under the daily limit."""
-        return state.entries_today < min(self._risk.max_entries_per_day, caps.MAX_ENTRIES_PER_DAY)
+        return "R-007" not in capacity_violations(
+            self._risk, positions=0, entries_today=state.entries_today
+        )
 
     @staticmethod
     def _symbol_once(intent: OrderIntent, qty: int, state: GateState) -> bool:
@@ -261,6 +264,18 @@ class RiskGate:
             for event in state.events
             if event.impact == "high"
         )
+
+
+def capacity_violations(risk: RiskConfig, *, positions: int, entries_today: int) -> tuple[str, ...]:
+    """R-006 and R-007 alone: the gate's own test, and how a book names a skip it made for size
+    before the gate when one of them binds too (D-056). There it is a label only, never a
+    reason to skip. The caps apply on top of the configuration."""
+    found: list[str] = []
+    if positions >= min(risk.max_concurrent_positions, caps.MAX_CONCURRENT_POSITIONS):
+        found.append("R-006")
+    if entries_today >= min(risk.max_entries_per_day, caps.MAX_ENTRIES_PER_DAY):
+        found.append("R-007")
+    return tuple(found)
 
 
 def _multiplier(intent: OrderIntent) -> Decimal:

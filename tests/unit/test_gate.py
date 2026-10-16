@@ -17,7 +17,7 @@ from trader.core.events import Event
 from trader.core.models import Asset, OrderIntent, RiskCheck
 from trader.core.yamlfile import load_yaml
 from trader.memory.journal import Journal
-from trader.risk.gate import GateState, RiskGate, record_risk_check
+from trader.risk.gate import GateState, RiskGate, capacity_violations, record_risk_check
 
 D = Decimal
 RISK = RiskConfig.model_validate(load_yaml(REPO / "config" / "risk.example.yaml"))
@@ -279,3 +279,13 @@ async def test_the_check_is_journaled(journal: Journal) -> None:
     assert (row["signal_id"], row["book"], row["approved"]) == ("20261009-XYZ-orb5", "A", 0)
     assert json.loads(row["violations_json"]) == ["R-009"]
     assert json.loads(row["state_json"])["available_cash"] == "20"
+
+
+def test_capacity_violations_name_r006_and_r007_alone() -> None:
+    """What a book uses to name a skip it made for size before the gate (D-056)."""
+    assert capacity_violations(RISK, positions=1, entries_today=1) == ()
+    assert capacity_violations(RISK, positions=2, entries_today=1) == ("R-006",)
+    assert capacity_violations(RISK, positions=1, entries_today=2) == ("R-007",)
+    assert capacity_violations(RISK, positions=2, entries_today=2) == ("R-006", "R-007")
+    loose = RISK.model_copy(update={"max_entries_per_day": 99})  # past the cap of 6
+    assert capacity_violations(loose, positions=0, entries_today=6) == ("R-007",)

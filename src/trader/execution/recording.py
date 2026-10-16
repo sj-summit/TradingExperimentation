@@ -18,6 +18,7 @@ from trader.execution.broker import (
     BrokerAdapter,
     BrokerError,
     BrokerEvent,
+    FeeActivity,
     Order,
     Position,
     StopTif,
@@ -54,7 +55,7 @@ def _encode(result: Any) -> Any:
         return None
     if isinstance(result, Order):
         return encode_order(result)
-    if isinstance(result, (AccountSnapshot, Position)):
+    if isinstance(result, (AccountSnapshot, Position, FeeActivity)):
         return result.model_dump(mode="json")
     if isinstance(result, list):
         return [_encode(item) for item in result]
@@ -91,6 +92,10 @@ class RecordingBroker:
     async def orders_since(self, after: datetime) -> list[Order]:
         return await self._call("orders_since", {"after": fmt_iso(after)},
                                 lambda: self._inner.orders_since(after))  # fmt: skip
+
+    async def fee_activities(self, after: datetime) -> list[FeeActivity]:
+        return await self._call("fee_activities", {"after": fmt_iso(after)},
+                                lambda: self._inner.fee_activities(after))  # fmt: skip
 
     async def submit_entry_oto(self, intent: OrderIntent) -> Order:
         return await self._call(

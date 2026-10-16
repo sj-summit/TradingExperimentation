@@ -6,7 +6,7 @@ Prices are Decimal, quantities whole shares, timestamps tz-aware ET.
 """
 
 from collections.abc import AsyncIterator
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Literal, Protocol
 
@@ -104,6 +104,19 @@ def stop_is_working(stop: Order, entry: Order | None = None) -> bool:
     return stop.status == "held" and entry is not None and entry.status == "filled"
 
 
+class FeeActivity(_Frozen):
+    """A fee the broker charged: one account activity of type FEE (DECISIONS D-055). Alpaca
+    charges each day's regulatory fees at its end; paper posts them overnight."""
+
+    id: str
+    date: date
+    sub_type: str  # REG, TAF, CAT, ...
+    net_amount: Decimal  # negative: cash taken
+    status: str  # executed, correct or canceled
+    symbol: str | None = None
+    created_at: datetime | None = None
+
+
 class TradeUpdate(_Frozen):
     """One event from the broker's trade-updates stream. ``qty`` and ``price`` describe this
     execution only; ``order.filled_qty`` is the order's cumulative fill."""
@@ -192,6 +205,10 @@ class BrokerAdapter(Protocol):
     async def order_by_client_id(self, client_order_id: str) -> Order | None: ...
     async def orders_since(self, after: datetime) -> list[Order]:
         """Orders submitted after ``after``, in any status, legs nested."""
+        ...
+
+    async def fee_activities(self, after: datetime) -> list[FeeActivity]:
+        """The FEE activities created after ``after``, oldest first."""
         ...
 
     async def submit_entry_oto(self, intent: OrderIntent) -> Order:

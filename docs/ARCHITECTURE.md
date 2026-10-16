@@ -80,7 +80,7 @@ Times are config defaults. On **early-close days**:
 |---|---|---|---|
 | 07:30 | Universe refresh (if not done the night before) | — | assets, SIP daily bars → ATR14/ADV14, corporate actions, OR baselines, EDGAR ticker map |
 | 08:25 | Process start (OS scheduler) | — | Exit cleanly if not a trading day |
-| 08:30 | Boot | A, B | boot's own checks (not `doctor --quick`); clock skew; the universe if missing; the t−1 regime tags; reconcile each account: today's journal explains a restart, anything else is a P1 and a flatten at max(now, 09:30:05); seed (first use, flat account only) or load the ledgers; set E; start the kill switch, heartbeat, alert pump and stream; write `boot.json` (DECISIONS D-048). The news stream joins in Phase 4 |
+| 08:30 | Boot | A, B | boot's own checks (not `doctor --quick`); clock skew; the universe if missing; the t−1 regime tags; reconcile each account: today's journal explains a restart, anything else is a P1 and a flatten at max(now, 09:30:05); seed (first use, flat account only) or load the ledgers; book the fees the broker charged (capability `fees_v1`, D-055); set E; start the kill switch, heartbeat, alert pump and stream; write `boot.json` (DECISIONS D-048). The news stream joins in Phase 4 |
 | 09:00 | Pre-market scan | — | top gainers among eligible (Alpaca movers endpoint if available on the plan, else IEX snapshots); news (last 18 h); EDGAR flags; up to 40 candidates |
 | 09:05 | Claude pre-market brief | B | deadline 09:28 (STRATEGY.md §5.2) |
 | 09:29 | Subscribe the stream to regime symbols (SPY, QQQ, IWM) | — | |
@@ -88,13 +88,13 @@ Times are config defaults. On **early-close days**:
 | 09:35:05 | Arm signals; subscribe the stream (≤ 30 symbols total) | A, B | |
 | 09:35:05 | Claude catalyst vet (batched) | B | 60 s budget |
 | 09:35–last_entry | Triggers → book policy → risk gate → OTO entries | A, B | |
-| continuous | Reconciliation every 60 s; R-020 stop-leg checks every 5 s; heartbeat every 10 s | A, B | |
+| continuous | Reconciliation every 60 s; R-020 stop-leg checks every 5 s (every 1 s while shares are bare or a stop is pending, every 2 s while entries are open; D-056); heartbeat every 10 s; the clock skew read every hour after boot (`skew_hourly`; journaled in `day_runs`; a P2 alert only, D-055) | A, B | |
 | last_entry (15:30) | Stop arming new entries; cancel unfilled entries | A, B | |
 | flatten (15:55) | Cancel all orders; close all positions; verify flat by close − 2 min | A, B | |
-| 16:05 | EOD per book: reconcile; final decisions; trades; daily stats; breakers (cash check, drawdown, losing streak) | A, B | each step marked in `day_runs`, so a restart skips it (D-048) |
-| 16:12 | Shadow outcomes (SIP 1-min bars; the 15:55 bar is > 15 min old from about 16:11; retry for up to 5 min) | — | STRATEGY.md §7.2 |
+| 16:05 | EOD per book: reconcile; final decisions; trades; fees (`fees_v1`, D-055); daily stats; breakers (cash check, with its residual stored and a P3 `cash_drift` past half the tolerance; drawdown; losing streak) | A, B | each step marked in `day_runs`, so a restart skips it (D-048) |
+| 16:12 | Shadow outcomes (SIP 1-min bars; the 15:55 bar is > 15 min old from about 16:11; retry for up to 5 min); each ambiguous trigger minute read from the SIP trade tape, one request each (capability `shadow_tape`, D-057); a minute the tape can't settle is counted as stopped, with a P3 `shadow_tape_unresolved` | — | STRATEGY.md §7.2 |
 | 16:15 | Claude post-close review → signal reviews, process issues, notes, lesson proposals (each to its own table) | B | 10 min first attempt; repair only if it can finish by 16:29, else `daily_reviews.status = missing` and the report says so |
-| 16:30 | Reports (MD and HTML), notifications, DB backup, recordings finalized | — | then exit |
+| 16:30 | Reports (MD and HTML), notifications, recordings finalized; DONE, then the DB backup (D-055) | — | then exit |
 
 ### Late start and partial days
 
@@ -137,12 +137,15 @@ class TradingCalendar:
 ### 4.2 data
 
 ```python
-class RateLimiter: ...   # token bucket; one per Alpaca REST host; default 180 req/min (verify plan limit)
+class RateLimiter: ...   # token bucket; one per Alpaca REST host; 180 req/min. On the order API, POST and DELETE
+                         # (submits, cancels, sells) go first and polls leave 4 tokens for them (D-056)
 
 class AlpacaMarketData:                       # wraps alpaca-py historical + REST
     async def bars(self, symbols: list[str], timeframe: str, start: datetime, end: datetime,
                    feed: Feed, adjustment: str = "raw") -> dict[str, list[Bar]]: ...   # paginates, batches
     async def snapshots(self, symbols: list[str], feed: Feed) -> dict[str, Snapshot]: ...
+    async def trades(self, symbols: list[str], start: datetime, end: datetime,
+                     feed: Feed) -> dict[str, list[SipTrade]]: ...   # the SIP tape (D-057)
     async def movers(self, top: int) -> list[Mover] | None: ...   # None if not available on plan
     async def assets(self) -> list[Asset]: ...
     async def corporate_actions(self, symbols: list[str], start: date, end: date) -> list[CorporateAction]: ...
@@ -170,7 +173,7 @@ class MarketDataHub:                          # the single WebSocket
   - stream events, each with its receive time `rx` → `stream.jsonl.gz`
   - every market-data REST call after boot (arguments, result or error, start and end `rx`) → `rest.jsonl.gz`
   - each book's broker calls and trade updates (parsed models, no raw payloads) → `broker-A.jsonl.gz`, `broker-B.jsonl.gz`
-  - each book's ledger, halts and state at boot, a calendar slice, and the config hashes and git SHA → `boot.json` (`boot-2.json` after a restart)
+  - each book's ledger, halts and state at boot, a calendar slice, the config hashes, the git SHA, a hash of the source (`source_sha256`, so an uncommitted tree has a name) and the engine's capabilities → `boot.json` (`boot-2.json` after a restart). A replay grants only the recorded capabilities, so a day recorded before one existed makes none of its calls (D-055)
   - OR scan response → `or_scan.parquet`
   - universe snapshot → `universe.parquet`
   - news → `news.jsonl.gz`
@@ -237,6 +240,7 @@ class BrokerAdapter(Protocol):
     async def cancel(self, order_id: str) -> None: ...
     async def close_position(self, symbol: str) -> Order: ...   # replaced by service.flatten_account (D-036)
     async def order_by_client_id(self, client_order_id: str) -> Order | None: ...
+    async def fee_activities(self, after: datetime) -> list[FeeActivity]: ...  # FEE activities (D-055)
     def trade_updates(self) -> AsyncIterator[TradeUpdate]: ...  # Alpaca trading stream
 ```
 
@@ -248,15 +252,16 @@ class BrokerAdapter(Protocol):
   - Stop legs trigger when a trade is at or below the stop and fill at `min(stop, trade) − sim_slippage`.
   - Optional random partial fills (seeded).
   - Optional faults modelled on Alpaca paper at the open (D-053), each opt-in:
-    - acceptance delays (`pending_new`);
+    - acceptance delays (`pending_new`); acceptance rewrites `submitted_at`, as paper does (D-055);
     - cancels queued until after acceptance, or dropped;
     - slow cancels that survive a partial fill;
     - `order_cancel_rejected` when a cancel finds the order final.
+  - `charge_fee()` posts a fee as paper does overnight: cash drops and a FEE activity appears (D-055).
   - Deterministic under `SimClock`.
 - **`ExecutionService` (one per book):**
   1. Submit after approval.
   2. Track state through trade updates.
-  3. Cancel entries still unfilled `entry_timeout_s` after the broker accepted them (or 30 s after submission if never accepted). Re-send a cancel while the order keeps working (D-053).
+  3. Cancel entries still unfilled `entry_timeout_s` after the broker accepted them (or 30 s after submission if never accepted). Re-send a cancel while the order keeps working (D-053). An entry is read every second while it waits for acceptance or after a cancel, and every 2 s while it works, its fills coming on the stream (D-056).
   4. Run the R-020 protection loop.
   5. Flatten and verify.
   6. Never blind-retry a submit: on timeout or error, query `order_by_client_id` before any resubmission.
@@ -306,10 +311,10 @@ class LLMResult(Generic[T]):
   BOOT → PREMARKET → OR_SCAN → TRADING → FLATTEN → EOD → REVIEW → REPORT → DONE
   ```
 
-  - Every state transition is journaled in `day_runs` (kind `state`) and `trading_days.run_status`; finished EOD steps are `day_runs` rows of kind `step`.
+  - Every state transition is journaled in `day_runs` (kind `state`) and `trading_days.run_status`; finished EOD steps are `day_runs` rows of kind `step`, and the hourly clock-skew readings rows of kind `clock` (D-055).
   - Each task has a deadline. A missed deadline follows the fallback in STRATEGY.md and RISK.md.
   - A state that fails before the flatten is a P2 and falls through to FLATTEN and EOD: closed for entries, open for exits.
-  - The modules: `plan.py` (the timeline), `day.py` (the machine), `eod.py`, `tasks.py` (heartbeat, staleness, subscriptions), `inputs.py` (the gate's network inputs), `lock.py`, `live.py` (the `run-day` wiring), `simdrive.py` (drives a SimClock), `ports.py`. Details in DECISIONS D-048.
+  - The modules: `plan.py` (the timeline), `day.py` (the machine), `eod.py`, `tasks.py` (heartbeat, staleness, subscriptions), `inputs.py` (the gate's network inputs), `lock.py`, `live.py` (the `run-day` wiring), `simdrive.py` (drives a SimClock), `ports.py`, `capabilities.py` (what a day's engine does, recorded in `boot.json` so a replay of an older day makes no newer call) and `provenance.py` (the source hash). Details in DECISIONS D-048 and D-055.
 - **`run-day` modes:** paper (records everything for replay; `runtime/run-day.lock` keeps a second engine away); `--sim` (live data, a SimBroker per book, everything under `runtime/sim/<date>/`, alerts prefixed `[SIM]`); `--dry-run` (boot's checks, read-only, and the timeline).
 - **`watchdog.py`:** RISK.md §6.
 
@@ -335,10 +340,11 @@ class LLMResult(Generic[T]):
 | `stream --symbols … --minutes N` | Dev: print live bars | — |
 | `run-day [--books A,B] [--sim] [--dry-run]` | The full day | HUMAN GATE until Phase 6 |
 | `replay --date D [--speed N]` | Recorded day through the real engine on SimClock, with recorded market data and broker answers; compares with the journal (D-049). `--speed` is deferred | — |
-| `backtest --start --end` | Rules-only ORB on historical SIP | — |
+| `backtest --start --end [--tape]` | Rules-only ORB on historical SIP; `--tape` fetches the SIP tape of each ambiguous trigger minute not yet cached (D-057) | — |
 | `report daily\|weekly\|evaluation` | Reports | — |
 | `lessons evaluate [--promote]` | Weekly job | — |
 | `followups list [--all]` / `followups set issue\|note ID --status S [--response TEXT]` | Claude's open process issues and notes; only the human closes them (issue: `fixed`/`wontfix`; note: `accepted`/`rejected`/`done`) | — |
+| `fees [--book A\|B\|all] [--days N]` | Read-only: the FEE activities Alpaca charged a book's account, then its cash (D-055) | — |
 | `halt`, `resume`, `flatten` | Kill switch | `resume` requires typed confirmation |
 | `watchdog` | Independent safety check | — |
 | `smoke paper` | Places and cancels a non-marketable 1-share OTO in paper | HUMAN GATE |
@@ -478,7 +484,8 @@ CREATE TABLE trades (id TEXT PRIMARY KEY, book TEXT, signal_id TEXT, symbol TEXT
 CREATE TABLE shadow_outcomes (signal_id TEXT PRIMARY KEY REFERENCES signals(id), entry_price TEXT,
   exit_price TEXT, exit_reason TEXT, shadow_r REAL, mfe_r REAL, mae_r REAL, minutes_held INTEGER,
   path_source TEXT, computed_at TEXT,
-  trigger_ts TEXT, sip_only_trigger INTEGER);   -- from 0004: the SIP trigger minute; live feed never triggered
+  trigger_ts TEXT, sip_only_trigger INTEGER,   -- from 0004: the SIP trigger minute; live feed never triggered
+  trigger_resolution TEXT);   -- from 0006: bars | tape | fallback, how the trigger minute was judged (D-057)
 CREATE TABLE llm_calls (id TEXT PRIMARY KEY, date TEXT, role TEXT, model_alias TEXT, model_resolved TEXT,
   prompt_sha256 TEXT, schema_sha256 TEXT, started_at TEXT, ended_at TEXT, duration_ms INTEGER,
   exit_code INTEGER, is_error INTEGER, num_turns INTEGER, cost_estimate_usd REAL, schema_valid INTEGER,
@@ -496,7 +503,7 @@ CREATE TABLE ledger_entries (id INTEGER PRIMARY KEY, book TEXT, kind TEXT, symbo
   trade_date TEXT, settle_date TEXT, ref TEXT, created_at TEXT);
 CREATE TABLE daily_stats (date TEXT, book TEXT, start_equity TEXT, end_equity TEXT, pnl TEXT,
   n_signals INTEGER, n_triggered INTEGER, n_trades INTEGER, max_intraday_dd TEXT, regime_json TEXT,
-  eval_epoch INTEGER, PRIMARY KEY (date, book));
+  eval_epoch INTEGER, cash_residual TEXT, PRIMARY KEY (date, book));   -- cash_residual: from 0005, broker - ledger at EOD (D-055)
 CREATE TABLE lessons (id TEXT PRIMARY KEY, created_at TEXT, source_call_id TEXT, statement TEXT,
   rationale TEXT, evidence_query_json TEXT, claimed_direction TEXT, suggested_use TEXT, status TEXT,
   n_subset INTEGER, n_complement INTEGER, effect_r REAL, ci_low REAL, ci_high REAL,
@@ -521,7 +528,7 @@ CREATE TABLE book_state (book TEXT PRIMARY KEY, halted INTEGER, halt_reason TEXT
 CREATE TABLE regime_daily (date TEXT PRIMARY KEY, spy_close TEXT, spy_sma20 TEXT, spy_trend TEXT,   -- from 0004
   spy_atr_pct REAL, tercile_low REAL, tercile_high REAL, vol_bucket TEXT, computed_at TEXT);
 CREATE TABLE day_runs (id INTEGER PRIMARY KEY, date TEXT NOT NULL, kind TEXT NOT NULL,   -- from 0004
-  name TEXT NOT NULL, at TEXT NOT NULL, detail TEXT);   -- kind: state (a transition log) | step (an EOD step done)
+  name TEXT NOT NULL, at TEXT NOT NULL, detail TEXT);   -- kind: state (a transition log) | step (an EOD step done) | clock (an hourly skew reading, detail = seconds; D-055)
 CREATE TABLE halts (id INTEGER PRIMARY KEY, book TEXT NOT NULL, reason TEXT NOT NULL,    -- from 0003 (D-036)
   scope TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL, expires_at TEXT,           -- scope: until_resume | session | marker
   cleared_at TEXT, cleared_by TEXT);

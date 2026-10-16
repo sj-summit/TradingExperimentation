@@ -266,8 +266,9 @@ async def test_one_symbols_working_sell_does_not_hold_up_another(
     result = await flatten(sim, records, clock)
     assert result.flat
     assert manual.id not in sim.cancels  # the other process's exit was left to fill
-    abc = await sim.order_by_client_id("A-20261009-ABC-exit-1")
+    abc = await records.order("A-20261009-ABC-exit-1")  # our send time: paper rewrites its own
     assert abc is not None
+    assert abc.submitted_at is not None
     assert abc.submitted_at - started < timedelta(seconds=1)  # sold in the first pass
 
 

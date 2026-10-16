@@ -8,7 +8,10 @@ Rebuilt at EOD with an idempotent upsert, id ``{book}-{signal_id}``:
 - ``pnl`` and ``r_multiple`` are gross (S§7.1: R = (exit - entry) / (entry - planned stop));
   ``fees_est`` holds the estimated sale fees.
 - ``entry_slippage`` is entry - trigger; ``entry_delay_ms`` runs from the live trigger to the
-  first fill.
+  booking of the first fill, both on the PC clock: the broker stamps fills with its own clock,
+  which the PC's trails by tenths of a second (D-055). A fill booked more than
+  ``LIVE_BOOKING_MAX_S`` after the broker's fill time was caught up after a restart or an
+  outage, so its delay is unknown: NULL.
 - A position still open keeps NULL exit fields until a later rebuild sees it closed.
 """
 
@@ -21,6 +24,10 @@ from decimal import Decimal
 from trader.config import BookName
 from trader.core.clock import fmt_iso, parse_et_iso
 from trader.memory.journal import Journal, db_to_dec, dec_to_db
+
+# A live booking follows the broker's fill within the stream's latency or one 1 s poll, give
+# or take RISK.md §9's 2 s of clock skew; later than this, the fill was caught up (D-055).
+LIVE_BOOKING_MAX_S = 5.0
 
 EXIT_REASONS: dict[str, str] = {
     "stop_leg": "stop",
@@ -73,6 +80,7 @@ def build_trade(
     stop: Decimal | None,
     trigger: Decimal | None,
     triggered_at: datetime | None,
+    first_booked_at: datetime | None,
     entries: Sequence[Fill],
     exits: Sequence[Fill],
     fees: Decimal,
@@ -116,7 +124,11 @@ def build_trade(
         fees_est=fees,
         entry_slippage=entry - trigger if trigger is not None else None,
         entry_delay_ms=(
-            int((first - triggered_at).total_seconds() * 1000) if triggered_at else None
+            int((first_booked_at - triggered_at).total_seconds() * 1000)
+            if triggered_at
+            and first_booked_at
+            and (first_booked_at - first).total_seconds() <= LIVE_BOOKING_MAX_S
+            else None
         ),
         eval_epoch=epoch,
     )
@@ -158,7 +170,12 @@ def read_trades(conn: sqlite3.Connection, book: BookName, day: date) -> list[Tra
         )
         if not bought:
             continue
-        first = min(f.at for f in bought)
+        first_fill = min(bought, key=lambda f: f.at)
+        first = first_fill.at
+        booked = conn.execute(
+            "SELECT created_at FROM ledger_entries WHERE book = ? AND ref = ?",
+            (book, f"fill:{first_fill.fill_id}"),
+        ).fetchone()
         sold = [
             f
             for f in _fills(
@@ -179,6 +196,7 @@ def read_trades(conn: sqlite3.Connection, book: BookName, day: date) -> list[Tra
             stop=db_to_dec(e["stop_price"]),
             trigger=db_to_dec(e["trigger_price"]),
             triggered_at=parse_et_iso(e["triggered_at"]) if e["triggered_at"] else None,
+            first_booked_at=parse_et_iso(booked[0]) if booked and booked[0] else None,
             entries=bought,
             exits=sold,
             fees=fees,

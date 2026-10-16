@@ -56,6 +56,7 @@ from trader.notify import notifier_from_config
 from trader.orchestrator.day import DayDeps, DayOrchestrator, DayPaths
 from trader.orchestrator.lock import RunLock
 from trader.orchestrator.ports import DayMarket
+from trader.orchestrator.provenance import source_sha256
 from trader.risk.killswitch import KILL_FILE
 
 log = structlog.get_logger(__name__)
@@ -363,7 +364,13 @@ def _boot_info(root: Path, opts: RunOptions) -> Mapping[str, Any]:
         for name, rel in files.items()
         if (root / rel).is_file()
     }
-    return {"version": __version__, "git_sha": _git_sha(root), "sim": opts.sim, **hashes}
+    return {
+        "version": __version__,
+        "git_sha": _git_sha(root),
+        "source_sha256": source_sha256(root),  # names an uncommitted tree too (D-055)
+        "sim": opts.sim,
+        **hashes,
+    }
 
 
 def _git_sha(root: Path) -> str | None:

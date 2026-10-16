@@ -2,7 +2,7 @@ import asyncio
 import json
 import random
 from collections.abc import AsyncIterator
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -18,12 +18,14 @@ from trader.core.clock import ET, SimClock
 from trader.core.models import OrderIntent
 from trader.data.alpaca_rest import TRADING_PAPER_URL
 from trader.data.ratelimit import RateLimiter
-from trader.execution.alpaca_broker import AlpacaBroker
+from trader.execution.alpaca_broker import ORDER_RESERVE, AlpacaBroker
 from trader.execution.broker import (
     BrokerAuthError,
     BrokerDataError,
     BrokerError,
+    BrokerUnavailable,
     DuplicateClientOrderId,
+    FeeActivity,
     OrderNotCancelable,
     OrderNotFound,
     OrderRejected,
@@ -210,6 +212,105 @@ async def test_orders_since_asks_for_every_status(
     )
 
 
+FEES = f"{TRADING_PAPER_URL}/v2/account/activities/FEE"
+
+
+def fee_json(**changes: Any) -> dict[str, Any]:
+    row = {
+        "id": "20261013203000000::f0",
+        "activity_type": "FEE",
+        "activity_sub_type": "CAT",
+        "date": "2026-10-13",
+        "created_at": "2026-10-13T20:30:00Z",
+        "net_amount": "-0.01",
+        "status": "executed",
+        "symbol": "FIGS",
+        "currency": "USD",
+    }
+    return row | changes
+
+
+async def test_a_fee_activity_parses_exactly(
+    broker: AlpacaBroker, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.get(FEES).mock(return_value=httpx.Response(200, json=[fee_json()]))
+    assert await broker.fee_activities(NOW) == [
+        FeeActivity(
+            id="20261013203000000::f0",
+            date=date(2026, 10, 13),
+            sub_type="CAT",
+            net_amount=D("-0.01"),
+            status="executed",
+            symbol="FIGS",
+            created_at=datetime(2026, 10, 13, 16, 30, tzinfo=ET),
+        )
+    ]
+
+
+async def test_fee_activities_are_read_page_by_page_oldest_first(
+    broker: AlpacaBroker, respx_mock: respx.MockRouter
+) -> None:
+    first = [fee_json(id=f"f{i}") for i in range(100)]
+    last = [fee_json(id="f100", activity_sub_type="TAF", net_amount="-0.02", symbol=None)]
+    route = respx_mock.get(FEES).mock(
+        side_effect=[httpx.Response(200, json=first), httpx.Response(200, json=last)]
+    )
+    fees = await broker.fee_activities(NOW)
+    assert [f.id for f in fees[-2:]] == ["f99", "f100"]
+    assert (fees[-1].sub_type, fees[-1].net_amount, fees[-1].symbol) == ("TAF", D("-0.02"), None)
+    one, two = (call.request.url.params for call in route.calls)
+    assert (one["after"], one["direction"], one["page_size"]) == (
+        "2026-10-09T14:00:00Z",
+        "asc",
+        "100",
+    )
+    assert "page_token" not in one
+    assert two["page_token"] == "f99"
+
+
+async def test_an_odd_activities_payload_is_refused(
+    broker: AlpacaBroker, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.get(FEES).mock(return_value=httpx.Response(200, json={"oops": 1}))
+    with pytest.raises(BrokerError, match="activities"):
+        await broker.fee_activities(NOW)
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {k: v for k, v in fee_json().items() if k != "net_amount"},
+        fee_json(net_amount=None),
+        fee_json(date=None),
+        fee_json(created_at="2026-10-13T20:30:00"),  # no offset
+    ],
+)
+async def test_an_unreadable_fee_row_is_a_broker_error(
+    broker: AlpacaBroker, respx_mock: respx.MockRouter, row: dict[str, Any]
+) -> None:
+    """Review F2 (D-055): the boot and EOD bookings turn a BrokerError into a P3 and go on."""
+    respx_mock.get(FEES).mock(return_value=httpx.Response(200, json=[row]))
+    with pytest.raises(BrokerDataError, match="unreadable fee activity"):
+        await broker.fee_activities(NOW)
+
+
+async def test_activities_not_found_is_a_broker_error(
+    broker: AlpacaBroker, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.get(FEES).mock(return_value=httpx.Response(404, json={"message": "not found"}))
+    with pytest.raises(BrokerUnavailable, match="not found"):
+        await broker.fee_activities(NOW)
+
+
+async def test_the_activities_window_goes_in_whole_seconds(
+    broker: AlpacaBroker, respx_mock: respx.MockRouter
+) -> None:
+    """Alpaca documents YYYY-MM-DD and YYYY-MM-DDTHH:MM:SSZ for ``after`` (review, D-055)."""
+    route = respx_mock.get(FEES).mock(return_value=httpx.Response(200, json=[]))
+    await broker.fee_activities(NOW.replace(microsecond=538_444))
+    assert route.calls.last.request.url.params["after"] == "2026-10-09T14:00:00Z"
+
+
 async def test_a_full_page_of_orders_is_refused(
     broker: AlpacaBroker, respx_mock: respx.MockRouter
 ) -> None:
@@ -372,6 +473,8 @@ async def test_from_config_paper_only(repo: Path) -> None:
     cfg = load_config(repo)
     broker = AlpacaBroker.from_config(cfg, "B", SimClock(NOW))
     assert broker.name == "alpaca-paper:B"
+    limiter = broker._http._limiters[TRADING_PAPER_URL]
+    assert limiter._reserve == ORDER_RESERVE == 4  # polls leave these to orders (D-056)
     await broker.aclose()
     set_yaml(repo / "config" / "settings.yaml", "mode", "live")
     with pytest.raises(BrokerError, match="live gate"):
@@ -382,3 +485,33 @@ async def test_from_config_without_keys(repo: Path) -> None:
     (repo / ".env").write_text('CLAUDE_TOKEN_CREATED="2026-10-01"\n', encoding="utf-8")
     with pytest.raises(BrokerAuthError, match="ALPACA_PAPER_A"):
         AlpacaBroker.from_config(load_config(repo), "A", SimClock(NOW))
+
+
+class Recording(RateLimiter):
+    """Remembers which calls asked to be urgent."""
+
+    def __init__(self) -> None:
+        super().__init__(100_000, capacity=1_000, reserve=4)
+        self.urgent: list[bool] = []
+
+    async def acquire(self, *, urgent: bool = False) -> None:
+        self.urgent.append(urgent)
+        await super().acquire(urgent=urgent)
+
+
+async def test_orders_jump_the_limiter_queue_and_polls_do_not(
+    respx_mock: respx.MockRouter,
+) -> None:
+    """D-054 #6 (D-056): a submit, cancel or sell must not queue behind the polls."""
+    limiter = Recording()
+    broker = AlpacaBroker(
+        "A", "PKTESTKEY", "test-secret", clock=SimClock(NOW), limiter=limiter, sleep=no_sleep
+    )
+    respx_mock.get(f"{ORDERS}/o1").mock(return_value=httpx.Response(200, json=order_json()))
+    respx_mock.delete(f"{ORDERS}/o1").mock(return_value=httpx.Response(204))
+    respx_mock.post(ORDERS).mock(return_value=httpx.Response(200, json=order_json()))
+    await broker.get_order("o1")
+    await broker.cancel("o1")
+    await broker.submit_market_sell("XYZ", 40, "A-20261009-XYZ-sell-1")
+    assert limiter.urgent == [False, True, True]
+    await broker.aclose()

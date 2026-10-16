@@ -3,6 +3,7 @@
 import itertools
 import math
 import statistics
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
@@ -143,6 +144,21 @@ def render(result: BacktestResult) -> str:
     for name, subset in (("long", longs), ("shadow short", shorts), ("long + short", signals)):
         s = shadow_stats(subset)
         lines.append(f"| {name} | {s.n} | {_pct(s.win_rate)} | {_num(s.mean_r)} |")
+    judged = Counter(
+        r.shadow.trigger_resolution for r in signals if r.shadow and r.shadow.triggered
+    )
+    fell = [r for r in signals if r.shadow and r.shadow.trigger_resolution == "fallback"]
+    unread = sum(not r.tape_read for r in fell)
+    lines += [
+        "",
+        f"- trigger minutes (D-057): {judged['bars']} settled by their bar; {judged['tape']} "
+        f"ambiguous ones read from the SIP tape; {judged['fallback']} ambiguous ones counted "
+        f"as stopped: {unread} with no tape (`--tape` fetches them), {len(fell) - unread} "
+        "whose tape had no usable print at the trigger",
+        f"- longs read from the tape whose first print past the trigger was beyond the chase "
+        f"cap: {_past_cap(longs)}. The shadow enters them at the trigger regardless, so their "
+        "outcomes are optimistic (D-057)",
+    ]
     lines += ["", "## H4: mean shadow R by rel_vol rank", ""]
     lines += ["| ranks | long n | long mean R | all n | all mean R |", "|---|---|---|---|---|"]
     for (label, sl), (_, sa) in zip(buckets_long, buckets_all, strict=True):
@@ -155,6 +171,8 @@ def render(result: BacktestResult) -> str:
         "## Limitations",
         "",
         "- Fills are simulated from SIP 1-minute bars: no queue position, impact or latency.",
+        "- An ambiguous trigger minute is ordered by the SIP tape where it was read, else counted "
+        "as stopped; either way the entry stays at max(trigger, the minute's open) (D-057).",
         "- Triggers use SIP minute highs; live triggers use the IEX feed and lag the tape.",
         "- Inactive assets are included only where Alpaca still lists them; survivorship is "
         "reduced, not removed.",
@@ -163,6 +181,17 @@ def render(result: BacktestResult) -> str:
         "",
     ]
     return "\n".join(lines)
+
+
+def _past_cap(results: Sequence[SignalResult]) -> int:
+    return sum(
+        1
+        for r in results
+        if r.shadow
+        and r.shadow.tape_entry is not None
+        and r.signal.max_chase_price is not None
+        and r.shadow.tape_entry > r.signal.max_chase_price
+    )
 
 
 def signal_rows(result: BacktestResult) -> list[dict[str, Any]]:
@@ -184,6 +213,9 @@ def signal_rows(result: BacktestResult) -> list[dict[str, Any]]:
                     "triggered": bool(o and o.triggered),
                     "trigger_ts": o.trigger_ts.isoformat() if o and o.trigger_ts else None,
                     "exit_reason": o.exit_reason if o else None,
+                    "trigger_resolution": o.trigger_resolution if o else None,
+                    "tape_read": r.tape_read,
+                    "tape_entry": _s(o.tape_entry) if o else None,
                     "shadow_r": o.shadow_r if o else None,
                     "mfe_r": o.mfe_r if o else None,
                     "mae_r": o.mae_r if o else None,

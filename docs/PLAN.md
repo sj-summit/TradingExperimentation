@@ -10,9 +10,9 @@
 
 ```
 STATUS
-current_phase: 3 done (G3 passed 2026-10-14, D-054; H4's direction noted in D-042); next is Phase 4 in plan mode. Due before G4b, not before Phase 4's coding: the shadow-entry and trigger-minute fix, and D-054's fixes that touch live trading
-last_completed_task: G3 passed on run 2, 2026-10-14 (D-054): DONE, no P1, flat, replay matches; D-053 handled VRNS's 12 s acceptance; the code that ran is commit cc6eb60; golden replay test from the recorded day (tests/golden/recordings/2026-10-14, trimmed to 3.3 MB); 715 tests
-open_questions: read docs/HANDOFF.md first. Next from Claude, two plans for the human: (1) D-054's minor fixes (paper fee check, stuck-exit timing, stale marks, entry_delay clock, skip-reason order, polling budget, dirty-tree flag); (2) the shadow entry on gap-through trigger bars together with the trigger-minute rule (D-042: shadow R between -0.31 and +0.14 for longs; bar-open entries lower both bounds), then restate D-042's shadow numbers and H4; both land before G4b, since Book B's veto value and the review are judged on shadow outcomes. H0.2 open until doctor's claude checks pass (claude's folder added to PATH; CLAUDE_TOKEN_CREATED); Phase 1 done-checks pending (stream, news, filings); Q2 open (run 2: 14 symbols x trades+quotes = 28, under 30, no 405; a 405 at 16 or more symbols would mean channels count toward the 30), Q6 partly answered
+current_phase: 4 (plan approved 2026-10-14: C:\Users\Admin\.claude\plans\squishy-popping-honey.md; order P4.0a, P4.0b, P4.0c, P4.1-P4.6, G4a, P4.7-P4.10, G4b)
+last_completed_task: P4.0c's code (D-057): shadow entries at max(trigger, open); ambiguous trigger minutes from the SIP tape (live job and backtest); reviewed, every finding fixed; P4.0a (D-055) and P4.0b (D-056) done before it; 799 tests; all uncommitted (HEAD 0226783). P4.0c stays open for the human's tape fetch and the D-042/H4 restatement; then P4.1. D-058 records the fee probe: paper lists its charges, and a dry run on a copy of the journal leaves a $0.00 residual
+open_questions: read docs/HANDOFF.md first. Human steps in Phase 4: the SIP-tape fetch, now due: `uv run trader backtest --start 2026-04-01 --end 2026-10-09 --tape` after 16:30 ET or on a non-trading day (`--force` only while no run-day is running; about 605 requests); H0.2 before G4a; the Phase 1 checks (news, filings, stream --news) and ALPACA_DATA_* keys before G4b. Q2 open (run 2: 14 symbols x trades+quotes = 28, under 30, no 405; a 405 at 16 or more symbols would mean channels count toward the 30), Q4 open until G4a, Q6 partly answered
 eval_epoch: 0
 ```
 
@@ -149,6 +149,24 @@ Specs referenced: ARCHITECTURE.md (A§), STRATEGY.md (S§), RISK.md (R§).
 
 ## Phase 4 — LLM layer and Book B
 
+The plan approved on 2026-10-14 adds three tasks first, all due before G4b: D-054's fixes and the shadow rule the human chose. The plan file is `C:\Users\Admin\.claude\plans\squishy-popping-honey.md`.
+
+- [x] **P4.0a** D-054's fixes, part 1:
+  - the stuck-exit cap times from our own send;
+  - a stale symbol is marked at the broker's price;
+  - `entry_delay_ms` is measured on one clock, and the clock skew is read hourly;
+  - `boot.json` carries a source hash and capabilities;
+  - migration 0005 adds `daily_stats.cash_residual`; each later Phase 4 part brings its own migration (D-055).
+
+  Fees come from Alpaca's FEE activities; the human's read-only `trader fees` probe showed paper lists them (D-058). The EOD cash check counts them as they post: never today's estimates, which post overnight.
+- [x] **P4.0b** D-054's fixes, part 2:
+  - a skip names R-006 or R-007 when it also binds (labels only);
+  - the order-API limiter keeps capacity in reserve for submits, cancels and sells;
+  - busy polling is trimmed.
+- [ ] **P4.0c** Shadow outcomes:
+  - entry at max(trigger, the trigger minute's open), plus slippage;
+  - the ambiguous trigger minutes resolved from the SIP trade tape;
+  - the backtest re-run from its cache, with D-042's numbers and H4 restated.
 - [ ] **P4.1** Write `llm/schemas.py` (A§5), the schema generator to `schemas/*.json` (refs inlined, each file under 8 KB), and tests that the generated schemas validate the fixtures.
 - [ ] **P4.2** Write `llm/sanitize.py`: HTML strip, truncation, injection heuristics → `suspicious`, optional entity anonymization. Write tests with adversarial headlines.
 - [ ] **P4.3** Write `llm/context.py`: the premarket, vet, and review packs (A§8), plus size-cap tests.
@@ -181,7 +199,7 @@ Specs referenced: ARCHITECTURE.md (A§), STRATEGY.md (S§), RISK.md (R§).
 ## Phase 5 — Memory, statistics, lessons, weekly reporting
 
 - [ ] **P5.1** Write `memory/stats.py` (S§7.3): per-book and per-epoch metrics, a seeded bootstrap, veto value V with CI, and SPY buy-and-hold comparison.
-- [ ] **P5.2** Write `memory/lessons.py`: store proposals from the review, the DSL evaluator with a whitelist (unknown fields and ops rejected), and the promotion and demotion rules (S§6.3). Add the `trader lessons evaluate --promote` CLI. Write tests, including DSL injection attempts.
+- [ ] **P5.2** Write `memory/lessons.py`: the DSL evaluator (P4.10 already stores the review's proposals with status `proposed`) with a whitelist (unknown fields and ops rejected), and the promotion and demotion rules (S§6.3). Add the `trader lessons evaluate --promote` CLI. Write tests, including DSL injection attempts.
 - [ ] **P5.3** Write `memory/playbook.py`: render `runtime/playbook.md` (at most 15 lessons with evidence), plus the `matching_lessons` computation for context packs.
 - [ ] **P5.4** Write `reports/weekly.py`: equity curves A vs B vs SPY, trade stats, V with CI, lessons status, the factor tally, the week's `bad_process` reviews, open process issues and notes, incidents, epoch, and the limitations footer (A§4.10).
 - [ ] **P5.5** Write `reports/evaluation.py`: the pre-registered evaluation memo (S§8), with every criterion shown as pass, fail, or insufficient data.

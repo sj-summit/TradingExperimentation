@@ -1,8 +1,8 @@
 """Recording and replaying a day's market data (A§4.2; DECISIONS D-047).
 
 - ``RecordingMarketData`` wraps the REST client: every call the day makes (calendar, clock,
-  assets, bars, snapshots, splits) is written to ``rest.jsonl.gz`` with its arguments, its
-  result (as our parsed models) or error, and its start and end receive times.
+  assets, bars, snapshots, splits, trades) is written to ``rest.jsonl.gz`` with its arguments,
+  its result (as our parsed models) or error, and its start and end receive times.
 - ``ReplayMarketData`` serves those results back. Each call is matched by method and
   arguments, repeated identical calls by occurrence (a surplus call reuses the last answer and
   is counted as a divergence), and it returns after the recorded duration on the injected clock,
@@ -25,7 +25,7 @@ from typing import Any, Literal
 import structlog
 
 from trader.core.clock import Clock, fmt_iso, parse_et_iso
-from trader.core.models import Asset, Bar, Quote, Snapshot, Split, Trade
+from trader.core.models import Asset, Bar, Quote, SipTrade, Snapshot, Split, Trade
 from trader.data.alpaca_rest import (
     Adjustment,
     AlpacaAuthError,
@@ -78,8 +78,8 @@ def _canon(value: Any) -> Any:
 def _encode(method: str, result: Any) -> Any:
     if method == "clock":
         return fmt_iso(result)
-    if method in ("bars",):
-        return {s: [b.model_dump(mode="json") for b in bars] for s, bars in result.items()}
+    if method in ("bars", "trades"):
+        return {s: [b.model_dump(mode="json") for b in rows] for s, rows in result.items()}
     if method == "snapshots":
         return {s: snap.model_dump(mode="json") for s, snap in result.items()}
     if method in ("assets", "splits"):
@@ -94,6 +94,8 @@ def _decode(method: str, data: Any) -> Any:
         return parse_et_iso(data)
     if method == "bars":
         return {s: [Bar.model_validate(b) for b in bars] for s, bars in data.items()}
+    if method == "trades":
+        return {s: [SipTrade.model_validate(t) for t in rows] for s, rows in data.items()}
     if method == "snapshots":
         return {s: Snapshot.model_validate(snap) for s, snap in data.items()}
     if method == "assets":
@@ -158,6 +160,14 @@ class RecordingMarketData:
             ),
         )
 
+    async def trades(
+        self, symbols: Sequence[str], start: datetime, end: datetime, *, feed: Feed
+    ) -> dict[str, list[SipTrade]]:
+        args = {"symbols": list(symbols), "start": start, "end": end, "feed": feed}
+        return await self._call(
+            "trades", args, lambda: self._inner.trades(symbols, start, end, feed=feed)
+        )
+
     async def snapshots(self, symbols: Sequence[str], *, feed: Feed) -> dict[str, Snapshot]:
         return await self._call("snapshots", {"symbols": list(symbols), "feed": feed},
                                 lambda: self._inner.snapshots(symbols, feed=feed))  # fmt: skip
@@ -181,7 +191,7 @@ class RecordingMarketData:
             record |= {
                 "end_rx": fmt_iso(self._clock.now()),
                 "error": {"type": type(exc).__name__, "status": exc.status,
-                          "message": str(exc), "path": exc.path, "code": exc.code},
+                          "message": exc.message, "path": exc.path, "code": exc.code},
             }  # fmt: skip
             self._sink(record)
             raise
@@ -259,6 +269,13 @@ class ReplayMarketData:
         result: dict[str, list[Bar]] = await self._serve("bars", args)
         return result
 
+    async def trades(
+        self, symbols: Sequence[str], start: datetime, end: datetime, *, feed: Feed
+    ) -> dict[str, list[SipTrade]]:
+        args = {"symbols": list(symbols), "start": start, "end": end, "feed": feed}
+        result: dict[str, list[SipTrade]] = await self._serve("trades", args)
+        return result
+
     async def snapshots(self, symbols: Sequence[str], *, feed: Feed) -> dict[str, Snapshot]:
         result: dict[str, Snapshot] = await self._serve(
             "snapshots", {"symbols": list(symbols), "feed": feed}
@@ -294,7 +311,12 @@ class ReplayMarketData:
         if "error" in record:
             err = record["error"]
             kind = _ERRORS.get(err["type"], AlpacaError)
-            raise kind(int(err["status"]), str(err["message"]), str(err["path"]), err.get("code"))
+            status, path = int(err["status"]), str(err["path"])
+            # Recordings before D-057 stored the formatted text: drop the prefix the
+            # constructor adds again, so the replayed error reads as the live one.
+            prefix = f"Alpaca {path}: " + (f"HTTP {status}: " if status else "")
+            message = str(err["message"]).removeprefix(prefix)
+            raise kind(status, message, path, err.get("code"))
         return _decode(method, record["result"]), record
 
 

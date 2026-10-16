@@ -21,7 +21,17 @@ import structlog
 
 from trader.config import AppConfig
 from trader.core.clock import Clock, ensure_et, parse_et_iso
-from trader.core.models import Asset, Bar, Mover, NewsItem, Quote, Snapshot, Split, Trade
+from trader.core.models import (
+    Asset,
+    Bar,
+    Mover,
+    NewsItem,
+    Quote,
+    SipTrade,
+    Snapshot,
+    Split,
+    Trade,
+)
 from trader.data.ratelimit import RateLimiter
 
 log = structlog.get_logger(__name__)
@@ -29,6 +39,7 @@ log = structlog.get_logger(__name__)
 TRADING_PAPER_URL = "https://paper-api.alpaca.markets"
 DATA_URL = "https://data.alpaca.markets"
 MAX_BARS_PER_PAGE = 10_000  # a total across all symbols in the request, not per symbol
+MAX_TRADES_PER_PAGE = 10_000  # the same total, for historical trades (the API's maximum)
 MAX_ACTIONS_PER_PAGE = 1_000
 MAX_NEWS_PER_PAGE = 50
 MAX_BACKOFF_S = 30.0
@@ -124,9 +135,10 @@ class AlpacaHttp:
     ) -> Any:
         limiter = self._limiters[base]
         idempotent = method != "POST"
+        urgent = method != "GET"  # submits, cancels and sells go first (D-056)
         attempt = 0
         while True:
-            await limiter.acquire()
+            await limiter.acquire(urgent=urgent)
             try:
                 response = await self._client.request(
                     method, base + path, params=params, json=body, headers=self._headers
@@ -322,6 +334,40 @@ class AlpacaRest:
 
         return _merge(await self._batched(symbols, fetch))
 
+    async def trades(
+        self,
+        symbols: Sequence[str],
+        start: datetime,
+        end: datetime,
+        *,
+        feed: Feed,
+        asof: str | None = None,
+    ) -> dict[str, list[SipTrade]]:
+        """Historical prints per symbol from ``start`` to ``end`` (both inclusive), oldest
+        first, every page followed: a page may hold fewer than the limit even with more to
+        come. Symbols with no prints are absent. On the free plan the SIP window must end
+        15 minutes or more ago (D-057). ``asof`` as for ``bars``."""
+        params: dict[str, Any] = {
+            "start": rfc3339(start),
+            "end": rfc3339(end),
+            "feed": feed,
+            "limit": MAX_TRADES_PER_PAGE,
+            "sort": "asc",
+        }
+        if asof is not None:
+            params["asof"] = asof
+
+        async def fetch(chunk: list[str]) -> dict[str, list[SipTrade]]:
+            out: dict[str, list[SipTrade]] = defaultdict(list)
+            async for page in self._pages(
+                "/v2/stocks/trades", {**params, "symbols": ",".join(chunk)}
+            ):
+                for symbol, rows in (page.get("trades") or {}).items():
+                    out[symbol].extend(_sip_trade(symbol, row) for row in rows)
+            return dict(out)
+
+        return _merge(await self._batched(symbols, fetch))
+
     async def snapshots(self, symbols: Sequence[str], *, feed: Feed) -> dict[str, Snapshot]:
         """Latest trade, quote and bars per symbol; symbols without data are absent."""
 
@@ -496,6 +542,17 @@ def _trade(symbol: str, raw: Mapping[str, Any]) -> Trade:
         price=raw["p"],
         size=int(raw["s"]),
         conditions=tuple(raw.get("c") or ()),
+    )
+
+
+def _sip_trade(symbol: str, raw: Mapping[str, Any]) -> SipTrade:
+    return SipTrade(
+        symbol=symbol,
+        ts=parse_et_iso(raw["t"]),
+        price=raw["p"],
+        size=int(raw["s"]),
+        conditions=tuple(raw.get("c") or ()),
+        update=raw.get("u") or None,
     )
 
 

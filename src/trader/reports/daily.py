@@ -21,8 +21,9 @@ from trader.strategy.orb_sip import load_signals
 
 LIMITATIONS = (
     "Data: IEX-only real-time data makes triggers lag, and makes relative volume noisier.",
-    "Paper fills: they ignore market impact, queue position, and latency slippage. Regulatory "
-    "fees and dividends aren't simulated either.",
+    "Paper fills: they ignore market impact, queue position, and latency slippage. Dividends "
+    "aren't simulated either. Paper does charge regulatory fees, overnight; the ledger books "
+    "what it charged.",
     "Sample size: small samples mean wide confidence intervals. Two to three months of signals "
     "cannot prove a durable edge.",
     "Backtest vs live: the paper's backtest (2016-2023, with leverage, long and short) is not a "

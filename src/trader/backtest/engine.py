@@ -4,11 +4,12 @@ Each session runs the same code as live, fed by ``BacktestData``'s as-of view:
 
 1. ``UniverseBuilder`` (with inactive assets) decides eligibility from the prior sessions.
 2. The 09:30 opening-range bars and ``select()`` pick the top 20.
-3. ``simulate_long``/``simulate_short`` give every signal its shadow outcome (S§7.2).
+3. ``simulate_long``/``simulate_short`` give every signal its shadow outcome (S§7.2): entered at
+   max(trigger, the trigger minute's open), with an ambiguous trigger minute read from the SIP
+   tape cached by ``--tape`` (else counted as stopped, the pessimistic fallback; D-057).
 4. Book A's long-only leg trades the triggered longs in trigger-minute order (then rank), sized by
    ``size_position`` and judged by the real ``RiskGate`` against an in-memory settlement ledger.
-   It enters at the trigger bar's open when the bar gapped past the trigger, and skips as
-   ``chased`` beyond the chase cap: the shadow entry (trigger + slippage) would be optimistic.
+   It takes each long's shadow outcome as its own, and skips as ``chased`` past the chase cap.
 
 The engine never calls an LLM (D-010).
 """
@@ -21,15 +22,22 @@ from decimal import Decimal
 
 import structlog
 
-from trader.books.reasons import reason_from_violations
+from trader.books.reasons import reason_for_no_size, reason_from_violations
 from trader.config import BookName, FeesConfig, RiskConfig, Settings
 from trader.core.calendar import DayTimes, TradingCalendar, day_times
 from trader.core.ids import client_order_id, is_ticker
 from trader.core.models import Asset, OrderIntent, Signal
 from trader.data.alpaca_rest import Feed
 from trader.data.universe import UniverseBuilder
-from trader.memory.shadow import ShadowOutcome, ShadowParams, simulate_long, simulate_short
-from trader.risk.gate import GateState, RiskGate
+from trader.memory.shadow import (
+    ShadowOutcome,
+    ShadowParams,
+    ambiguous,
+    simulate_long,
+    simulate_short,
+    trigger_minute,
+)
+from trader.risk.gate import GateState, RiskGate, capacity_violations
 from trader.risk.ledger import (
     LedgerEntry,
     available,
@@ -54,6 +62,7 @@ class BacktestSettings:
     end: date
     feed: Feed
     starting_cash: Decimal = Decimal(1000)
+    tape: bool = False  # fetch the SIP tape of ambiguous trigger minutes not yet cached (D-057)
 
 
 @dataclass(frozen=True)
@@ -88,6 +97,7 @@ class SignalResult:
     shadow: ShadowOutcome | None  # None for a doji, which has no prices
     trade: TradeResult | None = None
     skip: str | None = None  # why a triggered long wasn't traded by Book A's leg
+    tape_read: bool = False  # its ambiguous trigger minute's tape was read (cache or fetch)
 
 
 @dataclass(frozen=True)
@@ -157,7 +167,7 @@ class BookLeg:
         settle: date,
         longs: Sequence[tuple[Signal, ShadowOutcome]],
     ) -> tuple[dict[str, TradeResult], dict[str, str]]:
-        """``longs`` are the armed longs with their realistic (bar-open entry) outcomes."""
+        """``longs`` are the armed longs with their shadow outcomes (D-057)."""
         equity = start_of_day_cash(self.ledger, day)
         trades: dict[str, TradeResult] = {}
         skips: dict[str, str] = {}
@@ -197,8 +207,11 @@ class BookLeg:
                 self._risk.max_position_pct,
                 Decimal(1),
             )
-            if size.qty < 1:
-                skips[sig.id] = "insufficient_settled_cash" if size.by_cash < 1 else "qty_zero"
+            if size.qty < 1:  # named as Book A names it (D-056)
+                capacity = capacity_violations(
+                    self._risk, positions=len(positions), entries_today=len(entered)
+                )
+                skips[sig.id] = reason_for_no_size(capacity, by_cash=size.by_cash)
                 continue
             intent = OrderIntent(
                 book=BOOK,
@@ -386,11 +399,22 @@ async def run_backtest(
         minute = await data.minute_bars([s.symbol for s in priced], day)
         shadows: dict[str, ShadowOutcome] = {}
         realistic: list[tuple[Signal, ShadowOutcome]] = []
+        read: set[str] = set()
         for s in priced:
             assert s.trigger_price is not None
             assert s.stop_price is not None
-            sim = simulate_long if s.direction == "long" else simulate_short
+            sign = 1 if s.direction == "long" else -1
             path = minute.get(s.symbol, [])
+            hit = trigger_minute(path, sign=sign, trigger=s.trigger_price, window_start=or_end,
+                                 last_entry=times.last_entry)  # fmt: skip
+            prints = None
+            if hit is not None and ambiguous(
+                hit, sign=sign, trigger=s.trigger_price, stop=s.stop_price
+            ):
+                prints = await data.tape(s.symbol, hit.ts, fetch=cfg.tape)
+                if prints is not None:
+                    read.add(s.id)
+            sim = simulate_long if sign > 0 else simulate_short
             shadows[s.id] = sim(
                 path,
                 trigger=s.trigger_price,
@@ -399,19 +423,10 @@ async def run_backtest(
                 last_entry=times.last_entry,
                 flatten_at=times.flatten,
                 params=params,
+                tape=prints,
             )
-            if s.status == "armed":
-                real = simulate_long(
-                    path,
-                    trigger=s.trigger_price,
-                    stop=s.stop_price,
-                    window_start=or_end,
-                    last_entry=times.last_entry,
-                    flatten_at=times.flatten,
-                    params=params,
-                    entry_mode="bar_open",
-                )
-                realistic.append((s, real))
+            if s.status == "armed":  # Book A's leg: the same outcome, the same resolver
+                realistic.append((s, shadows[s.id]))
         start_equity = start_of_day_cash(book.ledger, day)
         trades, day_skips = book.trade_day(day, times, calendar.settlement_date(day), realistic)
         skips.update(day_skips.values())
@@ -426,6 +441,7 @@ async def run_backtest(
                     shadow=shadows.get(s.id),
                     trade=trades.get(s.id),
                     skip=day_skips.get(s.id),
+                    tape_read=s.id in read,
                 )
                 for s in signals
             ),

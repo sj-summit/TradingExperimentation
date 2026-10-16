@@ -2,7 +2,7 @@
 
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -19,7 +19,7 @@ from trader.backtest.data import BacktestData, LookAheadError
 from trader.backtest.engine import BacktestResult, BacktestSettings, busy_hours, run_backtest
 from trader.cli import app
 from trader.core.clock import ET
-from trader.core.models import Asset, Bar, Split
+from trader.core.models import Asset, Bar, SipTrade, Split
 from trader.data.alpaca_rest import AlpacaError
 from trader.memory.journal import Journal
 
@@ -68,14 +68,18 @@ class History:
         self.minute: dict[tuple[str, date], list[Bar]] = {}
         self.split_list: list[Split] = []
         self.requests: list[str] = []
+        self.tape: dict[tuple[str, datetime], list[SipTrade]] = {}
 
-    def hot(self, symbol: str, day: date, *, minute: int, wins: bool) -> None:
+    def hot(self, symbol: str, day: date, *, minute: int, wins: bool, touch: bool = False) -> None:
         """A bullish opening range at 10x the baseline volume; the trigger prints at
-        09:40 + ``minute``; a winner runs to the flatten, a loser stops out at 09:50."""
+        09:40 + ``minute``; a winner runs to the flatten, a loser stops out at 09:50. With
+        ``touch``, the trigger minute also touches the stop and closes above it: bars can't
+        order the two (D-057)."""
         c = self.stocks[symbol].level
         self.or_bars[(symbol, day)] = bar(at(day, 9, 30), c, c + D("0.40"), c - D("0.10"),
                                           c + D("0.35"), 30_000)  # fmt: skip
-        trig = bar(at(day, 9, 40 + minute), c + D("0.38"), c + D("0.45"), c + D("0.36"),
+        low = c + D("0.20") if touch else c + D("0.36")
+        trig = bar(at(day, 9, 40 + minute), c + D("0.38"), c + D("0.45"), low,
                    c + D("0.44"))  # fmt: skip
         path = [trig]
         if wins:
@@ -113,6 +117,12 @@ class History:
         self.requests.append("splits")
         return [s for s in self.split_list if start <= s.ex_date <= end]
 
+    async def trades(self, symbols: Sequence[str], start: datetime, end: datetime, *,
+                     feed: str, asof: str | None = None) -> dict[str, list[SipTrade]]:  # fmt: skip
+        self.requests.append("trades")
+        assert (feed, asof, end - start) == ("sip", "-", timedelta(minutes=1))
+        return {s: self.tape[(s, start)] for s in symbols if (s, start) in self.tape}
+
 
 @pytest.fixture
 async def cache(tmp_path: Path) -> AsyncIterator[Journal]:
@@ -121,10 +131,13 @@ async def cache(tmp_path: Path) -> AsyncIterator[Journal]:
     await opened.aclose()
 
 
-async def backtest(history: History, cache: Journal, start: date, end: date) -> BacktestResult:
+async def backtest(
+    history: History, cache: Journal, start: date, end: date, *, tape: bool = False
+) -> BacktestResult:
     data = BacktestData(source=history, cache=cache, calendar=CALENDAR)
     return await run_backtest(data, calendar=CALENDAR, settings=SETTINGS, risk=RISK,
-                              cfg=BacktestSettings(start=start, end=end, feed="iex"))  # fmt: skip
+                              cfg=BacktestSettings(start=start, end=end, feed="iex",
+                                                   tape=tape))  # fmt: skip
 
 
 def day_of(result: BacktestResult, d: date) -> dict[str, tuple[bool, str | None]]:
@@ -195,6 +208,57 @@ async def test_placeholders_and_refused_symbols_never_stop_the_fetch(cache: Jour
     assert (h.refusals, h.requests.count("1Day")) == (1, 1)  # refused with BOGUS, then served
 
 
+async def test_a_size_skip_is_named_by_a_capacity_rule_that_also_binds(cache: Journal) -> None:
+    """D-056 (D-054 #5): named as Book A names it, so the reason doesn't depend on the price.
+    At 09:42 two positions are open and about $38 is left: PRCY at $50.50 gets no shares."""
+    h = History([*stocks(), Stock("PRCY", D("50.50"))])
+    tue = date(2026, 10, 6)
+    h.hot("GOOD", tue, minute=0, wins=True)
+    h.hot("BAD", tue, minute=1, wins=False)
+    h.hot("PRCY", tue, minute=2, wins=True)
+    result = await backtest(h, cache, FIRST_DAY, date(2026, 10, 9))
+    assert day_of(result, tue)["PRCY"] == (False, "capacity_positions")
+
+
+async def test_an_ambiguous_trigger_minute_is_read_from_the_tape_once(cache: Journal) -> None:
+    """D-057: GOOD's trigger minute touched its stop and closed above it. Its tape says the
+    stop came first, so it holds to the flatten, for the shadow and Book A's leg alike."""
+    h = History(stocks())
+    tue = date(2026, 10, 6)
+    h.hot("GOOD", tue, minute=0, wins=True, touch=True)
+    h.hot("BAD", tue, minute=1, wins=False)  # triggers too, but its bar settles its minute
+    c = h.stocks["GOOD"].level
+    minute = at(tue, 9, 40)
+    h.tape[("GOOD", minute)] = [
+        SipTrade(symbol="GOOD", ts=minute + timedelta(seconds=s), price=c + D(p), size=100)
+        for s, p in ((5, "0.20"), (20, "0.42"), (50, "0.44"))  # the stop's touch, then the entry
+    ]
+
+    def good(result: BacktestResult) -> tuple[str | None, str | None, str | None]:
+        day = next(x for x in result.days if x.day == tue)
+        r = next(x for x in day.signals if x.signal.symbol == "GOOD")
+        assert r.shadow is not None
+        assert r.trade is not None
+        return r.shadow.exit_reason, r.shadow.trigger_resolution, r.trade.exit_reason
+
+    assert good(await backtest(h, cache, FIRST_DAY, date(2026, 10, 9))) == (
+        "stop",
+        "fallback",
+        "stop",
+    )  # no tape cached and none fetched: the pessimistic rule
+    assert h.requests.count("trades") == 0
+    fetched = await backtest(h, cache, FIRST_DAY, date(2026, 10, 9), tape=True)
+    assert good(fetched) == ("flatten", "tape", "flatten")
+    assert h.requests.count("trades") == 1  # only the ambiguous minute's tape
+    day = next(x for x in fetched.days if x.day == tue)
+    bad = next(x for x in day.signals if x.signal.symbol == "BAD")
+    assert bad.shadow is not None
+    assert (bad.shadow.trigger_resolution, bad.tape_read) == ("bars", False)
+    cached = await backtest(h, cache, FIRST_DAY, date(2026, 10, 9))
+    assert good(cached) == ("flatten", "tape", "flatten")
+    assert h.requests.count("trades") == 1  # read from bt_tape
+
+
 async def test_settled_cash_waits_out_the_columbus_day_gap(cache: Journal) -> None:
     h = History([*stocks(), Stock("PRCY", D("50.50")), Stock("PRCZ", D("50.50"))])
     fri, mon, tue = date(2026, 10, 9), date(2026, 10, 12), date(2026, 10, 13)
@@ -253,6 +317,34 @@ async def test_a_cached_rerun_makes_no_requests(cache: Journal) -> None:
     assert [len(d.trades) for d in again.days] == [len(d.trades) for d in first.days]
 
 
+async def test_a_rerun_never_reads_a_baseline_restated_for_a_later_split(cache: Journal) -> None:
+    """Review BT-1 (D-057): a day after a split rewrites the symbol's OR baseline in the new
+    share basis. A rerun must not read those rows on the days before the split: that would
+    divide raw volume by a baseline restated with the future (D-042's look-ahead guard)."""
+    h = History([Stock("SPLT", D("40.00")), *stocks()])
+    split_day = date(2026, 10, 7)
+    for i, b in enumerate(h.daily["SPLT"]):  # trades at half the price from the split on
+        if b.ts.date() >= split_day:
+            h.daily["SPLT"][i] = bar(b.ts, D(20), D("20.5"), D("19.5"), D(20), 4_000_000)
+    for (symbol, day), b in list(h.or_bars.items()):
+        if symbol == "SPLT" and day >= split_day:
+            h.or_bars[(symbol, day)] = bar(b.ts, D(20), D("20.05"), D("19.95"), D(20),
+                                           b.volume * 2)  # fmt: skip
+    h.split_list.append(Split(symbol="SPLT", ex_date=split_day, process_date=None,
+                              old_rate=D(1), new_rate=D(2), reverse=False))  # fmt: skip
+    h.hot("SPLT", date(2026, 10, 6), minute=0, wins=True)
+
+    def splt(result: BacktestResult) -> list[tuple[date, float]]:
+        return [(d.day, r.signal.rel_vol) for d in result.days for r in d.signals
+                if r.signal.symbol == "SPLT"]  # fmt: skip
+
+    first = await backtest(h, cache, FIRST_DAY, date(2026, 10, 9))
+    again = await backtest(h, cache, FIRST_DAY, date(2026, 10, 9))
+    assert splt(first)
+    assert splt(again) == splt(first)
+    assert again.requests == 0
+
+
 async def test_the_report(cache: Journal, tmp_path: Path) -> None:
     h = History(stocks())
     h.hot("GOOD", date(2026, 10, 6), minute=0, wins=True)
@@ -304,7 +396,15 @@ def test_cli_refuses_market_hours_and_unfinished_days(
 ) -> None:
     clock = JumpClock(at(date(2026, 10, 13), 10, 0))
     monkeypatch.setattr(runtime, "RealClock", lambda: clock)
-    monkeypatch.setattr(runtime.AlpacaRest, "from_config", lambda _c, _k: Rest(stocks()))
+    rest = Rest(stocks())
+    tue = date(2026, 10, 6)
+    rest.hot("GOOD", tue, minute=0, wins=True, touch=True)  # an ambiguous trigger minute
+    c = rest.stocks["GOOD"].level
+    rest.tape[("GOOD", at(tue, 9, 40))] = [
+        SipTrade(symbol="GOOD", ts=at(tue, 9, 40) + timedelta(seconds=n), price=c + D(p), size=100)
+        for n, p in ((5, "0.20"), (20, "0.42"))
+    ]
+    monkeypatch.setattr(runtime.AlpacaRest, "from_config", lambda _c, _k: rest)
 
     def run(*args: str) -> tuple[int, str]:
         result = CliRunner().invoke(app, ["--root", str(repo), "backtest", *args])
@@ -319,4 +419,11 @@ def test_cli_refuses_market_hours_and_unfinished_days(
     code, out = run("--start", "2026-10-05", "--end", "2026-10-09", "--force")
     assert code == 0, out
     assert "5/5 2026-10-09" in out
-    assert (repo / "runtime" / "reports" / "backtest-2026-10-05-2026-10-09-iex.md").exists()
+    report = repo / "runtime" / "reports" / "backtest-2026-10-05-2026-10-09-iex.md"
+    assert report.exists()
+    assert rest.requests.count("trades") == 0
+    assert "1 with no tape (`--tape` fetches them)" in report.read_text(encoding="utf-8")
+    code, out = run("--start", "2026-10-05", "--end", "2026-10-09", "--force", "--tape")
+    assert code == 0, out
+    assert rest.requests.count("trades") == 1  # --tape reached the engine
+    assert "1 ambiguous ones read from the SIP tape" in report.read_text(encoding="utf-8")

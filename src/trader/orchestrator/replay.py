@@ -49,8 +49,9 @@ from trader.memory.journal import Journal
 from trader.memory.regime import RegimeTags, store_regime
 from trader.notify import NullNotifier
 from trader.orchestrator.day import Cadence, DayDeps, DayOrchestrator, DayPaths
+from trader.orchestrator.provenance import source_sha256
 from trader.orchestrator.simdrive import drive
-from trader.risk.ledger import LedgerEntry, insert_entries
+from trader.risk.ledger import SEED_REF, LedgerEntry, insert_entries
 
 CONFIG_FILES = {
     "settings": "config/settings.yaml",
@@ -141,6 +142,9 @@ async def replay_day(
                 backups_dir=out / "backups",
             ),
             cadence=cadence or Cadence(),
+            # Only what the recorded engine did: an older day replays without calls it never
+            # made (D-055).
+            capabilities=frozenset(boot.get("capabilities", ())),
         )
         outcome = await drive(clock, DayOrchestrator(deps).run(), watched=[journal])
         divergences = list(market.divergences) + [
@@ -215,6 +219,11 @@ async def seed(
         for name, book in sorted(boot["books"].items()):
             entries = [LedgerEntry.model_validate(e) for e in book["ledger"]]
             insert_entries(conn, entries, parse_et_iso(at))
+            if book.get("seeded_at"):  # fee booking skips what the seed paid (D-055)
+                conn.execute(
+                    "UPDATE ledger_entries SET created_at = ? WHERE book = ? AND ref = ?",
+                    (book["seeded_at"], name, SEED_REF),
+                )
             conn.executemany(
                 "INSERT INTO halts (book, reason, scope, detail, created_at, expires_at) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
@@ -307,6 +316,9 @@ def _notes(folder: Path, boot: Mapping[str, Any], root: Path | None) -> list[str
         ]
         if changed:
             notes.append(f"config changed since the recording: {', '.join(changed)}")
+        recorded = boot.get("source_sha256")
+        if recorded and source_sha256(root) not in (None, recorded):
+            notes.append("the code changed since the recording")
     return notes
 
 

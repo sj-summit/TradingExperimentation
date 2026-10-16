@@ -473,3 +473,27 @@ async def test_a_market_sell_accepted_after_the_close_waits_for_the_open(
     await clock.advance(timedelta(seconds=5))  # accepted after it
     assert (await sim.get_order(sold.id)).status == "accepted"  # queued, not filled
     assert (await sim.positions())[0].qty == 16
+
+
+async def test_a_charged_fee_takes_cash_and_lists_as_an_activity(clock: SimClock) -> None:
+    sim = SimBroker(clock=clock, cash=D("1000"))
+    fee = sim.charge_fee(D("0.02"), symbol="F")
+    assert (await sim.account()).cash == D("999.98")
+    assert (fee.date, fee.net_amount, fee.status, fee.symbol) == (
+        T0.date(),
+        D("-0.02"),
+        "executed",
+        "F",
+    )
+    assert await sim.fee_activities(T0 - timedelta(days=1)) == [fee]
+    assert await sim.fee_activities(T0) == []  # created at T0, not after it
+
+
+async def test_acceptance_rewrites_submitted_at_as_paper_does(
+    sim: SimBroker, clock: SimClock
+) -> None:
+    sim.accept_delay = timedelta(seconds=12)
+    placed = await sim.submit_entry_oto(intent())
+    assert placed.submitted_at == T0
+    await clock.advance(timedelta(seconds=12))
+    assert (await sim.get_order(placed.id)).submitted_at == T0 + timedelta(seconds=12)

@@ -26,7 +26,7 @@ Five principles follow from that question:
 | Session | Regular hours only (09:30–16:00 ET; early-close days use the calendar's close). No extended hours. |
 | Broker | Alpaca; two paper accounts with $1,000 each (A and B). |
 | Real-time data | Alpaca free plan: **IEX feed** (single venue), at most 30 streamed symbols. Configurable to `sip` if upgraded. |
-| Historical data | Alpaca SIP bars older than 15 minutes (free) for daily features and shadow outcomes. Rolling opening-range baselines use the **same feed as live** (IEX by default) so relative volume compares like with like. |
+| Historical data | Alpaca SIP bars older than 15 minutes (free) for daily features and shadow outcomes, and the SIP trade tape for the trigger minutes bars can't order (§7.2). Rolling opening-range baselines use the **same feed as live** (IEX by default) so relative volume compares like with like. |
 | News | Alpaca news (Benzinga) WebSocket and REST; SEC EDGAR filings. |
 | Time zone | America/New_York everywhere. |
 
@@ -111,7 +111,7 @@ qty = floor( min( risk_budget / risk_per_share,
                   S_available / limit ) )
 ```
 
-- If `qty < 1`, skip with reason `qty_zero`.
+- If `qty < 1`, skip. The reason is `capacity_positions` or `capacity_entries` if R-006 or R-007 also binds, else `insufficient_settled_cash` if the settled cash can't buy one share, else `qty_zero` (DECISIONS D-044, D-056).
 - `day_size_multiplier` is 1.0 for Book A, and 1.0 or 0.5 for Book B depending on `day_mode` (§5.2).
 - **Capacity:** at most 2 concurrent positions and 2 entries per day per book. Total buys per day are also capped by settled cash, so with 50% sizing the second entry uses the rest of the settled cash.
 - **Tie-breaks** when several signals trigger in the same second: higher `rel_vol` rank first.
@@ -129,7 +129,7 @@ With a $1,000 book, typical numbers are a risk budget of $10, a notional cap of 
 | Exit at 16:00 | Flatten at close − 5 min | Reliable exit before the closing auction |
 | Entries all day | No new entries after close − 30 min | Little time left; risk control |
 | Relative volume on consolidated volume | IEX-to-IEX on the free plan | Data cost. Recheck if upgraded to SIP |
-| Commission $0.0035/share | Commission-free; estimated SEC/FINRA fees journaled | Alpaca pricing |
+| Commission $0.0035/share | Commission-free; SEC/FINRA fees estimated per sale, then replaced by the fees Alpaca charged, a CAT fee among them (D-055, D-058) | Alpaca pricing |
 
 ---
 
@@ -347,15 +347,20 @@ A pattern that keeps showing up in the tally and carries `knowable_at_decision: 
 | **Trade** | An actual paper fill in a book, with entry, exit, P&L, and R from fills. |
 | **R** | `(exit − entry) / (entry − stop)` per share. |
 
-### 7.2 Shadow outcome simulation (16:12, SIP 1-minute bars)
+### 7.2 Shadow outcome simulation (16:12, SIP 1-minute bars; the SIP trade tape for ambiguous trigger minutes)
 
 1. **Trigger minute:** the first SIP 1-minute bar from 09:35 up to `last_entry` whose high ≥ `trigger_price`. A signal the live (IEX) feed never triggered can still get a shadow outcome; flag it `sip_only_trigger`.
-2. **Entry:** `trigger_price + slippage`, where slippage = $0.01 + 0.02% of price (configurable).
+2. **Entry:** `max(trigger_price, the trigger minute's open) + slippage`, where slippage = $0.01 + 0.02% of the trigger price (configurable). A minute that opened past the trigger filled at its open (DECISIONS D-057).
 3. **Walk the minute bars from the trigger minute:**
-   - If a bar's low ≤ stop, exit at min(bar open, stop) − $0.01. In the trigger minute itself, assume the worst: a low at or below the stop counts as stopped.
-   - Otherwise exit at the open of the `flatten_time` minute.
-4. **Record** `shadow_r`, `exit_reason`, and `path_source = sip_1min`, plus path stats for the review (§6.5): `mfe_r` (best excursion in R before exit), `mae_r` (worst excursion), and `minutes_held`. Path stats are outcomes, so they are never DSL fields.
-5. **Shadow-only shorts** mirror these rules: trigger at `or_low − $0.01` (a bar's low ≤ trigger), stop at trigger + 0.10 × ATR14, the same slippage and worst-case conventions, and R with signs reversed.
+   - **In the trigger minute,** a stop touch exits at stop − $0.01: the bar's open came before the entry (D-041).
+     - **The ambiguous case:** the minute opened below the trigger, touched the stop and closed above it. Bars can't tell whether the stop came before the entry or after it.
+     - **Resolving it from the SIP trade tape** (D-057): the first print at or above the trigger orders the minute (the entry price stays step 2's, even if that print lies well above the trigger). The trade is stopped only if a later print is at or below the stop, exiting at min(stop, that print) − $0.01. MFE and MAE then count only the prints the trade held in that minute.
+     - **Which prints count:** canceled and incorrect prints don't, and neither do prints whose conditions don't set a bar's price.
+     - **With no usable tape,** assume the worst: the touch counts as a stop (`trigger_resolution = fallback`, and a P3 when a tape was asked for).
+   - **From the next bar on,** if a bar's low ≤ stop, exit at min(bar open, stop) − $0.01.
+   - **Otherwise** exit at the open of the `flatten_time` minute.
+4. **Record** `shadow_r`, `exit_reason`, `path_source = sip_1min` and `trigger_resolution` (`bars`, `tape` or `fallback`), plus path stats for the review (§6.5): `mfe_r` (best excursion in R before exit), `mae_r` (worst excursion), and `minutes_held`. Path stats are outcomes, so they are never DSL fields.
+5. **Shadow-only shorts** mirror these rules: trigger at `or_low − $0.01` (a bar's low ≤ trigger), entry at min(trigger, open) − slippage, stop at trigger + 0.10 × ATR14, the same tape and worst-case conventions, and R with signs reversed.
 
 ### 7.3 Metrics (per book, per epoch, rolling)
 
@@ -411,7 +416,7 @@ A pattern that keeps showing up in the tally and carries `knowable_at_decision: 
 ## 10. Known limitations (say these out loud in every report footer)
 
 - **Data:** IEX-only real-time data makes triggers lag, and makes relative volume noisier.
-- **Paper fills:** they ignore market impact, queue position, and latency slippage. Regulatory fees and dividends aren't simulated either.
+- **Paper fills:** they ignore market impact, queue position, and latency slippage. Dividends aren't simulated either. Paper does charge regulatory fees, overnight; the ledger books what it charged (D-055).
 - **Sample size:** small samples mean wide confidence intervals. Two to three months of signals cannot prove a durable edge.
 - **Backtest vs live:** the paper's backtest (2016–2023, with leverage, long and short) is not a forecast. Day-trading edges decay, and most retail day traders lose money.
 - **LLM drift:** model updates behind an alias (`opus`, `sonnet`) can change behavior mid-epoch. Log the resolved model ID when available.

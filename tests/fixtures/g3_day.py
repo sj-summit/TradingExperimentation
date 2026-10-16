@@ -41,6 +41,14 @@ QUOTE_EVERY_S = 10.0
 COPIED = ("boot.json", "universe.parquet", "rest.jsonl.gz", "broker-A.jsonl.gz")
 CONFIG_FILES = {"settings": "settings.yaml", "risk": "risk.yaml", "events": "events.yaml"}
 
+# Where today's engine knowingly differs from the live session, as ``replay.diff`` lines, each
+# with the DECISIONS entry that made the change. ``journal.json`` stays the live truth.
+CODE_CHANGES = [
+    # D-056 (D-054 #5): STT's size skip is named by R-007, which also bound, not by its price.
+    "decision recorded but not replayed: 20261014-STT-orb5 A 0 insufficient_settled_cash",
+    "decision replayed but not recorded: 20261014-STT-orb5 A 0 capacity_entries",
+]
+
 
 def settings() -> Settings:
     return Settings.model_validate(load_yaml(CONFIG / "settings.yaml"))

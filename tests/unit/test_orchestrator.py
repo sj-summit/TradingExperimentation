@@ -1,6 +1,7 @@
 """Whole days through the real orchestrator on a SimClock (P3.5; DECISIONS D-048)."""
 
 import json
+import sqlite3
 from collections.abc import AsyncIterator, Iterable, Sequence
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
@@ -16,11 +17,13 @@ from trader.core.clock import ET, SimClock
 from trader.data.replay import ReplayHub
 from trader.data.stream import Channel
 from trader.data.ws import StreamError
-from trader.execution.broker import BrokerUnavailable, Order, OrderRejected
+from trader.execution.broker import BrokerUnavailable, FeeActivity, Order, OrderRejected
 from trader.execution.service import ExecutionService, FlattenResult
 from trader.execution.sim_broker import SimBroker
+from trader.memory.shadow import ShadowRun
+from trader.orchestrator.capabilities import CURRENT, SHADOW_TAPE, SKEW_HOURLY
 from trader.orchestrator.eod import BookClose, EodContext
-from trader.risk.ledger import LedgerError, SettlementLedger
+from trader.risk.ledger import LedgerEntry, LedgerError, SettlementLedger, insert_entries
 from trader.strategy.triggers import TriggerEngine
 
 STATES = ["BOOT", "PREMARKET", "OR_SCAN", "TRADING", "FLATTEN", "EOD", "REVIEW", "REPORT", "DONE"]
@@ -52,7 +55,7 @@ async def test_a_normal_day(normal: DayRun) -> None:
         "LOSE": "taken",
         "CHASE": "missed_at_arm",
         "GAPPER": "chased",
-        "CAP": "insufficient_settled_cash",
+        "CAP": "capacity_entries",  # cash and R-007 both bind; capacity names it (D-056)
     }
     assert await normal.trades() == {
         "WIN": (24, "20.43", "21.98", "eod_flatten"),
@@ -79,6 +82,7 @@ async def test_a_normal_day(normal: DayRun) -> None:
         "reconcile:A",
         "decisions:A",
         "trades:A",
+        "fees:A",
         "stats:A",
         "breakers:A",
         "shadow",
@@ -88,7 +92,7 @@ async def test_a_normal_day(normal: DayRun) -> None:
     assert (root / "reports" / "2026-10-13.md").exists()
     assert (root / "backups" / "trader-2026-10-13.db").exists()
     beat = json.loads((root / "runtime" / "heartbeat.json").read_text(encoding="utf-8"))
-    assert (beat["state"], beat["books"]["A"]["halted"]) == ("REPORT", False)
+    assert (beat["state"], beat["books"]["A"]["halted"]) == ("DONE", False)
     boot = json.loads((root / "recordings" / "2026-10-13" / "boot.json").read_text("utf-8"))
     assert boot["books"]["A"]["broker_cash"] == "1000"
     assert boot["books"]["A"]["ledger"][0]["ref"] == "seed"
@@ -185,7 +189,7 @@ async def test_a_crash_mid_day_is_picked_up_without_a_p1(tmp_path: Path) -> None
     }
     decisions = await run.decisions()
     assert decisions["GAPPER"] == "missed_at_arm"  # it ran past its cap while we were down
-    assert decisions["CAP"] == "insufficient_settled_cash"
+    assert decisions["CAP"] == "capacity_entries"
     assert await run.incidents() == []
     assert (await run.states()).count("BOOT") == 2
     await run.close()
@@ -264,7 +268,7 @@ async def test_a_first_boot_refuses_an_account_that_is_not_flat(tmp_path: Path) 
 
 async def test_a_skewed_clock_arms_nothing(tmp_path: Path) -> None:
     run = await DayRun(tmp_path, standard_day(), skew=timedelta(seconds=5)).open()
-    await run.run()
+    await run.run(run.deps(capabilities=CURRENT - {SKEW_HOURLY}))  # boot's checks only
     # Boot reads it three times (D-051), and so does the 09:29 re-check: still 5 s off.
     assert await run.incidents() == [("P2", "clock_skew"), ("P2", "clock_skew")]
     messages = [r["message"] for r in await run.rows("SELECT message FROM incidents")]
@@ -287,11 +291,129 @@ async def test_one_slow_clock_answer_is_read_again_not_taken_as_skew(tmp_path: P
         return await answer()
 
     run.market.clock = slow_once  # type: ignore[method-assign]
-    await run.run()
+    await run.run(run.deps(capabilities=CURRENT - {SKEW_HOURLY}))  # boot's reading only
     assert len(calls) == 2  # read again; the quick answer counts
     assert await run.incidents() == []
     assert (await run.trades())["WIN"][3] == "eod_flatten"
     await run.close()
+
+
+async def test_the_clock_is_read_every_hour_and_a_new_skew_is_a_p2_once(tmp_path: Path) -> None:
+    """D-055: boot's check alone decides arming, but the PC drifts or is stepped later on."""
+    run = await DayRun(tmp_path, standard_day()).open()
+    run.at("12:00:00", lambda: setattr(run.market, "_skew", timedelta(seconds=3)))
+    await run.run()
+    readings = await run.rows("SELECT at, detail FROM day_runs WHERE kind = 'clock'")
+    assert [(r["at"][11:16], r["detail"]) for r in readings][:3] == [
+        ("10:20", "+0.000"),
+        ("11:20", "+0.000"),
+        ("12:20", "+3.000"),
+    ]
+    assert await run.incidents() == [("P2", "clock_skew")]  # once, though every later one is off
+    assert (await run.trades())["WIN"][3] == "eod_flatten"  # it only alerts
+    await run.close()
+
+
+async def test_a_failed_hourly_clock_reading_is_only_logged(tmp_path: Path) -> None:
+    run = await DayRun(tmp_path, standard_day()).open()
+    run.at("10:00:00", lambda: run.market.fail.__setitem__("clock", TimeoutError("test")))
+    await run.run()
+    readings = await run.rows("SELECT at FROM day_runs WHERE kind = 'clock'")
+    assert [r["at"][11:16] for r in readings][:2] == ["11:20", "12:20"]  # 10:20's failed
+    assert await run.incidents() == []
+    await run.close()
+
+
+# ---------------------------------------------------------------- fees (D-055)
+
+
+async def test_boot_books_the_overnight_charge_before_e(tmp_path: Path) -> None:
+    """Yesterday's sale was estimated at 0.01; the broker charged 0.02 overnight. Boot books
+    the charge and retires the estimate before E is set, so E is the broker's cash."""
+    run = await DayRun(tmp_path, standard_day(), cash=D("1100")).open()
+    prev, seeded = run.calendar.previous_session(DAY), date(2026, 10, 9)
+    rows = [
+        LedgerEntry(book="A", kind="deposit", amount=D(1000), trade_date=seeded,
+                    settle_date=seeded, ref="seed"),
+        LedgerEntry(book="A", kind="sell", symbol="OLD", amount=D(100), trade_date=prev,
+                    settle_date=DAY, ref="fill:old:1"),
+        LedgerEntry(book="A", kind="fee", symbol="OLD", amount=D("-0.01"), trade_date=prev,
+                    settle_date=DAY, ref="fee-est:old:1"),
+    ]  # fmt: skip
+    created = datetime.combine(seeded, time(9), ET)
+    await run.journal.write(lambda conn: insert_entries(conn, rows, created))
+    run.sims["A"].charge_fee(D("0.02"), day=prev)
+    await run.run()
+    boot = json.loads((tmp_path / "recordings" / "2026-10-13" / "boot.json").read_text("utf-8"))
+    assert boot["books"]["A"]["equity_sod"] == "1099.98"  # the broker's cash at boot
+    booked = await run.rows(
+        "SELECT ref, created_at FROM ledger_entries WHERE ref LIKE 'fee:%' "
+        "OR ref LIKE 'fee-est-reversal:%' ORDER BY id"
+    )
+    assert [(r["ref"], r["created_at"][11:16]) for r in booked] == [
+        ("fee:fee-1", "09:20"),
+        (f"fee-est-reversal:{prev}:{DAY}", "09:20"),
+    ]
+    stats = await run.rows("SELECT start_equity, cash_residual FROM daily_stats")
+    assert [(s["start_equity"], s["cash_residual"]) for s in stats] == [("1099.98", "0.00")]
+    assert await run.incidents() == []
+    await run.close()
+
+
+async def test_a_failed_backup_after_done_is_only_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The backup runs after DONE (D-055); SQLite refusing it must not turn the day into a
+    traceback (review)."""
+    run = await DayRun(tmp_path, standard_day()).open()
+
+    async def refused(target: Path) -> None:
+        raise sqlite3.OperationalError("attempt to write a readonly database (test)")
+
+    monkeypatch.setattr(run.journal, "backup", refused)
+    outcome = await run.run()
+    assert outcome is not None
+    assert outcome.state == "DONE"
+    assert await run.incidents() == []
+    await run.close()
+
+
+async def test_a_fee_read_that_fails_is_a_p3_and_the_day_goes_on(tmp_path: Path) -> None:
+    run = await DayRun(tmp_path, standard_day()).open()
+
+    async def down(after: datetime) -> list[FeeActivity]:
+        raise BrokerUnavailable("account activities: HTTP 503 (test)")
+
+    run.sims["A"].fee_activities = down  # type: ignore[method-assign]
+    outcome = await run.run()
+    assert outcome is not None
+    assert outcome.state == "DONE"
+    assert await run.incidents() == [("P3", "fees_unavailable"), ("P3", "fees_unavailable")]
+    assert (await run.trades())["WIN"][3] == "eod_flatten"
+    await run.close()
+
+
+async def test_an_unresolved_trigger_minute_is_a_p3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-057: the day asks the shadow job to read ambiguous minutes from the tape, and says
+    when one fell back to the pessimistic rule; a replay of an older day asks for no tape."""
+    asked: list[bool] = []
+
+    async def shadow(**kw: Any) -> ShadowRun:
+        asked.append(kw["tape"])
+        return ShadowRun(ok=True, outcomes={}, tape_unresolved=("CAP: HTTP 500 (test)",))
+
+    monkeypatch.setattr(day_module, "compute_shadow", shadow)
+    run = await DayRun(tmp_path, standard_day()).open()
+    await run.run()
+    assert asked == [True]
+    assert ("P3", "shadow_tape_unresolved") in await run.incidents()
+    await run.close()
+    older = await DayRun(tmp_path / "older", standard_day()).open()
+    await older.run(older.deps(capabilities=CURRENT - {SHADOW_TAPE}))
+    assert asked == [True, False]
+    await older.close()
 
 
 async def test_a_clock_unverified_at_boot_is_checked_again_before_the_scan(

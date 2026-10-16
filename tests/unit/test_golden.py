@@ -6,7 +6,7 @@ import sqlite3
 import subprocess
 import sys
 from contextlib import closing
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -15,7 +15,8 @@ import pytest
 from typer.testing import CliRunner
 
 from tests.fixtures import g3_day
-from tests.fixtures.days import DAY
+from tests.fixtures.dayrun import DayRun
+from tests.fixtures.days import DAY, standard_day
 from tests.fixtures.exec_harness import RISK, SETTINGS
 from tests.fixtures.golden import GOLDEN, dumps, golden_run, golden_snapshot, snapshot
 from tests.helpers import REPO
@@ -25,8 +26,10 @@ from trader.core.models import OrderIntent
 from trader.execution.broker import OrderNotCancelable, OrderRejected
 from trader.execution.replay import ReplayBroker
 from trader.execution.sim_broker import SimBroker
+from trader.orchestrator.capabilities import CURRENT
 from trader.orchestrator.replay import comparable, diff, replay_day
 from trader.orchestrator.simdrive import drive
+from trader.risk.ledger import LedgerEntry, insert_entries
 
 D = Decimal
 
@@ -72,6 +75,79 @@ async def test_a_recorded_day_replays_the_same(tmp_path: Path) -> None:
     assert (report.divergences, report.differences) == ([], [])
     assert report.lines()[-1] == "the replay matches the recorded day"
     assert (tmp_path / "replay" / "reports" / "2026-10-13.md").exists()
+    # The replay ran what the recording did: the fees step and every hourly clock reading
+    # (D-055). Without the capabilities, it would skip them and still "match" above.
+    boot = json.loads((tmp_path / "recordings" / "2026-10-13" / "boot.json").read_text("utf-8"))
+    assert boot["capabilities"] == sorted(CURRENT)
+
+    def day_runs(db: Path) -> list[tuple[str, str, str]]:
+        with closing(sqlite3.connect(db)) as conn:
+            return conn.execute("SELECT kind, name, at FROM day_runs ORDER BY id").fetchall()
+
+    recorded = day_runs(tmp_path / "trader.db")
+    assert ("step", "fees:A") in {(k, n) for k, n, _ in recorded}
+    assert [r for r in recorded if r[0] == "clock"] != []
+    assert day_runs(tmp_path / "replay" / "trader.db") == recorded
+
+    def shadows(db: Path) -> list[tuple[Any, ...]]:
+        with closing(sqlite3.connect(db)) as conn:
+            return conn.execute("SELECT * FROM shadow_outcomes ORDER BY signal_id").fetchall()
+
+    # The tape reads replay too: CAP's and GAPPER's ambiguous minutes come from them (D-057).
+    live_shadows = shadows(tmp_path / "trader.db")
+    assert [r for r in live_shadows if r[-1] == "tape"] != []
+    assert shadows(tmp_path / "replay" / "trader.db") == live_shadows
+
+
+async def test_a_recorded_day_that_books_fees_replays_the_same(tmp_path: Path) -> None:
+    """D-055: boot books a charge from the last session, two weeks back, and EOD one posted
+    during the day. The replay rebuilds the ledger from boot.json, where that estimate is
+    already retired, so its boot read asks a different ``after``; reads still match the
+    recording by time, and the seed time comes back from boot.json."""
+    run = await DayRun(tmp_path, standard_day(), cash=D("1100"), recording=True).open()
+    seeded, sold = date(2026, 9, 1), date(2026, 9, 28)  # the last session two weeks back
+    rows = [
+        LedgerEntry(book="A", kind="deposit", amount=D(1000), trade_date=seeded,
+                    settle_date=seeded, ref="seed"),
+        LedgerEntry(book="A", kind="sell", symbol="OLD", amount=D(100), trade_date=sold,
+                    settle_date=date(2026, 9, 29), ref="fill:old:1"),
+        LedgerEntry(book="A", kind="fee", symbol="OLD", amount=D("-0.01"), trade_date=sold,
+                    settle_date=date(2026, 9, 29), ref="fee-est:old:1"),
+    ]  # fmt: skip
+    created = datetime.combine(seeded, time(9), ET)
+    await run.journal.write(lambda conn: insert_entries(conn, rows, created))
+    sim = run.sims["A"]
+    sim.charge_fee(D("0.02"), day=sold, posted=datetime.combine(sold, time(20, 30), ET))
+    run.at("12:00:00", lambda: sim.charge_fee(D("0.01"), sub_type="TAF"))
+    await run.run()
+    await run.close()
+    report = await replay_day(
+        recordings=tmp_path / "recordings",
+        day=DAY,
+        out=tmp_path / "replay",
+        settings=SETTINGS,
+        risk=RISK,
+        recorded_db=tmp_path / "trader.db",
+    )
+    assert (report.state, report.divergences, report.differences) == ("DONE", [], [])
+    boot = json.loads((tmp_path / "recordings" / "2026-10-13" / "boot.json").read_text("utf-8"))
+    assert boot["books"]["A"]["seeded_at"] == "2026-09-01T09:00:00-04:00"
+
+    def table(db: Path, sql: str) -> list[tuple[Any, ...]]:
+        with closing(sqlite3.connect(db)) as conn:
+            return [tuple(r) for r in conn.execute(sql).fetchall()]
+
+    ledger = "SELECT kind, symbol, amount, trade_date, settle_date, ref FROM ledger_entries"
+    for sql in (f"{ledger} ORDER BY ref", "SELECT * FROM daily_stats"):
+        assert table(tmp_path / "replay" / "trader.db", sql) == table(tmp_path / "trader.db", sql)
+    # Each charge booked when it was live: one at boot, one at EOD. Keyed by ``after``, the
+    # boot read found EOD's answer instead and booked the midday charge before E.
+    booked = "SELECT ref, created_at FROM ledger_entries WHERE ref LIKE 'fee:%' ORDER BY ref"
+    assert table(tmp_path / "trader.db", booked) == [
+        ("fee:fee-1", "2026-10-13T09:20:00-04:00"),
+        ("fee:fee-2", "2026-10-13T16:05:00-04:00"),
+    ]
+    assert table(tmp_path / "replay" / "trader.db", booked) == table(tmp_path / "trader.db", booked)
 
 
 async def test_replay_reports_what_it_could_not_reproduce(tmp_path: Path) -> None:
@@ -110,8 +186,9 @@ def test_trader_replay_compares_with_the_journal(repo: Path) -> None:
 @pytest.mark.timeout(300)  # a whole real day: about 30 s
 async def test_the_g3_day_replays_as_it_was_recorded(tmp_path: Path) -> None:
     """G3 run 2 (2026-10-14; D-054): Alpaca paper's real answers, replayed through the current
-    engine, give the journal the live session wrote, and the engine asks nothing the recording
-    lacks. The replay's own journal is pinned too; ``UPDATE_GOLDEN=1`` rewrites it."""
+    engine, give the journal the live session wrote, apart from the changes ``CODE_CHANGES``
+    lists, and the engine asks nothing the recording lacks. The replay's own journal is pinned
+    too; ``UPDATE_GOLDEN=1`` rewrites it."""
     report = await replay_day(
         recordings=g3_day.RECORDINGS,
         day=g3_day.G3_DAY,
@@ -124,7 +201,7 @@ async def test_the_g3_day_replays_as_it_was_recorded(tmp_path: Path) -> None:
     assert report.divergences == []
     with closing(sqlite3.connect(tmp_path / "replay" / "trader.db")) as conn:
         conn.row_factory = sqlite3.Row
-        assert diff(g3_day.recorded(), comparable(conn, g3_day.G3_DAY)) == []
+        assert diff(g3_day.recorded(), comparable(conn, g3_day.G3_DAY)) == g3_day.CODE_CHANGES
         got = dumps(snapshot(conn))
     if os.environ.get("UPDATE_GOLDEN") == "1":
         g3_day.GOLDEN.write_text(got + "\n", encoding="utf-8")

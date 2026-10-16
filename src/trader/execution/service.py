@@ -12,7 +12,7 @@ import asyncio
 import contextlib
 import json
 import sqlite3
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -299,7 +299,9 @@ async def _held_positions(broker: BrokerAdapter) -> list[Position]:
 # ---------------------------------------------------------------- the book's executor
 
 PARTIAL_FILL_GRACE_S = 1.0  # a partly filled entry gets this long to finish (D-032)
-ENTRY_POLL_S = 1.0  # open entries are polled over REST, whatever the stream says
+ENTRY_POLL_S = 1.0  # the loop's tick while busy; entries waiting or cancelling are read each time
+ENTRY_STEADY_POLL_S = 2.0  # a working entry is read at least this often (D-056)
+ENTRY_REFRESH_S = 2.0  # positions and open orders, while only entries are open (D-056)
 ACCEPT_WAIT_MAX_S = 30.0  # an entry the broker hasn't accepted by then is cancelled (D-053)
 CANCEL_RESEND_S = 2.0  # a cancel the order outlives is sent again at most this often (D-053)
 ENTRY_STUCK_S = 60.0  # still open this long after its first cancel: a P2 (D-053)
@@ -383,6 +385,8 @@ class _Entry:
     seen_waiting: bool = False  # this process saw it before the broker accepted it
     live_at: datetime | None = None  # accepted at the venue: the entry timeout counts from here
     give_up_at: datetime | None = None  # an uncertain entry is called lost after this
+    last: Order | None = None  # the latest snapshot, from the stream or a read (D-056)
+    read_at: datetime | None = None  # when ``get_order`` last answered for it
 
     @property
     def open(self) -> bool:
@@ -431,6 +435,7 @@ class ExecutionService:
         self._entries: dict[str, _Entry] = {}
         self._view: _View | None = None
         self._bare: dict[str, datetime] = {}  # symbol -> when its unprotected time started
+        self._cover_ends: dict[str, datetime] = {}  # symbol -> when its exits stop covering
         self._covered_once: set[str] = set()
         self._stop_pending: set[str] = set()
         # R-020's allowance (D-053): symbol -> None while its entry's cancel is pending, then
@@ -559,7 +564,7 @@ class ExecutionService:
             return EntryResult("broker_rejected", check, reason=str(exc))
         await self._adopt(entry, order)
         if self._closing:  # a halt began while this submit was in flight
-            await self._send_cancel(entry, order, self._clock.now())
+            await self._send_cancel(entry, order, self._clock.now(), "closing")
         return EntryResult("submitted", check, order)
 
     async def _uncertain(self, entry: _Entry, check: RiskCheck) -> EntryResult:
@@ -571,12 +576,14 @@ class ExecutionService:
     def _give_up_time(self, submitted_at: datetime) -> datetime:
         return submitted_at + timedelta(seconds=self._risk.entry_timeout_s + RECONCILE_S)
 
-    async def _adopt(self, entry: _Entry, order: Order) -> None:
+    async def _adopt(self, entry: _Entry, order: Order) -> list[BookedFill]:
+        """Fold a read of one of our entries in, booking its new fills; returns them."""
         booked = await self._records.apply(order, signal_id=entry.signal_id or None)
         if order.filled_qty and entry.first_fill_at is None and not booked:
             # Fills booked earlier (e.g. before a restart): the clock starts at the first one.
             entry.first_fill_at = await self._records.first_fill_at(order.id)
         self._note(order, booked)
+        return booked
 
     def _note(self, order: Order, booked: list[BookedFill]) -> None:
         """Fold a broker snapshot of one of our entries into its tracking. A stale snapshot
@@ -584,7 +591,7 @@ class ExecutionService:
         entry = self._entries.get(order.client_order_id)
         if entry is None or (is_final(entry.status) and not order.final):
             return
-        entry.status, entry.order_id = order.status, order.id
+        entry.status, entry.order_id, entry.last = order.status, order.id, order
         if order.status in WAITING_STATUSES:
             entry.seen_waiting = True
         elif entry.live_at is None and order.status in LIVE_STATUSES:
@@ -636,8 +643,7 @@ class ExecutionService:
             stop = await self._records.planned_stop(symbol)
             if stop is not None:
                 open_risk += qty * max(average - stop, Decimal(0))
-            last = self._prices.last_price(symbol)
-            marked += qty * (last if last is not None else average)
+            marked += qty * self._mark(symbol, average)
         used = intent is not None and await self._records.order(intent.client_order_id) is not None
         return Exposure(
             symbols=frozenset(symbols),
@@ -647,11 +653,22 @@ class ExecutionService:
             equity_sod=self.equity_sod,
             realized_pnl_today=day.realized,
             open_risk=open_risk,
-            ledger_equity=cash(ledger, include_fee_estimates=False) + marked,
+            ledger_equity=cash(ledger, unposted_from=today) + marked,
             unprotected=frozenset(self._bare),
             client_order_id_used=used,
             open_order_for_signal=intent is not None and intent.signal_id in open_signals,
         )
+
+    def _mark(self, symbol: str, cost: Decimal) -> Decimal:
+        """A held symbol's price: the hub's last trade, else the broker's mark when that is
+        stale (D-047), else cost (D-055)."""
+        last = self._prices.last_price(symbol)
+        if last is not None:
+            return last
+        position = self._view.positions.get(symbol) if self._view is not None else None
+        if position is not None and position.current_price is not None:
+            return position.current_price
+        return cost
 
     @property
     def accepting(self) -> bool:
@@ -675,7 +692,7 @@ class ExecutionService:
             return False
         entry = self._entries.get(client_order_id)
         if entry is not None:
-            await self._send_cancel(entry, order, self._clock.now())
+            await self._send_cancel(entry, order, self._clock.now(), "requested")
         else:
             await _cancel_quietly(self._broker, order)
         self._last_refresh = None
@@ -714,7 +731,16 @@ class ExecutionService:
                 self._last_refresh = None
             if result.flat:
                 self._bare.clear()
+                self._cover_ends.clear()
                 self._cancel_wait.clear()
+            log.info(
+                "flatten pass",
+                book=self.book,
+                purpose=purpose,
+                flat=result.flat,
+                remaining=result.remaining,
+                market_closed=result.market_closed,
+            )
             return result
 
     # ---------------------------------------------------------------- the loops
@@ -744,24 +770,28 @@ class ExecutionService:
         """Protection must outlive any single failure: every error is logged and the loop
         goes on, so a bad payload can't silently end it."""
         while True:
+            started = self._clock.now()
             try:
                 await self._tick()
             except BrokerError as exc:
                 log.warning("execution tick failed", book=self.book, error=str(exc))
             except Exception:
                 log.exception("execution tick crashed", book=self.book)
-            await self._sleep(self._next_wake())
+            await self._sleep(self._next_wake(started))
 
     def _busy(self) -> bool:
         return bool(self._bare or self._stop_pending or any(e.open for e in self._entries.values()))
 
-    def _next_wake(self) -> datetime:
+    def _next_wake(self, started: datetime) -> datetime:
+        """The next tick: the routine one, or sooner a deadline the last tick (begun at
+        ``started``) didn't see pass. One that passed while it ran comes due at once (D-055)."""
         now = self._clock.now()
         wake = now + timedelta(seconds=ENTRY_POLL_S if self._busy() else PROTECTION_REFRESH_S)
         deadlines = [self._deadline(symbol, since) for symbol, since in self._bare.items()]
+        deadlines += self._cover_ends.values()  # R-020's time runs from a lapse (D-055)
         if self._confirm_at is not None:
             deadlines.append(self._confirm_at)
-        return min([wake, *(d for d in deadlines if d > now)])
+        return min([wake, *(d for d in deadlines if d > started)])
 
     async def _sleep(self, until: datetime) -> None:
         """Until the clock reaches ``until``, or something wakes the loop sooner."""
@@ -811,11 +841,16 @@ class ExecutionService:
                 continue
             if entry.order_id is None:
                 continue
-            order = await self._broker.get_order(entry.order_id)
-            await self._adopt(entry, order)
+            order = self._recent(entry, now)
+            if order is None:
+                order = await self._broker.get_order(entry.order_id)
+                entry.read_at = now
+                if await self._adopt(entry, order):
+                    self._last_refresh = None  # new shares: read the positions this tick
             if order.final:
                 self._finished.add(entry.client_order_id)
                 del self._entries[entry.client_order_id]
+                self._last_refresh = None  # its shares, if any, need a stop now (D-056)
                 continue
             if entry.cancel_requested:
                 await self._follow_cancel(entry, order, now)
@@ -825,8 +860,35 @@ class ExecutionService:
                 and entry.first_fill_at is not None
                 and now >= entry.first_fill_at + timedelta(seconds=PARTIAL_FILL_GRACE_S)
             )
-            if self._unfilled_too_long(entry, order, now) or partial_done_waiting or self._closing:
-                await self._send_cancel(entry, order, now)
+            if self._unfilled_too_long(entry, order, now):
+                await self._send_cancel(entry, order, now, "timeout")
+            elif partial_done_waiting:
+                await self._send_cancel(entry, order, now, "partial fill")
+            elif self._closing:
+                await self._send_cancel(entry, order, now, "closing")
+
+    def _recent(self, entry: _Entry, now: datetime) -> Order | None:
+        """The entry's latest snapshot (the stream's, or the last read's), standing in for a
+        read while it is an unfilled working order read under ``ENTRY_STEADY_POLL_S`` ago: the
+        stream reports its fills (D-056). It is read every tick otherwise:
+        - before its first read, so a replay asks for no order the recording lacks;
+        - while it waits for acceptance, whose time starts the entry timeout (D-053);
+        - after a cancel: Alpaca never streams ``pending_cancel``;
+        - where a cancel can come due on time (a partial fill's grace, the last
+          ``ENTRY_STEADY_POLL_S`` before the timeout, a closing book), so the decision rests
+          on a fresh read that a replay finds in the recording."""
+        last, read = entry.last, entry.read_at
+        if last is None or read is None or entry.cancel_requested or self._closing:
+            return None
+        if last.status in WAITING_STATUSES or last.filled_qty > 0:
+            return None
+        steady = timedelta(seconds=ENTRY_STEADY_POLL_S)
+        if now - read >= steady:
+            return None
+        timeout = timedelta(seconds=self._risk.entry_timeout_s)
+        if entry.live_at is not None and now >= entry.live_at + timeout - steady:
+            return None
+        return last
 
     def _unfilled_too_long(self, entry: _Entry, order: Order, now: datetime) -> bool:
         """S§3.3's entry timeout, counted from the broker's acceptance; an order the broker
@@ -844,12 +906,22 @@ class ExecutionService:
         )
         return True
 
-    async def _send_cancel(self, entry: _Entry, order: Order, now: datetime) -> None:
-        """Every cancel of one of our entries goes through here (D-053)."""
+    async def _send_cancel(self, entry: _Entry, order: Order, now: datetime, why: str) -> None:
+        """Every cancel of one of our entries goes through here (D-053); the first is logged
+        with its reason (D-055)."""
         await _cancel_quietly(self._broker, order)
         entry.cancel_requested, entry.cancel_sent_at = True, now
         if entry.first_cancel_at is None:
             entry.first_cancel_at = now
+            since = entry.live_at or entry.submitted_at
+            log.info(
+                "entry cancel sent",
+                client_order_id=entry.client_order_id,
+                why=why,
+                status=order.status,
+                filled=order.filled_qty,
+                after_s=round((now - since).total_seconds(), 1),
+            )
         self._last_refresh = None
 
     async def _follow_cancel(self, entry: _Entry, order: Order, now: datetime) -> None:
@@ -866,7 +938,7 @@ class ExecutionService:
                 client_order_id=entry.client_order_id,
                 status=order.status,
             )
-            await self._send_cancel(entry, order, now)
+            await self._send_cancel(entry, order, now, "again")
         first = entry.first_cancel_at
         if (
             not entry.stuck_reported
@@ -911,16 +983,39 @@ class ExecutionService:
     # ---------------------------------------------------------------- protection (D-032)
 
     def _refresh_due(self, now: datetime) -> bool:
+        """Positions and open orders: every tick while shares are bare or a stop is pending
+        (R-020), every ``ENTRY_REFRESH_S`` while only entries are open, else every
+        ``PROTECTION_REFRESH_S``. Any order event asks for one at once (D-056)."""
         if self._last_refresh is None:
             return True
-        every = ENTRY_POLL_S if self._busy() else PROTECTION_REFRESH_S
+        if self._bare or self._stop_pending:
+            every = ENTRY_POLL_S
+        elif any(e.open for e in self._entries.values()):
+            every = ENTRY_REFRESH_S
+        else:
+            every = PROTECTION_REFRESH_S
         return now - self._last_refresh >= timedelta(seconds=every)
 
     async def _refresh_view(self) -> None:
-        positions = {p.symbol: p for p in await self._broker.positions() if p.qty != 0}
-        open_orders = await self._broker.open_orders()  # read after the positions
+        # Stamped before the reads: an order event during them asks for another view, and
+        # that ask must survive this one (D-056).
+        stamp, self._last_refresh = self._last_refresh, self._clock.now()
+        try:
+            positions = {p.symbol: p for p in await self._broker.positions() if p.qty != 0}
+            open_orders = await self._broker.open_orders()  # read after the positions
+        except BaseException:
+            if self._last_refresh is not None:
+                self._last_refresh = stamp  # due again, unless an event asked meanwhile
+            raise
+        before = self._view.positions if self._view is not None else {}
+        for symbol in sorted(positions.keys() - before.keys()):
+            log.info("position opened", book=self.book, symbol=symbol, qty=positions[symbol].qty)
+        for symbol in sorted(before.keys() - positions.keys()):
+            log.info("position closed", book=self.book, symbol=symbol)
         self._view = _View(positions=positions, open_orders=open_orders)
-        self._last_refresh = self._clock.now()
+        for symbol in list(self._cover_ends):
+            if symbol not in positions:
+                del self._cover_ends[symbol]
         for symbol in list(self._bare):
             if symbol not in positions:
                 del self._bare[symbol]
@@ -931,17 +1026,30 @@ class ExecutionService:
         symbol, qty = position.symbol, position.qty
         if qty <= 0:
             return  # never ours: reconciliation reports it
+        exits = [o for o in view.open_orders if o.symbol == symbol and exit_at_work(o)]
+        sent = await self._sent_times(exits)
         covered = sum(
             order.qty - order.filled_qty
             for order in view.open_orders
             if order.symbol == symbol
-            and (self._stop_works(order, view) or self._exit_covers(order, now))
+            and (self._stop_works(order, view) or self._exit_covers(order, sent, now))
         )
+        ends = [end for o in exits if (end := self._cover_end(o, sent)) is not None and end > now]
+        if ends:
+            self._cover_ends[symbol] = min(ends)  # the loop wakes when the first one lapses
+        else:
+            self._cover_ends.pop(symbol, None)
         if covered >= qty:
-            if self._bare.pop(symbol, None) is not None and symbol in self._partial:
+            bare_since = self._bare.pop(symbol, None)
+            if bare_since is not None and symbol in self._partial:
                 self._partial.discard(symbol)
+                exit_covers = any(o.symbol == symbol and exit_at_work(o) for o in view.open_orders)
+                how = "covered by an exit at work" if exit_covers else "now under a stop"
+                bare_s = (now - bare_since).total_seconds()
                 await self._incident(
-                    "P3", "partial_fill_protected", f"{symbol}: partial fill now under a stop"
+                    "P3",
+                    "partial_fill_protected",
+                    f"{symbol}: bare {bare_s:.1f} s after a partial fill; {qty} shares {how}",
                 )
             self._covered_once.add(symbol)
             self._stop_pending.discard(symbol)
@@ -969,13 +1077,28 @@ class ExecutionService:
                 f"{self._window_note(symbol)}",
             )
 
-    def _exit_covers(self, order: Order, now: datetime) -> bool:
+    def _exit_covers(self, order: Order, sent: Mapping[str, datetime], now: datetime) -> bool:
         """A market sell on its way out covers its shares, for ``partial_fill_cancel_max_s``
-        after it was sent: a stuck exit leaves them bare again, and R-020 acts (D-053)."""
+        after we sent it: a stuck exit leaves them bare again, and R-020 acts (D-053)."""
         if not exit_at_work(order):
             return False
-        sent = order.submitted_at
-        return sent is None or now < sent + timedelta(seconds=self._risk.partial_fill_cancel_max_s)
+        end = self._cover_end(order, sent)
+        return end is None or now < end
+
+    def _cover_end(self, order: Order, sent: Mapping[str, datetime]) -> datetime | None:
+        """When an exit at work stops covering; None when no send time is known at all."""
+        at = sent.get(order.client_order_id) or order.submitted_at
+        return None if at is None else at + timedelta(seconds=self._risk.partial_fill_cancel_max_s)
+
+    async def _sent_times(self, exits: Iterable[Order]) -> dict[str, datetime]:
+        """When we sent these exits: the journal's time, which Alpaca's rewrite of
+        ``submitted_at`` at acceptance never reaches (D-055)."""
+        sent: dict[str, datetime] = {}
+        for order in exits:
+            row = await self._records.order(order.client_order_id)
+            if row is not None and row.submitted_at is not None:
+                sent[order.client_order_id] = row.submitted_at
+        return sent
 
     def _watch_cancel(self, symbol: str, buys: list[Order], now: datetime) -> None:
         """R-020's allowance for partly filled shares (D-053): while every open buy on the
@@ -1047,7 +1170,7 @@ class ExecutionService:
             first = entry.first_fill_at if entry is not None else None
             if first is None or now >= first + grace:
                 if entry is not None:
-                    await self._send_cancel(entry, order, now)
+                    await self._send_cancel(entry, order, now, "partial fill")
                 else:
                     await _cancel_quietly(self._broker, order)
                 self._last_refresh = None

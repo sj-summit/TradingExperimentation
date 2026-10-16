@@ -69,3 +69,59 @@ def test_nonsense_settings_are_rejected() -> None:
         RateLimiter(0)
     with pytest.raises(ValueError, match="capacity"):
         RateLimiter(60, capacity=0)
+
+
+async def test_an_urgent_caller_goes_ahead_of_waiting_polls() -> None:
+    """D-056: an order submit, cancel or sell never queues behind routine reads."""
+    t = FakeTime()
+    gate = limiter(t, 60, capacity=1)
+    await gate.acquire()  # the bucket is empty
+    order: list[str] = []
+
+    async def take(name: str, *, urgent: bool = False) -> None:
+        await gate.acquire(urgent=urgent)
+        order.append(name)
+
+    polls = [asyncio.create_task(take(f"poll {i}")) for i in range(2)]
+    await asyncio.sleep(0)  # the polls are waiting
+    await take("cancel", urgent=True)
+    await asyncio.gather(*polls)
+    assert order == ["cancel", "poll 0", "poll 1"]  # polls keep their own order
+
+
+async def test_a_poll_leaves_the_next_token_to_an_urgent_caller_waiting_for_it() -> None:
+    """With no reserve (or once it is spent), a poll arriving while an urgent caller waits for
+    the next token lets it go first (review RL-1)."""
+    t = FakeTime()
+    gate = limiter(t, 60, capacity=1)
+    await gate.acquire()  # the bucket is empty
+    order: list[str] = []
+
+    async def take(name: str, *, urgent: bool = False) -> None:
+        await gate.acquire(urgent=urgent)
+        order.append(name)
+
+    cancel = asyncio.create_task(take("cancel", urgent=True))
+    await asyncio.sleep(0)  # the cancel waits for the next token
+    await take("poll")
+    await cancel
+    assert order == ["cancel", "poll"]
+
+
+async def test_polls_leave_the_reserve_to_urgent_callers() -> None:
+    t = FakeTime()
+    gate = RateLimiter(60, capacity=10, reserve=4, monotonic=t.monotonic, sleep=t.sleep)
+    for _ in range(6):
+        await gate.acquire()
+    for _ in range(4):
+        await gate.acquire(urgent=True)  # the reserve, at once
+    assert t.now == 0
+    await gate.acquire()  # a poll waits for the reserve to refill, then for its own token
+    assert t.now == pytest.approx(5.0)
+
+
+def test_a_reserve_must_leave_room_for_polls() -> None:
+    with pytest.raises(ValueError, match="reserve"):
+        RateLimiter(60, capacity=4, reserve=4)
+    with pytest.raises(ValueError, match="reserve"):
+        RateLimiter(60, reserve=-1)

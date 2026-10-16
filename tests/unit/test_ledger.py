@@ -151,20 +151,23 @@ def test_start_of_day_cash_is_everything_traded_before_today() -> None:
 # ---------------------------------------------------------------- EOD cash check
 
 
-def test_paper_eod_check_ignores_fee_estimates_paper_never_charges() -> None:
-    day = date(2026, 10, 7)
-    entries = [deposit(date(2026, 10, 6)), *buy(day, 50, "10.00"), *sell(day, 50, "9.80")]
-    broker_cash = D(1000) - D(500) + D(490)
-    paper = eod_check(entries, broker_cash, mode="paper", tolerance=D("1.00"))
-    assert (paper.ok, paper.ledger_cash, paper.difference) == (True, D("990.00"), D(0))
-    live = eod_check(entries, broker_cash, mode="live", tolerance=D("1.00"))
-    assert (live.ledger_cash, live.difference) == (D("989.98"), D("0.02"))
-    assert cash(entries) == D("989.98")
+def test_the_eod_check_leaves_out_only_todays_fee_estimates() -> None:
+    """The broker charges a day's fees after its close (D-055), so at EOD today's are not in
+    its cash yet; earlier days' are, as estimates until the actual fees are booked."""
+    yesterday, day = date(2026, 10, 6), date(2026, 10, 7)
+    entries = [deposit(date(2026, 10, 5)), *buy(yesterday, 50, "10.00")]
+    entries += [*sell(yesterday, 50, "10.40"), *buy(day, 50, "10.00"), *sell(day, 50, "9.80")]
+    # Yesterday's $520 sale was estimated at 0.03, today's $490 at 0.02 (SEC + TAF, rounded up).
+    broker_cash = D(1000) - D(500) + D(520) - D("0.03") - D(500) + D(490)
+    check = eod_check(entries, broker_cash, day=day, tolerance=D("1.00"))
+    assert (check.ok, check.ledger_cash, check.difference) == (True, D("1009.97"), D(0))
+    assert cash(entries) == D("1009.95")
+    assert cash(entries, unposted_from=day) == D("1009.97")
 
 
 def test_a_gap_over_the_tolerance_fails() -> None:
     entries = [deposit(date(2026, 10, 6))]
-    check = eod_check(entries, D("998.99"), mode="paper", tolerance=D("1.00"))
+    check = eod_check(entries, D("998.99"), day=date(2026, 10, 7), tolerance=D("1.00"))
     assert not check.ok
     assert check.difference == D("-1.01")
 

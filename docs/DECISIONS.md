@@ -1266,7 +1266,338 @@ Append-only. Each entry records context, the decision, its consequences, and sou
   - A plan for the shadow-entry rule together with the trigger-minute decision; it restates D-042's shadow numbers and H4.
   - Both land before G4b, because Book B's veto value and the review are judged on shadow outcomes. Neither blocks Phase 4's coding.
 
+## D-055 — P4.0a: fees booked from Alpaca's FEE activities; D-054's fixes #2, #3, #4 and #7
+- **Date:** 2026-10-15 · **Status:** Accepted. The human approved the Phase 4 plan on 2026-10-14 and chose to book Alpaca's actual fees.
+- **Fees (amends D-034; D-019's "paper accounts don't charge them" is out of date, D-052 and D-054):**
+  - **The broker port** gains `fee_activities(after)`: `GET /v2/account/activities/FEE`, oldest first, 100 per page, paged by the last row's id, at most 50 pages.
+    - Each row keeps `id`, `date`, `activity_sub_type` (REG, TAF, CAT), `net_amount` (negative for a charge), `status` (`executed`, `correct`, `canceled`), `symbol` and `created_at` (when it posted).
+    - `after` goes in whole seconds, the form Alpaca documents ("YYYY-MM-DD and YYYY-MM-DDTHH:MM:SSZ").
+    - A row the adapter can't read is a `BrokerDataError`, and a 404 a `BrokerUnavailable`, so the callers' P3 path takes both.
+    - Checked against Alpaca's docs on 2026-10-14. The docs don't say:
+      - whether paper lists these activities;
+      - what the statuses mean;
+      - whether `after` filters by posting time or by date.
+    - They say fee activities are created "typically the day after the trade date (in UTC)", and that `date` is when the activity occurred or settled. So a charge may be dated its trade day, the next day or its settlement day.
+  - **Booking** (`SettlementLedger.book_posted_fees`) runs at boot, before E is computed, and in EOD's new `fees:<book>` step, before the stats. One transaction reads the ledger and writes:
+    - each charge not booked yet: kind `fee`, ref `fee:<id>`;
+    - a booked charge the broker has since canceled: `fee-void:<id>`, which undoes it;
+    - for a trade date whose charge has posted: one `fee-est-reversal:<trade>:<settle>` row per trade and settle date, retiring its estimates.
+  - **What a booking reads.** The read starts at midnight of a day, so it works whichever way Alpaca filters `after`. That day is the day before the oldest trade date whose estimates are still open, or 10 days back, whichever is earlier, and never earlier than the day before the seed's day.
+    - **Weeks between sessions** therefore miss nothing, and a charge up to 10 days late is still booked.
+    - **Charges the seed already paid** are dropped on our side: those that posted at or before the seed, or, with no posting time, those dated before the seed's day.
+    - `boot.json` records each book's seed time, so a replay drops the same ones.
+  - **Which estimates retire.** A trade date's estimates retire once a charge that posted after that day's close is booked.
+    - Alpaca charges a day's fees after its close, whatever date it gives them, so this holds under every dating.
+    - A day that sold but has no charge of its own counts as charged nothing.
+    - Today's estimates always stay.
+    - With no posting time, only a charge dated a later day retires a date. The estimate then stays a day longer, on the safe side.
+  - **Dating.**
+    - A charge's row is dated the earlier of its activity date and the day it posted: the cash left then.
+    - Charges and voids count toward E from the start of that day, like deposits, since they post outside the session.
+    - Reversals are `fee` rows dated like the estimates they retire, so they net out in every ledger rule.
+    - Today's realized P&L counts only today's estimates.
+    - So E, settled cash and P&L come out right under every dating.
+  - **Intraday, the per-fill estimates stay,** so settled cash stays conservative until the broker's charge replaces them.
+  - **The EOD cash check is the same for paper and live.**
+    - Ledger cash counts everything except today's estimates, which the broker charges after the close (`cash(entries, unposted_from=day)`). Earlier days count as their charged fees once booked, and as estimates until then.
+    - The residual (broker − ledger) is stored in `daily_stats.cash_residual` (migration 0005).
+    - Past half the tolerance it is a P3 `cash_drift`. Past the tolerance it is the `cash_mismatch` halt, as before.
+    - `daily_stats.start_equity` is now the ledger's start of day after the fees step, so a charge booked at EOD for an earlier day stays out of today's `pnl`. Boot's E is still what the day traded with.
+  - **If paper lists no FEE activities,** nothing is booked and the estimates stand in for the charges.
+    - The residual then records the difference: about −$0.01 per sale day at 10-13's rate, a P3 after roughly 20–50 such days.
+    - That is the plan's fallback, and it needs no code.
+  - **Assumptions to check:**
+    - **Status `correct`** is booked as one more charge. That is right if Alpaca cancels the original and books the correction, and double-counts if the correction silently replaces it.
+    - **Live:** Alpaca's regulatory-fees page says live accounts accrue pending fees intraday. If live `cash` reflects them, today's estimates would need counting in live's check. Recheck in Phase 7.
+  - **`trader fees --book A|B|all --days N`** lists the activities and the account's cash. It is read-only, but it opens the journal, so it applies migration 0005.
+- **D-054's fixes:**
+  - **#2 Stuck exit.**
+    - An exit at work counts as cover for 20 s from our own send, as the journal stamps it, not from Alpaca's `submitted_at`, which paper rewrites at acceptance. The broker's time is used only for an order the journal doesn't have.
+    - SimBroker now rewrites `submitted_at` at acceptance, as paper does.
+    - **The loop wakes when an exit's cover ends,** so R-020's 5 s run from the lapse. A deadline that passes during a slow tick comes due at once.
+      - Before, the loop slept 5 s from its last wake. An off-grid wake (another order's update), or a tick straddling the lapse, could push the P1 to send + 30 s.
+      - That predates P4.0a; the review found it.
+  - **#3 Stale marks.**
+    - `exposure()` marks a symbol whose IEX price is stale at the broker's `current_price` from the last positions read, and at cost only when neither exists.
+    - Ledger equity now leaves out only today's fee estimates, not all of them. R-019's band therefore compares it more closely with broker equity, and nothing is loosened.
+    - The standard golden day's `max_intraday_dd` falls from 15.70 to 3.86 from the marks alone. G3's is unchanged.
+  - **#4 Entry delay.**
+    - `trades.entry_delay_ms` is when we booked the first fill (its ledger row's `created_at`) minus `triggered_at`, both on our clock. G3's golden: BWA 892 → 703 ms and FAST 1175 → 985 ms.
+    - It is NULL when the booking came more than 5 s after the broker's fill time, i.e. a fill caught up after a restart or an outage. Otherwise it would measure the outage.
+    - **The skew is read every hour** after boot's reading, and journaled in `day_runs` (kind `clock`, name `skew`).
+      - Past 2 s it is a P2 `clock_skew`, once per episode.
+      - It only alerts: boot's check alone decides whether entries are armed. A failed reading is only logged.
+  - **#7 Provenance.**
+    - `boot.json` gains `source_sha256`: a hash of `src/trader` (`.py`, `.sql`), `prompts/*.md` and `schemas/*.json`, in POSIX path order, with CRLF read as LF. An uncommitted tree now has a name.
+    - Replay notes "the code changed since the recording" when it differs.
+- **Capabilities** (`orchestrator/capabilities.py`).
+  - A live run grants `fees_v1` and `skew_hourly`, and `boot.json` lists them. A replay grants only what its recording lists, so a day recorded before a capability existed makes none of its calls.
+  - G3's golden replays with no fee call and no hourly reading, still with zero divergences.
+    - Its `cash_residual` is −0.02. That replay books no fees, so the $0.01 estimates of 10-12 and 10-13 stand in for their $0.02 charges.
+  - Replay matches fee reads by time alone, like account reads. Their `after` comes from the ledger, and a replay starts from `boot.json`'s ledger, where boot's booking is already done.
+- **Smaller items (D-054's notes):**
+  - **Log lines:** `fees booked`, `clock checked`, `entry cancel sent` (with why), `position opened`, `position closed` and `flatten pass`.
+  - **The P3 `partial_fill_protected`** now says how long the shares were bare and what covered them, e.g. "FAST: bare 1.0 s after a partial fill; 10 shares now under a stop".
+  - **The backup** is taken after DONE is journaled, and still on every failure path. It is best effort: a SQLite error there is logged, not raised.
+- **Deviations from the approved plan:**
+  - **One migration per part.** 0005 holds only `cash_residual`. Applied migrations never change (D-040), so a single 0005 would freeze Phase 4's other columns before their code exists. Later parts add 0006 onward.
+  - **`cash_drift`, not `fee_drift`:** the residual isn't only fees.
+  - **Capabilities** instead of a replay rule that ignores a surplus clock call.
+  - **The reversal is a `fee` row per trade and settle date,** not an `adjust` per date. An `adjust` would count toward E from its own day; a `fee` row dated like its estimates nets them out exactly.
+- **Statements of current behavior this updates:**
+  - **D-019:** paper does charge fees.
+  - **D-034:** the paper EOD check.
+  - **D-035 and R-019:** ledger equity.
+  - **D-044:** `entry_delay_ms`.
+  - **D-047:** `boot.json`'s contents.
+  - **D-048:**
+    - BOOT books fees before E and starts the hourly reading;
+    - the EOD steps;
+    - the backup comes after DONE.
+  - **D-049:** replay grants the recorded capabilities, notes a changed source, and matches fee reads by time.
+  - **D-053 item 6:** `accept_delay` now rewrites `submitted_at`.
+  - **D-054's notes:**
+    - `max_intraday_dd` now leaves out only today's estimates;
+    - the backup order;
+    - the log lines;
+    - the P3's detail.
+- **Review.** Four reviewers (money, the broker port, execution, the orchestrator) each had a verifier who tried to refute every finding, then a completeness critic.
+  - **Major, 2, both fixed:**
+    1. **The fixed 10-day window lost charges** after weeks between sessions, and a later charge then retired their estimates, overstating cash.
+    2. **Fee reads were keyed by an `after` taken from the clock,** so every replay of a live day that booked fees would diverge. Three reviewers found this.
+  - **Minor, all fixed:**
+    - next-day dating put a charge in the wrong day's E and realized P&L;
+    - a first seed booked charges its cash had already paid;
+    - an unreadable FEE row or a 404 aborted BOOT or EOD;
+    - microseconds in `after` (an undocumented form; unconfirmed);
+    - an exit's lapse could be seen up to 5 s late (pre-existing);
+    - a restart put the outage into `entry_delay_ms`;
+    - a backup error after DONE escaped `run()`;
+    - a charge booked at EOD landed in today's `pnl`;
+    - PLAN's migration wording.
+  - **Refuted:** one finding, on the source hash's path order. It was hardened anyway.
+  - **Test gaps, all filled:** the boot booking, the `fees_unavailable` P3s, the capabilities round trip, and the replay's note.
+  - **A second pass tried to break each fix.** All held, and it found three more, now fixed:
+    - **The seed cutoff at the seed's time of day** could drop the seed day's own charges if Alpaca filters `after` by date. Book A's 10-12 sale came a minute after its seed. Hence the read from a midnight, with the seed applied on our side.
+    - **"The latest charged date"** could retire an estimate before its charge under next-day dating. Hence the posting-time rule.
+    - **A lapse during a slow tick was still lost.**
+- **Tests:**
+  - New tests per file:
+    - SimBroker 2;
+    - Alpaca 6 (one has 4 cases);
+    - fees 17;
+    - EOD 4;
+    - execution service 4;
+    - orchestrator 5;
+    - replay 1;
+    - golden 1, a day that books fees at boot and EOD, recorded and replayed;
+    - run-day CLI 3;
+    - trades 2 (one replaced).
+  - The record-then-replay test now also checks the capabilities round trip and `day_runs`.
+  - Each review fix's test fails without its fix. 763 tests pass.
+- **Pending:**
+  - **The human's probe,** `trader fees --book A --days 5`. It shows whether paper lists the charges, how it dates them, and whether they carry `created_at`. Its result is D-058.
+  - **G4b exercises the boot and EOD bookings live** for the first time.
+
+## D-056 — P4.0b: size skips named by capacity; orders ahead of polls; a polling budget (D-054 #5, #6)
+- **Date:** 2026-10-15 · **Status:** Accepted, as part of the Phase 4 plan the human approved on 2026-10-14.
+- **#5: a size skip names the capacity rule that also binds.**
+  - **The rule:** when sizing gives no shares before the gate, the reason is:
+    1. `capacity_positions` or `capacity_entries` if R-006 or R-007 also binds, ranked as the gate ranks them (D-044);
+    2. else `insufficient_settled_cash` if the settled cash can't buy one share;
+    3. else `qty_zero`.
+  - **Why:** the reason no longer depends on the price. On 10-14, STT got `insufficient_settled_cash` only because it cost more than the $20.39 left, although its two entries had already used up R-007.
+  - **A label only:** the same signals are skipped, in Book A and in the backtest. The decision's detail adds e.g. "capacity: R-007".
+  - **One test for capacity:** `gate.capacity_violations()` is that test, used by R-006 and R-007 too, with the caps on top. The reviewers confirmed:
+    - identical gate output on 10,080 states;
+    - identical Book A take/skip decisions and intents on 336 exposures;
+    - a G3 replay whose broker calls are byte-identical with and without the label.
+  - **G3's golden replay:**
+    - `journal.json` stays the live truth. `g3_day.CODE_CHANGES` lists the two diff lines from STT's new reason, citing this entry, and the test asserts that the replay's diff equals them.
+    - The golden journal changes in STT's reason and detail only.
+    - So `trader replay --date 2026-10-14` now reports those 2 differences and exits 1, by design, as D-053 noted for 10-13.
+  - **The synthetic days:** CAP gets `capacity_entries`.
+    - In the orchestrator's normal and crash-restart days it was `insufficient_settled_cash`.
+    - The golden day already had `capacity_entries`: WIN's partial fill leaves cash for 8 shares, so the gate rejects CAP on R-007.
+  - **D-042's skip split** (settled cash 360, the day's entries 326, …) was counted under the old labels. P4.0c's backtest re-run restates it.
+- **#6: the polling budget.**
+  - **The problem (D-054):** with one entry working, busy polling took 182–186 calls a minute, against the limiter's 180 a minute plus a burst of 10. Two entries at the open exceed that, and run 1's P1 window was paced by the limiter.
+  - **The limiter** (`data/ratelimit.py`):
+    - POST and DELETE requests (submits, cancels, market sells) are urgent. They wait in their own first-in-first-out queue, go ahead of every routine waiter, and may use the reserve.
+    - Routine reads stay first-in-first-out and never take the bucket below 4 tokens (`ORDER_RESERVE`, on each book's trading limiter only).
+    - Any 60 s still sees at most capacity + rate = 190 calls, under Alpaca's 200.
+    - A reviewer's simulation with saturating polls found the longest urgent wait was 0.25 s with the reserve, and 10 s with neither the reserve nor the queue rule.
+  - **The service** (`execution/service.py`):
+    - **The loop** still ticks every second while anything is busy.
+    - **Positions and open orders** are read:
+      - every second while shares are bare or a stop is pending (R-020);
+      - every 2 s while only entries are open;
+      - else every 5 s.
+      - Any order event, and any read that retires an entry or books a fill, asks for a read at once. A refresh is stamped before its reads, so an ask that arrives during them survives.
+    - **An entry is read every tick:**
+      - before its first read;
+      - while it waits for acceptance (D-053's clock);
+      - after a cancel, since Alpaca never streams `pending_cancel`;
+      - while partly filled (the 1 s grace);
+      - in the last 2 s before its timeout;
+      - while the book is closing.
+    - **Otherwise a working, unfilled entry is read every 2 s,** timed from its last read. Between reads, decisions use its latest snapshot, from the stream or the read.
+  - **The result:**
+    - Two working entries make 120 calls a minute (the old rule: 240); one makes 90 (old: 180).
+    - Entries waiting for acceptance are still read every tick: two waiting make about 180 a minute until paper accepts them, as at the open. The urgent queue and the reserve keep order calls from waiting behind those polls. Waiting entries can't fill, so R-020 has nothing to do then.
+  - **Deviations from the plan's wording:**
+    - **Timing.** The plan said "skip `get_order` when the stream reported that order within the poll interval". Timing the skip from the stream made the set of reads depend on how stream events and ticks interleave, so a replay asked for orders the live recording never read: the record-then-replay tests diverged. Timing from the last read, with every entry read at least once, removes that, and nearest-time matching (D-049) absorbs the rest.
+    - **Cadence.** With the plan's wording alone, two working entries would still make about 180 calls a minute, over the plan's own target of 150. So a working entry is read every 2 s, not every second.
+- **Review.** Three reviewers (labels, the limiter, polling) each had a verifier, then a completeness critic. There was no blocker, and nothing in the labels.
+  - **Confirmed and fixed:**
+    1. **A fill learned from a read (a quiet stream), or from an event that arrived during a refresh's reads, asked for no fresh view.** With a rejected leg, the shares then waited up to 5 s, and R-020 fired a P1 instead of trying a stop first (RISK.md §5). This predates P4.0b, which shifted its timing.
+    2. **Replays near a time-based cancel.** A live tick spends milliseconds a replay doesn't. Near the entry timeout or a partial fill's grace, live could act on the stream's fill while its replay acted on a 2 s-old recorded read, giving a cancel the recording lacks.
+    3. **Untested behavior:** nothing tested the 2 s re-read, the urgent caller's priority when it is already waiting, or that the broker's limiter has its reserve.
+  - **Refuted:**
+    - "Two waiting entries still poll at 180 a minute": that is the design, as stated above.
+  - **Noted:** a halt raised between the book's inputs and its sizing still gets a capacity or cash label, not `book_halted`. That window was already there for the cash label, lasts milliseconds, and affects the label only.
+- **Statements of current behavior this updates:**
+  - **D-032:** "open entries are polled every 1 s".
+  - **D-037:** the loop's read cadence.
+  - **D-041 and D-044 item 3:** the size-skip reason.
+  - **D-054:** `trader replay` of 10-14 matching (see above).
+  - **STRATEGY §3.5:** now states the rule.
+  - **ARCHITECTURE:** §3's continuous row, §4.2's limiter and §4.6's step 3 are updated.
+- **Tests:**
+  - New tests per file:
+    - gate 1;
+    - books 1 (4 cases);
+    - backtest 1;
+    - rate limiter 4;
+    - Alpaca broker 1, plus the reserve assertion;
+    - execution service 5:
+      - the budget;
+      - a partial fill the stream drops;
+      - a full fill the stream drops;
+      - an event during a refresh;
+      - a fill during a refresh;
+    - `test_polling_replay.py` 2 (5 cases: fills at the timeout and at a partial fill's grace, recorded with 3 ms of live time per tick, then replayed).
+  - **Changed:** 2 orchestrator expectations (CAP), and G3's comparison now asserts `CODE_CHANGES`.
+  - Each fix's test fails without it: four of the five replay cases diverge on the first version, and the old polling makes 240 calls a minute.
+  - 784 tests pass.
+
+## D-057 — P4.0c: shadow outcomes enter at the open past the trigger; ambiguous trigger minutes from the SIP tape
+- **Date:** 2026-10-15 · **Status:** Accepted. In the Phase 4 plan (2026-10-14), the human chose to resolve the trigger minute from the SIP trade tape, together with D-054's gap-through finding. The backtest's restated numbers come in a later entry, after the human's tape fetch.
+- **The problem:**
+  - **D-054's review:** S§7.2 entered every shadow at trigger + slippage, even when the trigger minute opened past the trigger. CRWG was booked at +5.08R; from the bar's open it is +3.07R.
+  - **D-042:** D-041's rule counts a stop touch in the trigger minute as a stop. That stopped 39% of triggered longs in their own minute, though 1-minute bars can't tell whether the touch came before the entry. Long shadow R lay anywhere from −0.31 to +0.14.
+- **The rule** (`memory/shadow.py`; S§7.2 amended):
+  - **Entry:** max(trigger, the trigger minute's open) + slippage, for every signal; shorts min(trigger, open) − slippage. Slippage stays a function of the trigger.
+  - **Unambiguous minutes** are settled by their bar (`trigger_resolution = bars`):
+    - opened past the trigger: the entry came first, so a stop touch in that minute is a stop, at stop − $0.01;
+    - closed at or past the stop: the touch came last, also a stop;
+    - never touched the stop: no stop in that minute.
+  - **An ambiguous minute** (a long's opened below the trigger, touched the stop and closed above it; shorts mirror) is read from the SIP trade tape (`tape`):
+    - the first print at or past the trigger orders the minute;
+    - the trade is stopped if a later print in the minute is at or past the stop, at min(stop, that print) − $0.01 (short: max + $0.01);
+    - otherwise the walk goes on from the next bar, by D-041's rules;
+    - MFE and MAE count only the prints the trade held in that minute: from the entry print through the exit, or to the minute's end. The whole bar would count a pre-entry touch, or a high printed after the exit.
+  - **Which prints count:**
+    - Alpaca's `u` marks `canceled` and `incorrect` prints void. Its docs define `incorrect` as the original of a corrected trade and `corrected` as the valid replacement, so a `corrected` print counts. The plan's "drop corrected" had them the wrong way round; the docs were followed.
+    - Prints with one of D-043's excluded conditions (odd lots and the rest) don't count either: they set no bar price.
+  - **No usable tape** (none read, a refused read, or no print at the trigger) means D-041's pessimistic stop (`fallback`). When a tape was asked for and didn't settle the minute, the day raises a P3 `shadow_tape_unresolved` naming the symbols.
+  - **A limitation, kept and measured:**
+    - The entry price still comes from bars. A minute that opened below the trigger but first printed far past it still enters at trigger + slippage. The synthetic GAPPER shows it: first print 51.00 against a 50.41 trigger.
+    - `ShadowOutcome.tape_entry` keeps that first print. The backtest report counts the tape-read longs whose first print lay past the chase cap, so the restatement can quote the bias.
+- **The data** (checked against Alpaca's docs, 2026-10-15):
+  - **`AlpacaRest.trades()`** calls `GET /v2/stocks/trades`:
+    - `start` and `end` are inclusive, `limit` is 10,000 (the maximum, across all symbols), sorted ascending, with an optional `asof`;
+    - every `next_page_token` is followed, since a page may hold fewer rows than the limit with more to come;
+    - each print keeps its `t`, `p`, `s`, `c` and `u` as a `SipTrade`.
+  - **The live job** makes one request per ambiguous signal, for [minute, minute + 1 min], and drops prints outside the minute. The free plan's 15-minute SIP delay is long past at close + 12 min.
+  - **Recording and replay:** the request is recorded and replayed like the bars, since its key comes from the bars and the signal alone. A replayed REST error now reads as it did live: the recording keeps the raw message, and a replay drops the prefix older recordings stored.
+  - **The capability `shadow_tape`** gates it. A day recorded before it (G3's golden) asks for no tape and replays unchanged, with its ambiguous minutes marked `fallback`.
+  - **Migration 0006** adds `shadow_outcomes.trigger_resolution`.
+- **The backtest:**
+  - **`trader backtest --tape`** fetches the tape of each ambiguous minute not yet cached (`bt_tape`, `asof="-"`). A refused read isn't cached, so the next run tries it again. Without `--tape`, cached tapes are used and the rest fall back.
+  - **Book A's leg** now takes each long's shadow outcome, from the same resolver. D-042's separate bar-open simulation is gone, since the shadow entry is now the same.
+  - **The report** counts the trigger minutes:
+    - settled by bars;
+    - read from the tape;
+    - fallen back with no tape (`--tape` fetches these);
+    - fallen back on a tape with no usable print.
+    - It also counts the tape-read entries past the chase cap. The per-signal Parquet gains `trigger_resolution`, `tape_read` and `tape_entry`.
+  - **Fixed, from the review: a look-ahead in cached reruns** (D-042's guard).
+    - The universe build caches OR baselines in `or_bars`, and a later split restates a symbol's rows in the new share basis. A rerun reaching a day before that split read those rows.
+    - On the real cache this put DD (2026-06-23) and JEM (2026-07-01) into the top 20, displacing SH and IFF, and shifted 27 ranks. It also made two network requests a "cached" rerun shouldn't.
+    - `prepare()` now rebuilds `or_bars` from `bt_or_raw` every run, at no request cost. A reviewer confirmed this reproduces D-042's selection exactly.
+- **The goldens:**
+  - **The standard day:**
+    - CHASE, which gapped to 41.00, now enters there: shadow R +4.84 becomes −0.03.
+    - CAP and GAPPER have ambiguous trigger minutes whose synthetic tape shows the stop touch first, so both hold to the flatten instead of the pessimistic stop. CAP goes from −1.09 to −0.15; GAPPER from −1.08 to +4.75. GAPPER's MAE of +4.75 is the entry limitation above.
+  - **G3** (recorded before the capability):
+    - CRWG's shadow short enters at the bar's open: +5.08 becomes +3.07, D-054's figure.
+    - KBH enters at its gapped open.
+    - Six ambiguous minutes keep their pessimistic numbers, marked `fallback`: AADX, BWA, FAST, FNGU, PGR and VRNS. D-054 noted that BWA and FAST held 29–30 minutes live.
+- **Review.** Three reviewers (the rule, the data path, the backtest) each had a verifier, then a completeness critic. There was no blocker.
+  - **Confirmed and fixed:**
+    - MFE and MAE took the whole trigger bar where the tape had ordered it;
+    - no test of the minute's end boundary, the short side of the ambiguity test, or the job's exclusions;
+    - a replayed REST error doubled its prefix (the cause predates P4.0c; P4.0c's P3 quotes it);
+    - the cached rerun look-ahead above (predates P4.0c);
+    - the report lumped retryable and unusable tapes;
+    - the backtest and CLI tape tests couldn't catch a tape read for every minute, or `--tape` never reaching the engine;
+    - S§7.2's wording on the entry print.
+  - **Refuted:** "nothing catches a replay that skips the tape reads". The goldens do; the record-then-replay test now compares `shadow_outcomes` too.
+- **Statements of current behavior this updates:**
+  - **D-041:** the entry; the trigger-minute stop, now only for minutes the bar settles and for the fallback; MFE and MAE over the whole trigger bar.
+  - **D-042:**
+    - the cache tables, which now include `bt_tape`, with `or_bars` rebuilt each run;
+    - the Book A leg;
+    - "about 850 small requests": the cache holds about 605 ambiguous minutes in that window.
+  - **D-045:** the shadow job also reads one tape per ambiguous minute.
+  - **D-047:** recorded REST errors keep the raw message.
+  - **D-054:** its shadow finding is resolved here.
+- **Tests:** 16 new:
+  - shadow 7, including a replaced gap-through test;
+  - shadow jobs 3;
+  - Alpaca REST 1;
+  - replay 2;
+  - backtest 2;
+  - orchestrator 1.
+
+  The record-then-replay test and the backtest CLI test were extended. Each fix's test fails without it. 799 tests pass.
+- **Pending:**
+  - **The human's tape fetch:** `uv run trader backtest --start 2026-04-01 --end 2026-10-09 --tape`, outside 09:00–16:30 ET. About 605 requests, a few minutes.
+  - **Then:** I re-run the report from the cache and restate D-042's numbers, its skip split (D-056) and H4 in a later entry.
+
 ---
+
+## D-058 — D-055's fee probe: paper lists its FEE activities, dated the trade day and posted that evening
+- **Date:** 2026-10-15 · **Status:** Accepted. The human ran D-055's read-only probe, `trader fees --book A --days 5`, at 14:04 ET. No code changes.
+- **What paper listed** for Book A from 10-12 to 10-14:
+  - Two rows per trading day, CAT and REG. All were `executed` and carried `created_at`. There was no TAF, and nothing `correct` or `canceled`.
+  - `date` is the trade date. CAT posted at 20:05 ET and REG at 20:15 ET that evening. That is 00:05 and 00:15 UTC the next day, which matches Alpaca's "typically the day after the trade date (in UTC)".
+  - The charges were $0.02 on 10-12, $0.02 on 10-13 and $0.04 on 10-14 (REG $0.03). Cash was $996.08.
+- **D-055's rules hold on these rows:**
+  - Each charge is dated its trade date. It retires that date's estimates at the next booking, since it posted after the close.
+  - The seed paid none of them. Book A was seeded at 13:02:51 ET on 10-12, before that day's sale.
+  - EOD runs before a day's charges post, so the check is right to leave out today's estimates.
+  - Whether `after` filters by posting time or by date is still unknown, since every row passes both ways. Reading from a midnight covers both.
+- **A dry run** of `fee_reconciliation` on a copy of the journal, with these six rows:
+  - It books the six charges and three reversals: +$0.01 (10-12), +$0.01 (10-13) and +$0.06 (10-14).
+  - Ledger cash and 10-15's E stay $996.08, the broker's cash: a residual of $0.00.
+  - The first boot after 10-15 (G4b's, unless a day runs before it) books the same nine rows, plus any charge posted in between.
+- **The estimates differ per day from the charges:** $0.01, $0.01 and $0.06, against $0.02, $0.02 and $0.04. Over the three days they sum the same, by chance.
+  - **REG is the SEC fee alone,** rounded up per order or per day, not per fill. On 10-14, $975.75 sold comes to $0.0201 and was charged $0.03. Per fill it would be $0.05.
+  - **FINRA's TAF is paused** until 2026-12-31 (settings.yaml's note). The estimate charges it at the 2027 rate, so it errs high.
+  - **CAT costs a cent each trading day,** even on 10-14 with two round trips. The estimate has no CAT term, so a day with one small sale estimates a cent low, as 10-12 and 10-13 did.
+  - **Where that shows:**
+    - An estimate stands in only until the next booking, and never in its own day's EOD check.
+    - So D-055's "settled cash stays conservative" holds to within a cent a day, and only when a booking fails, which is already a P3 `fees_unavailable`.
+    - A day's realized P&L counts its estimates, so it can differ from that day's charges by a few cents.
+  - No change. A CAT term can be added if those cents ever matter.
+- **Still unchecked:**
+  - D-055's assumption about status `correct`: no such row has appeared.
+  - Live's intraday fee accrual (Phase 7).
+- **Statements of current behavior this updates:**
+  - D-055's pending probe, now done, and its "settled cash stays conservative" (to within a cent a day);
+  - S§3.6's fee row: Alpaca also charges a CAT fee.
 
 ## Open questions to resolve during the build (record answers as new entries)
 
@@ -1274,7 +1605,7 @@ Append-only. Each entry records context, the decision, its consequences, and sou
 - **Q2 (P1.5):** The concurrent market-data WebSocket connection limit on the free plan, and whether a trading-status/halts channel is available on the IEX feed.
 - **Q3 (P2.1):** Exact alpaca-py request classes for OTO with a `stop_loss` leg; confirm that close-position cancels the related open orders. **Answered: D-030** (the trading client uses httpx, not alpaca-py; `DELETE /v2/positions/{symbol}` does not cancel open orders, so flattening cancels first).
 - **Q4 (G4a):** Does `--tools ""` work with `--json-schema`? What are the envelope fields and the exit codes on usage-limit or auth errors?
-- **Q5 (P0.2):** Current SEC Section 31 fee rate and FINRA TAF per share, for fee estimates (set in `fees:`). **Answered: D-019.**
+- **Q5 (P0.2):** Current SEC Section 31 fee rate and FINRA TAF per share, for fee estimates (set in `fees:`). **Answered: D-019.** D-058 adds Alpaca's CAT fee, a cent a trading day so far, which the estimates leave out.
 - **Q6 (P1.4):** Typical count of eligible symbols, and the IEX OR-volume distribution, to sanity-check the liquidity guards. **Partly answered: D-042's results** (about 1,675 eligible symbols a day in 2026-04..10); the IEX OR-volume distribution is still to look at.
 - **Q7 (P1.2):** Can the human's Alpaca account type fetch SIP historical bars (older than 15 min)? If not: open a regular account, or record a new decision to fall back to IEX history with rescaled ADV thresholds and IEX-based shadow outcomes (noisier). **Doctor's `data.sip_history` check answers this once keys exist.** **Answered by doctor on 2026-10-10: yes** (`data.sip_history` PASS: SPY daily SIP bars through 2026-10-09), so no IEX fallback is needed.
 - **Q8 (P2.3):** Should the cash ledger settle on Alpaca's `settlement_date`, which skips bank holidays (D-022), or on T+1 trading days as RISK.md §4 says? Alpaca's date matches real cash-account behavior; the human decides. **Answered: D-034** (the human chose Alpaca's settlement date).

@@ -3,11 +3,14 @@
 ``ReplayBroker`` answers a replayed day's calls from ``broker-<book>.jsonl.gz``, which
 ``RecordingBroker`` wrote:
 - **Submits** match by client order id, and **cancels** by order id (repeats in order).
-- **Reads** (account, positions, open orders, one order, an order by client id, orders since)
+- **Reads** (account, positions, open orders, one order, an order by client id, orders since,
+  fee activities)
   get the recorded answer to the same call that started nearest to now, unused answers first.
   A live engine spends a few milliseconds between calls that a SimClock doesn't, so a replay
   runs slightly early; and calls made at one instant (a zero-latency recording) are told apart
-  by their order. "The latest answer at or before now" got both wrong (D-049).
+  by their order. "The latest answer at or before now" got both wrong (D-049). Fee reads
+  match by time alone, like account reads: their ``after`` comes from the ledger and the seed
+  time, which a replay rebuilds differently (D-055).
 - **Trade updates** arrive at their receive times.
 
 Each answer comes after its recorded duration (a zero duration doesn't even yield, as the
@@ -35,6 +38,7 @@ from trader.execution.broker import (
     BrokerEvent,
     BrokerUnavailable,
     DuplicateClientOrderId,
+    FeeActivity,
     Order,
     OrderNotCancelable,
     OrderNotFound,
@@ -68,6 +72,7 @@ _READ_KEYS: dict[str, str | None] = {
     "get_order": "order_id",
     "order_by_client_id": "client_order_id",
     "orders_since": "after",
+    "fee_activities": None,
 }
 
 
@@ -151,6 +156,14 @@ class ReplayBroker:
     async def orders_since(self, after: datetime) -> list[Order]:
         result: list[Order] = await self._read(
             "orders_since", {"after": fmt_iso(after)}, lambda: self._fallback.orders_since(after)
+        )
+        return result
+
+    async def fee_activities(self, after: datetime) -> list[FeeActivity]:
+        result: list[FeeActivity] = await self._read(
+            "fee_activities",
+            {"after": fmt_iso(after)},
+            lambda: self._fallback.fee_activities(after),
         )
         return result
 
@@ -244,6 +257,8 @@ def _decode(method: str, data: Any) -> Any:
         return [Position.model_validate(p) for p in data]
     if method in ("open_orders", "orders_since"):
         return [Order.model_validate(o) for o in data]
+    if method == "fee_activities":
+        return [FeeActivity.model_validate(f) for f in data]
     if method == "order_by_client_id":
         return None if data is None else Order.model_validate(data)
     if method == "cancel":

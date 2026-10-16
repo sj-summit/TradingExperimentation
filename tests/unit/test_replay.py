@@ -9,8 +9,8 @@ from typing import Any
 import pytest
 
 from trader.core.clock import ET, SimClock
-from trader.core.models import Asset, Bar, OrderIntent, Quote, Snapshot, Trade
-from trader.data.alpaca_rest import SipRecentError
+from trader.core.models import Asset, Bar, OrderIntent, Quote, SipTrade, Snapshot, Trade
+from trader.data.alpaca_rest import AlpacaError, SipRecentError
 from trader.data.recorder import STREAM_FILE, Recorder, broker_file, read_jsonl
 from trader.data.replay import (
     RecordedEvent,
@@ -23,6 +23,7 @@ from trader.data.replay import (
 from trader.data.stream import SubscriptionLimitError
 from trader.execution.broker import OrderRejected
 from trader.execution.recording import RecordingBroker
+from trader.execution.replay import ReplayBroker
 from trader.execution.sim_broker import SimBroker
 from trader.memory.journal import Journal
 from trader.orchestrator.simdrive import StuckError, drive
@@ -74,8 +75,44 @@ class Inner:
         await self._take(0.1)
         return []
 
+    async def trades(self, symbols: Any, start: datetime, end: datetime, *,
+                     feed: str) -> dict[str, list[SipTrade]]:  # fmt: skip
+        await self._take(0.4)
+        return {"XYZ": [SipTrade(symbol="XYZ", ts=start, price=D("12.72"), size=100,
+                                 conditions=("@",), update="corrected")]}  # fmt: skip
+
     async def aclose(self) -> None:
         return None
+
+
+async def test_an_error_recorded_with_its_formatted_text_replays_as_it_read() -> None:
+    """Recordings before D-057 stored ``str(exc)``; the replay drops the prefix it adds."""
+    old = {"method": "clock", "key": "clock{}", "start_rx": "2026-10-13T09:35:03-04:00",
+           "end_rx": "2026-10-13T09:35:03-04:00",
+           "error": {"type": "AlpacaError", "status": 500, "path": "/v2/clock", "code": None,
+                     "message": "Alpaca /v2/clock: HTTP 500: internal error"}}  # fmt: skip
+    replay = ReplayMarketData([old], SimClock(T0))
+    with pytest.raises(AlpacaError) as replayed:
+        await replay.clock()
+    assert str(replayed.value) == "Alpaca /v2/clock: HTTP 500: internal error"
+
+
+async def test_a_tape_read_replays_with_its_prints() -> None:
+    """D-057: the shadow job's trigger-minute tape is recorded and replayed like any call."""
+    clock = SimClock(T0)
+    sink: list[dict[str, Any]] = []
+    rec = RecordingMarketData(Inner(clock), clock, sink.append)  # type: ignore[arg-type]
+    minute = at(-3)
+    live = await drive(clock, rec.trades(["XYZ"], minute, minute + timedelta(minutes=1),
+                                         feed="sip"))  # fmt: skip
+    assert [r["method"] for r in sink] == ["trades"]
+    replay_clock = SimClock(T0)
+    replay = ReplayMarketData(sink, replay_clock)
+    asked = replay.trades(["XYZ"], minute, minute + timedelta(minutes=1), feed="sip")
+    again = await drive(replay_clock, asked)
+    assert again == live
+    assert again["XYZ"][0].update == "corrected"
+    assert replay_clock.now() - T0 == timedelta(seconds=0.4)  # the recorded duration
 
 
 async def test_rest_calls_replay_with_their_results_and_durations() -> None:
@@ -107,8 +144,12 @@ async def test_rest_calls_replay_with_their_results_and_durations() -> None:
         out.append(await replay.snapshots(["XYZ"], feed="iex"))
         out.append(await replay.assets(status=None))
         out.append(await replay.snapshots(["XYZ"], feed="iex"))
-        with pytest.raises(SipRecentError):
+        with pytest.raises(SipRecentError) as replayed:
             await replay.bars(["XYZ"], "1Min", at(-303), feed="sip")
+        # It reads as live did: a P3 quoting it must match the live journal (review, D-057).
+        assert str(replayed.value) == (
+            "Alpaca /b: HTTP 403: subscription does not permit querying recent SIP data"
+        )
         return out
 
     assert await drive(replay_clock, again()) == live
@@ -283,3 +324,17 @@ def test_broker_recordings_are_one_file_per_book(tmp_path: Path) -> None:
     rec.close()
     assert broker_file("A") == "broker-A.jsonl.gz"
     assert list(read_jsonl(rec.dir / broker_file("A"))) == [{"method": "positions", "result": []}]
+
+
+async def test_fee_activities_are_recorded_and_replayed() -> None:
+    clock = SimClock(T0)
+    sim = SimBroker(clock=clock)
+    fee = sim.charge_fee(D("0.02"), symbol="XYZ")
+    sink: list[dict[str, Any]] = []
+    since = T0 - timedelta(days=1)
+    assert await RecordingBroker(sim, clock, sink.append).fee_activities(since) == [fee]
+    assert [r["method"] for r in sink] == ["fee_activities"]
+    replay = ReplayBroker(sink, SimClock(T0), fallback=SimBroker(clock=SimClock(T0)))
+    # The replay rebuilds the ledger, so its window differs; the read still matches (D-055).
+    assert await replay.fee_activities(since + timedelta(hours=9, microseconds=7)) == [fee]
+    assert replay.divergences == []

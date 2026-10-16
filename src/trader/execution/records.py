@@ -401,8 +401,9 @@ def read_book_day(conn: sqlite3.Connection, book: str, day: date) -> BookDay:
         realized += proceeds - sold * average
         if bought > sold:
             held[symbol] = (int(bought - sold), average)
-    fees = conn.execute(
-        "SELECT amount FROM ledger_entries WHERE book = ? AND kind = 'fee' AND trade_date = ?",
+    fees = conn.execute(  # today's estimates only: a charge dated today paid earlier trades
+        "SELECT amount FROM ledger_entries WHERE book = ? AND kind = 'fee' AND trade_date = ? "
+        "AND ref LIKE 'fee-est:%'",
         (book, day.isoformat()),
     ).fetchall()
     realized += sum((Decimal(r["amount"]) for r in fees), Decimal(0))

@@ -96,6 +96,8 @@ The ledger enforces cash-account behavior, even though Alpaca paper accounts are
 - **Rule:** the total cost of buys today must not exceed settled cash at the start of the day. Today's sale proceeds don't settle until T+1, so they can't fund another buy today without risking a good-faith violation.
 - **Available settled cash** = start-of-day settled cash − cost of today's buys (filled, plus pending entries at their limit).
 - **EOD:** reconcile ledger cash with broker cash. A mismatch above $1 is an incident, and the book does not trade next session until it's resolved or acknowledged.
+  - Paper and live alike, ledger cash counts the fees the broker charged once they are booked, earlier days' fee estimates until then, and never today's estimates: the broker charges a day's fees after its close (D-055).
+  - The difference is stored in `daily_stats.cash_residual`. Above half the tolerance it is a P3 `cash_drift`.
 
 ### Example
 
@@ -194,7 +196,7 @@ Stop live trading and return to paper if either happens:
 - **Credentials.**
   - `.env` only; the paper keys and the Claude token are separate secrets.
   - The `claude setup-token` token lasts about one year. `doctor` warns from 30 days before the one-year expiry, computed from `CLAUDE_TOKEN_CREATED=YYYY-MM-DD` in `.env`.
-- **Clock.** At boot, system time must be within 2 s of Alpaca's clock; otherwise P2 incident and refuse to arm signals.
+- **Clock.** At boot, system time must be within 2 s of Alpaca's clock; otherwise P2 incident and refuse to arm signals. The skew is read again every hour (D-055): past 2 s that is a P2 alert, once per episode, and arms or disarms nothing.
 - **Calendar.** Holidays and early closes come from the Alpaca calendar (cached). DST is handled by `zoneinfo`. Test the March/November transition days and the day after Thanksgiving.
 - **Machine.** It must not sleep from 08:15 to 16:45 ET on weekdays. `doctor` warns if the platform's sleep settings can't be verified.
 - **Outages.** If Alpaca, the network, or Anthropic is down:
@@ -215,5 +217,5 @@ Stop live trading and return to paper if either happens:
 | Severity | Examples | Response |
 |---|---|---|
 | P1 | Unprotected position; not flat by close − 2 min; reconciliation mismatch with positions; daily loss limit breached beyond the configured value | Immediate push alert; auto-flatten the affected book; halt until the human acknowledges |
-| P2 | Engine heartbeat stale with no positions; data stale > 120 s; LLM degraded; clock skew | Push alert; halt new entries as the rule requires |
-| P3 | A single LLM failure; scan slow; a minor data gap | Log; show in the daily report |
+| P2 | Engine heartbeat stale with no positions; data stale > 120 s; LLM degraded; clock skew | Push alert; halt new entries as the rule requires (the hourly clock reading only alerts) |
+| P3 | A single LLM failure; scan slow; a minor data gap; fees not readable; a cash residual over half the tolerance | Log; show in the daily report |

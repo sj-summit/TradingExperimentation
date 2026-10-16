@@ -9,12 +9,14 @@ book's lock. The decision is journaled whatever happens.
 from decimal import Decimal
 
 from trader.books.base import BookDecision, EntryInputs, decision_for, record_decision
+from trader.books.reasons import reason_for_no_size
 from trader.config import BookName, RiskConfig, StrategyConfig
 from trader.core.clock import Clock
 from trader.core.ids import client_order_id
 from trader.core.models import OrderIntent, Signal, TriggerEvent
 from trader.execution.service import ExecutionService
 from trader.memory.journal import Journal
+from trader.risk.gate import capacity_violations
 from trader.strategy.pricing import entry_limit, is_chased
 from trader.strategy.sizing import sizing
 
@@ -72,8 +74,12 @@ class BaselineBook:
             f"E {exposure.equity_sod} S {exposure.available_cash}"
         )
         if size.qty < 1:
-            reason = "insufficient_settled_cash" if size.by_cash < 1 else "qty_zero"
-            return self._skip(sig, reason, sized)
+            capacity = capacity_violations(
+                self._risk, positions=len(exposure.symbols), entries_today=exposure.entries_today
+            )
+            also = f"; capacity: {', '.join(capacity)}" if capacity else ""
+            reason = reason_for_no_size(capacity, by_cash=size.by_cash)
+            return self._skip(sig, reason, f"{sized}{also}")
         intent = OrderIntent(
             book=self.name,
             signal_id=sig.id,

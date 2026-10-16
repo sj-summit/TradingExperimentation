@@ -313,13 +313,23 @@ def backtest(
     force: Annotated[
         bool, typer.Option("--force", help="Run between 09:00 and 16:30 ET on a trading day.")
     ] = False,
+    tape: Annotated[
+        bool,
+        typer.Option(
+            "--tape",
+            help="Fetch the SIP trade tape of each ambiguous trigger minute not yet cached "
+            "(one request each; D-057). Without it, cached tapes are used and the rest fall back.",
+        ),
+    ] = False,
 ) -> None:
     """Rules-only ORB backtest on historical data (P3.9). Never uses the LLM (D-010). Data is
     cached under runtime/backtest/, so a rerun over the same range makes no requests."""
-    _run(_backtest(ctx.obj, start, end, feed, force=force))
+    _run(_backtest(ctx.obj, start, end, feed, force=force, tape=tape))
 
 
-async def _backtest(root: Path, start: str, end: str, feed: str | None, *, force: bool) -> None:
+async def _backtest(
+    root: Path, start: str, end: str, feed: str | None, *, force: bool, tape: bool = False
+) -> None:
     from typing import cast
 
     from trader.backtest import report
@@ -358,7 +368,7 @@ async def _backtest(root: Path, start: str, end: str, feed: str | None, *, force
                 calendar=calendar,
                 settings=rt.cfg.settings,
                 risk=rt.cfg.risk,
-                cfg=BacktestSettings(start=first, end=last, feed=cast(Feed, chosen)),
+                cfg=BacktestSettings(start=first, end=last, feed=cast(Feed, chosen), tape=tape),
                 progress=progress,
             )
         reports = rt.cfg.path(rt.cfg.settings.storage.reports_dir)
@@ -407,6 +417,48 @@ def filings(
 ) -> None:
     """Dev: recent SEC filings of flagged forms for a symbol (EDGAR)."""
     _run(_filings(ctx.obj, symbol, days))
+
+
+@app.command()
+def fees(
+    ctx: typer.Context,
+    book: Annotated[str, typer.Option("--book", help="A, B or all.")] = "A",
+    days: Annotated[int, typer.Option("--days", min=1, help="How far back.")] = 5,
+) -> None:
+    """Read-only: the fees Alpaca charged a book's account (FEE activities, D-055), then the
+    account's cash now. Places and cancels nothing."""
+    _run(_fees(ctx.obj, _books(book), days))
+
+
+async def _fees(root: Path, books: list[Literal["A", "B"]], days: int) -> None:
+    from collections import defaultdict
+    from decimal import Decimal
+
+    from trader.execution.alpaca_broker import AlpacaBroker
+    from trader.runtime import open_local
+
+    async with open_local(root) as local:
+        since = (local.clock.now() - dt.timedelta(days=days)).replace(microsecond=0)
+        for book in books:
+            broker = AlpacaBroker.from_config(local.cfg, book, local.clock)
+            try:
+                found = await broker.fee_activities(since)
+                cash = (await broker.account()).cash
+            finally:
+                await broker.aclose()
+            typer.echo(f"Book {book}: {len(found)} fee activities since {since:%Y-%m-%d %H:%M}")
+            by_date: dict[dt.date, Decimal] = defaultdict(Decimal)
+            for fee in found:
+                made = f"{fee.created_at:%Y-%m-%d %H:%M}" if fee.created_at else "?"
+                typer.echo(
+                    f"  {fee.date} {fee.sub_type or '-':<4} {fee.net_amount:>8} {fee.status:<9} "
+                    f"{fee.symbol or '-':<6} created {made}"
+                )
+                if fee.status != "canceled":
+                    by_date[fee.date] += fee.net_amount
+            for day, total in sorted(by_date.items()):
+                typer.echo(f"  {day}: {total} in all")
+            typer.echo(f"  cash now {cash}")
 
 
 async def _news(root: Path, symbols: str, hours: float) -> None:

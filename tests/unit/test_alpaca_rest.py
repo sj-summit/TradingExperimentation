@@ -2,7 +2,7 @@ import asyncio
 import json
 import random
 from collections.abc import AsyncIterator
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -117,6 +117,51 @@ async def test_bars_follow_pages_and_keep_order(
     days = [b.ts.date() for b in result["AAPL"]]
     assert days == [date(2026, 10, 6), date(2026, 10, 7), date(2026, 10, 8)]
     assert len(result["MSFT"]) == 1
+    assert route.calls[1].request.url.params["page_token"] == "t1"
+
+
+TRADES = f"{DATA_URL}/v2/stocks/trades"
+
+
+def trades_page(rows: dict[str, list[str]], token: str | None = None) -> httpx.Response:
+    body = ",".join(f'"{s}":[{",".join(r)}]' for s, r in rows.items())
+    next_token = json.dumps(token)
+    return httpx.Response(200, content=f'{{"trades":{{{body}}},"next_page_token":{next_token}}}')
+
+
+async def test_historical_trades_follow_pages_and_keep_corrections(
+    rest: AlpacaRest, respx_mock: respx.MockRouter
+) -> None:
+    """D-057: a page can hold fewer than the limit with more to come, so every token is
+    followed; Alpaca's ``u`` marks a print canceled, incorrect, or a correction."""
+    first = trades_page(
+        {
+            "XYZ": [
+                '{"t":"2026-10-13T13:41:01.5Z","x":"V","p":10.01,"s":100,"c":["@"],"i":1,'
+                '"z":"C","u":"canceled"}'
+            ]
+        },
+        token="t1",
+    )
+    second = trades_page(
+        {"XYZ": ['{"t":"2026-10-13T13:41:02Z","x":"Q","p":9.88,"s":5,"c":["@","I"],"i":2,"z":"C"}']}
+    )
+    route = respx_mock.get(TRADES).mock(side_effect=[first, second])
+    start = datetime(2026, 10, 13, 9, 41, tzinfo=ET)
+    found = await rest.trades(["XYZ"], start, start + timedelta(minutes=1), feed="sip", asof="-")
+    one, two = found["XYZ"]
+    assert (one.price, one.update, one.conditions) == (Decimal("10.01"), "canceled", ("@",))
+    assert (two.price, two.size, two.update, two.conditions) == (
+        Decimal("9.88"), 5, None, ("@", "I")
+    )  # fmt: skip
+    assert one.ts == datetime(2026, 10, 13, 9, 41, 1, 500_000, tzinfo=ET)
+    params = route.calls[0].request.url.params
+    assert (params["symbols"], params["feed"], params["limit"], params["sort"]) == (
+        "XYZ", "sip", "10000", "asc"
+    )  # fmt: skip
+    assert (params["start"], params["end"], params["asof"]) == (
+        "2026-10-13T13:41:00Z", "2026-10-13T13:42:00Z", "-"
+    )  # fmt: skip
     assert route.calls[1].request.url.params["page_token"] == "t1"
 
 

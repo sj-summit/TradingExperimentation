@@ -26,7 +26,7 @@ import asyncio
 import random
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Literal
 
@@ -36,6 +36,7 @@ from trader.execution.broker import (
     AccountSnapshot,
     BrokerEvent,
     DuplicateClientOrderId,
+    FeeActivity,
     Order,
     OrderNotCancelable,
     OrderNotFound,
@@ -149,6 +150,7 @@ class SimBroker:
         self.queued_cancel_delay = timedelta(0)
         self.submits: list[str] = []  # client_order_ids in submission order, faults included
         self.cancels: list[str] = []  # order ids, one per cancel call
+        self._fees: list[FeeActivity] = []
 
     # ---------------------------------------------------------------- fault injection
 
@@ -177,6 +179,32 @@ class SimBroker:
             return
         for event in reversed(held) if reverse else held:
             self._events.put_nowait(event)
+
+    def charge_fee(
+        self,
+        amount: Decimal,
+        *,
+        day: date | None = None,
+        sub_type: str = "REG",
+        symbol: str | None = None,
+        posted: datetime | None = None,
+    ) -> FeeActivity:
+        """Charge a fee as paper does overnight: cash drops by ``amount`` and a FEE activity
+        dated ``day`` (default today) appears, created now, or at ``posted`` for a charge made
+        while this account wasn't being watched."""
+        now = self._clock.now()
+        self.cash -= amount
+        fee = FeeActivity(
+            id=f"fee-{len(self._fees) + 1}",
+            date=day or now.date(),
+            sub_type=sub_type,
+            net_amount=-amount,
+            status="executed",
+            symbol=symbol,
+            created_at=posted or now,
+        )
+        self._fees.append(fee)
+        return fee
 
     @property
     def idle(self) -> bool:
@@ -269,6 +297,11 @@ class SimBroker:
         ]
 
     # ---------------------------------------------------------------- order mutations
+
+    async def fee_activities(self, after: datetime) -> list[FeeActivity]:
+        """The charges posted after ``after``, oldest first, as Alpaca lists them."""
+        found = [f for f in self._fees if f.created_at is not None and f.created_at > after]
+        return sorted(found, key=lambda f: (f.created_at or after, f.id))
 
     async def submit_entry_oto(self, intent: OrderIntent) -> Order:
         self._advance()
@@ -638,6 +671,8 @@ class SimBroker:
         if is_final(order.status):  # it ended while it waited (expired at the close, say)
             order.queued_cancel = False
             return
+        if accepted_at is not None:
+            order.submitted_at = accepted_at  # paper rewrites it at acceptance (D-053)
         if order.queued_cancel and accepted_at is not None:  # timed from the acceptance itself
             order.queued_cancel = False
             order.queued_cancel_at = accepted_at + self.queued_cancel_delay

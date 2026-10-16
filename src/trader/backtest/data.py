@@ -26,8 +26,8 @@ from typing import Literal, Protocol
 import structlog
 
 from trader.core.calendar import TradingCalendar
-from trader.core.clock import ET, et_datetime, parse_et_iso
-from trader.core.models import Asset, Bar, Split
+from trader.core.clock import ET, et_datetime, fmt_iso, parse_et_iso
+from trader.core.models import Asset, Bar, SipTrade, Split
 from trader.data.alpaca_rest import Adjustment, AlpacaError, Feed, Timeframe
 from trader.memory.journal import Journal, db_to_dec, dec_to_db
 
@@ -53,6 +53,8 @@ CACHE_TABLES = (
     "CREATE TABLE IF NOT EXISTS bt_minute (symbol TEXT, date TEXT, bars_json TEXT, "
     "PRIMARY KEY (symbol, date))",
     "CREATE TABLE IF NOT EXISTS bt_fetched (kind TEXT, key TEXT, PRIMARY KEY (kind, key))",
+    "CREATE TABLE IF NOT EXISTS bt_tape (symbol TEXT, minute TEXT, prints_json TEXT, "
+    "PRIMARY KEY (symbol, minute))",
 )
 
 
@@ -77,6 +79,16 @@ class HistorySource(Protocol):
 
     async def splits(self, start: date, end: date) -> list[Split]: ...
 
+    async def trades(
+        self,
+        symbols: Sequence[str],
+        start: datetime,
+        end: datetime,
+        *,
+        feed: Feed,
+        asof: str | None = None,
+    ) -> dict[str, list[SipTrade]]: ...
+
 
 class LookAheadError(RuntimeError):
     """The backtest asked for data after the simulated day."""
@@ -97,6 +109,10 @@ class BacktestData:
         """Make sure the cache holds assets, daily bars and splits for [the first lookback
         session, end], fetching only what it lacks."""
         await self.cache.write(_create_tables)
+        # The universe build caches OR baselines in or_bars, and a later split restates a
+        # symbol's rows in the new share basis. A rerun reaching a day before that split would
+        # read them: look-ahead. bt_or_raw keeps every raw bar, so rebuild them each run.
+        await self.cache.execute("DELETE FROM or_bars")
         first = self._calendar.last_sessions(start, LOOKBACK_SESSIONS)[0]
         if not await self._fetched("assets", "all"):
             fetched = await self._source.assets(status=None)
@@ -194,6 +210,35 @@ class BacktestData:
             )
             have |= {s: fetched.get(s, []) for s in missing}
         return have
+
+    async def tape(self, symbol: str, minute: datetime, *, fetch: bool) -> list[SipTrade] | None:
+        """The SIP prints of one trigger minute (D-057): from the cache, or fetched and cached
+        first when ``fetch`` (``trader backtest --tape``). None when not cached and not fetched,
+        or when Alpaca refuses: the pessimistic fallback applies."""
+        key = fmt_iso(minute)
+        row = await self.cache.fetch_one(
+            "SELECT prints_json FROM bt_tape WHERE symbol = ? AND minute = ?", (symbol, key)
+        )
+        if row is not None:
+            return _prints_from_json(symbol, row["prints_json"])
+        if not fetch:
+            return None
+        try:
+            found = await self._source.trades(
+                [symbol], minute, minute + timedelta(minutes=1), feed="sip", asof="-"
+            )
+        except AlpacaError as exc:
+            log.warning("trigger minute tape refused", symbol=symbol, minute=key, error=str(exc))
+            return None
+        finally:
+            self.requests += 1
+        prints = found.get(symbol, [])
+        text = _prints_json(prints)
+        await self.cache.execute(
+            "INSERT OR REPLACE INTO bt_tape (symbol, minute, prints_json) VALUES (?, ?, ?)",
+            (symbol, key, text),
+        )
+        return prints
 
     # ---------------------------------------------------------------- serving the view
 
@@ -458,6 +503,20 @@ def _bars_json(bars: Sequence[Bar]) -> str:
         [[b.ts.isoformat(), str(b.open), str(b.high), str(b.low), str(b.close), b.volume]
          for b in bars]
     )  # fmt: skip
+
+
+def _prints_json(prints: Sequence[SipTrade]) -> str:
+    return json.dumps(
+        [[p.ts.isoformat(), str(p.price), p.size, list(p.conditions), p.update] for p in prints]
+    )
+
+
+def _prints_from_json(symbol: str, text: str) -> list[SipTrade]:
+    return [
+        SipTrade(symbol=symbol, ts=parse_et_iso(ts), price=Decimal(price), size=int(size),
+                 conditions=tuple(conditions), update=update)
+        for ts, price, size, conditions, update in json.loads(text)
+    ]  # fmt: skip
 
 
 def _bars_from_json(text: str) -> list[Bar]:

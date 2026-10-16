@@ -31,7 +31,9 @@ async def journal(tmp_path: Path) -> AsyncIterator[Journal]:
     )
     # A 39-share entry filled in two parts: 20 @ 12.73, then 19 @ 12.74.
     await order(opened, "A-20261013-XYZ-entry-1", "e1", "buy", 39, signal=SID, stop="12.64")
-    await fill(opened, "e1", "buy", 20, "12.73", at(9, 40, 1.5), cumulative=20)
+    # Alpaca stamped the first fill 09:40:01.5; the PC, 0.2 s behind, booked it at 01.3.
+    await fill(opened, "e1", "buy", 20, "12.73", at(9, 40, 1.5), cumulative=20,
+               booked=at(9, 40, 1.3))  # fmt: skip
     await fill(opened, "e1", "buy", 19, "12.74", at(9, 40, 2), cumulative=39)
     yield opened
     await opened.aclose()
@@ -48,13 +50,20 @@ async def order(journal: Journal, cid: str, oid: str, side: str, qty: int, *, si
 
 
 async def fill(journal: Journal, oid: str, side: str, qty: int, price: str, when: str, *,
-               cumulative: int, fee: str | None = None) -> None:  # fmt: skip
+               cumulative: int, fee: str | None = None,
+               booked: str | None = None) -> None:  # fmt: skip
     fill_id = f"{oid}:{cumulative}"
     await journal.execute(
         "INSERT INTO fills (id, broker_order_id, book, symbol, side, qty, price, filled_at) "
         "VALUES (?, ?, 'A', 'XYZ', ?, ?, ?, ?)",
         (fill_id, oid, side, qty, price, when),
     )
+    if booked:  # the fill's ledger row, written on the PC clock when the fill was booked
+        await journal.execute(
+            "INSERT INTO ledger_entries (book, kind, symbol, amount, trade_date, settle_date, ref, "
+            "created_at) VALUES ('A', ?, 'XYZ', ?, ?, '2026-10-14', ?, ?)",
+            (side, str(-qty * Decimal(price)), DAY.isoformat(), f"fill:{fill_id}", booked),
+        )
     if fee:
         await journal.execute(
             "INSERT INTO ledger_entries (book, kind, symbol, amount, trade_date, settle_date, ref) "
@@ -75,7 +84,26 @@ async def test_a_stop_leg_exit(journal: Journal) -> None:
     assert trade.pnl == 39 * (D("12.63") - ENTRY)
     assert trade.r_multiple == pytest.approx(float((D("12.63") - ENTRY) / (ENTRY - D("12.64"))))
     assert trade.entry_slippage == ENTRY - D("12.72")
-    assert trade.entry_delay_ms == 1_500  # 09:40:00 trigger -> 09:40:01.5 first fill
+    assert trade.entry_delay_ms == 1_300  # trigger 09:40:00 to booked 01.3, both on the PC
+
+
+async def test_a_fill_caught_up_after_a_restart_has_no_entry_delay(journal: Journal) -> None:
+    """Booked two minutes after Alpaca filled it, the fill was found by a restart: the delay
+    would measure the outage, so it is unknown (review, D-055)."""
+    await journal.execute(
+        "UPDATE ledger_entries SET created_at = ? WHERE ref = 'fill:e1:20'", (at(9, 42, 1.5),)
+    )
+    (trade,) = await write_trades(journal, "A", DAY)
+    assert trade.entry_delay_ms is None
+
+
+async def test_a_fill_booked_a_few_seconds_late_still_has_its_delay(journal: Journal) -> None:
+    """A slow stream or one missed poll, within LIVE_BOOKING_MAX_S of Alpaca's time."""
+    await journal.execute(
+        "UPDATE ledger_entries SET created_at = ? WHERE ref = 'fill:e1:20'", (at(9, 40, 6),)
+    )
+    (trade,) = await write_trades(journal, "A", DAY)
+    assert trade.entry_delay_ms == 6_000
 
 
 async def test_the_sell_with_the_most_shares_names_the_reason(journal: Journal) -> None:

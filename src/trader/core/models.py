@@ -65,6 +65,14 @@ class Trade(_Frozen):
     conditions: tuple[str, ...] = ()
 
 
+class SipTrade(Trade):
+    """A historical print from the consolidated tape (``GET /v2/stocks/trades``). ``update``
+    is Alpaca's ``u``: ``canceled`` and ``incorrect`` prints are void; ``corrected`` is the
+    valid replacement of an incorrect one (D-057)."""
+
+    update: str | None = None
+
+
 class Quote(_Frozen):
     symbol: str
     ts: datetime

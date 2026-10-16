@@ -5,8 +5,10 @@ Per book, in order:
 2. **decisions:** ``finalize_decisions`` (``entry_unfilled``/``broker_rejected``), and
    ``restart_lost`` for a trigger the book never decided;
 3. **trades:** rebuild the day's trades;
-4. **stats:** the ``daily_stats`` row;
-5. **breakers:** the cash check, the drawdown breaker and the losing streak.
+4. **fees:** book the fees the broker charged lately (D-055), when the day's capabilities say so;
+5. **stats:** the ``daily_stats`` row;
+6. **breakers:** the cash check (its residual is stored), the drawdown breaker and the losing
+   streak.
 
 Each step is marked done in ``day_runs`` and a restart skips it. The first four are idempotent
 anyway; the markers matter for the breakers, which must count a day once.
@@ -18,7 +20,6 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
-from typing import Literal
 
 import structlog
 
@@ -26,13 +27,14 @@ from trader.books.base import finalize_decisions, record_skips
 from trader.config import BookName, RiskConfig
 from trader.core.clock import ET, Clock, fmt_iso
 from trader.core.models import FeatureValue
-from trader.execution.broker import BrokerAdapter
+from trader.execution.broker import BrokerAdapter, BrokerError
 from trader.execution.reconcile import Reconciler
 from trader.execution.records import Records
 from trader.execution.service import PriceSource
 from trader.memory.incidents import Severity, record_incident
 from trader.memory.journal import Journal, db_to_dec, dec_to_db
 from trader.memory.trades import write_trades
+from trader.orchestrator.capabilities import FEES
 from trader.risk.breakers import (
     BookStats,
     HaltReason,
@@ -41,7 +43,13 @@ from trader.risk.breakers import (
     drawdown_pct,
     losing_streak_breached,
 )
-from trader.risk.ledger import cash, eod_check, read_entries
+from trader.risk.ledger import (
+    SettlementLedger,
+    cash,
+    eod_check,
+    read_entries,
+    start_of_day_cash,
+)
 from trader.strategy.orb_sip import load_signals
 
 log = structlog.get_logger(__name__)
@@ -108,7 +116,6 @@ class BookClose:
     book: BookName
     broker: BrokerAdapter
     records: Records
-    equity_sod: Decimal
     max_drawdown: Decimal | None  # marked, in $, from the heartbeat; None if none sampled
 
 
@@ -118,15 +125,15 @@ class EodContext:
     clock: Clock
     day: date
     risk: RiskConfig
-    mode: Literal["paper", "live"]
     halts: Halts
     stats: BookStats
     prices: PriceSource
     regime: Mapping[str, FeatureValue]
+    capabilities: frozenset[str] = frozenset()  # what the day's engine does (capabilities.py)
 
 
 async def close_book(ctx: EodContext, b: BookClose) -> None:
-    """Run the book's five EOD steps, skipping those already done today."""
+    """Run the book's EOD steps, skipping those already done today."""
     name = b.book
     await once(ctx.journal, ctx.clock, ctx.day, f"reconcile:{name}", lambda: _reconcile(ctx, b))
     await once(ctx.journal, ctx.clock, ctx.day, f"decisions:{name}", lambda: _decisions(ctx, b))
@@ -137,6 +144,8 @@ async def close_book(ctx: EodContext, b: BookClose) -> None:
         f"trades:{name}",
         lambda: write_trades(ctx.journal, name, ctx.day),
     )
+    if FEES in ctx.capabilities:
+        await once(ctx.journal, ctx.clock, ctx.day, f"fees:{name}", lambda: _fees(ctx, b))
     await once(ctx.journal, ctx.clock, ctx.day, f"stats:{name}", lambda: _stats(ctx, b))
     await once(ctx.journal, ctx.clock, ctx.day, f"breakers:{name}", lambda: _breakers(ctx, b))
 
@@ -170,13 +179,29 @@ async def _decisions(ctx: EodContext, b: BookClose) -> None:
         )
 
 
+async def _fees(ctx: EodContext, b: BookClose) -> None:
+    """Book what the broker charged lately (D-055), so the cash check compares like with like.
+    Fees that can't be read now are booked by a later boot or EOD."""
+    try:
+        rows = await SettlementLedger(ctx.journal, b.book, ctx.clock).book_posted_fees(b.broker)
+    except BrokerError as exc:
+        await _incident(ctx, "P3", "fees_unavailable", f"Book {b.book}: fees not read: {exc}")
+        return
+    if rows:
+        net = sum((r.amount for r in rows), Decimal(0))
+        log.info("fees booked", book=b.book, rows=len(rows), net=str(net))
+
+
 async def _stats(ctx: EodContext, b: BookClose) -> None:
+    """The day's row. Its start is the ledger's start of day after the fees step, not boot's
+    E: a charge booked since boot paid earlier trades, so it stays out of today's pnl (D-055)."""
     entries = await ctx.journal.read(lambda conn: read_entries(conn, b.book))
     marked = Decimal(0)
     for position in await b.broker.positions():
         if position.qty:
             last = ctx.prices.last_price(position.symbol) or position.current_price
             marked += position.qty * (last or position.avg_entry_price)
+    start_equity = start_of_day_cash(entries, ctx.day)
     end_equity = cash(entries) + marked
     day = ctx.day.isoformat()
 
@@ -196,9 +221,9 @@ async def _stats(ctx: EodContext, b: BookClose) -> None:
             (
                 day,
                 b.book,
-                dec_to_db(b.equity_sod),
+                dec_to_db(start_equity),
                 dec_to_db(end_equity),
-                dec_to_db(end_equity - b.equity_sod),
+                dec_to_db(end_equity - start_equity),
                 count,
                 triggered,
                 trades,
@@ -224,15 +249,20 @@ async def _breakers(ctx: EodContext, b: BookClose) -> None:
     pnl = db_to_dec(row["pnl"]) or Decimal(0)
     entries = await ctx.journal.read(lambda conn: read_entries(conn, b.book))
     broker_cash = (await b.broker.account()).cash
-    checked = eod_check(
-        entries, broker_cash, mode=ctx.mode, tolerance=ctx.risk.reconcile_cash_tolerance
+    tolerance = ctx.risk.reconcile_cash_tolerance
+    checked = eod_check(entries, broker_cash, day=ctx.day, tolerance=tolerance)
+    await ctx.journal.execute(
+        "UPDATE daily_stats SET cash_residual = ? WHERE date = ? AND book = ?",
+        (dec_to_db(checked.difference), ctx.day.isoformat(), b.book),
+    )
+    compared = (
+        f"Book {b.book}: broker cash {checked.broker_cash} vs ledger {checked.ledger_cash} "
+        f"(difference {checked.difference})"
     )
     if not checked.ok:
-        message = (
-            f"Book {b.book}: broker cash {checked.broker_cash} vs ledger {checked.ledger_cash} "
-            f"(difference {checked.difference})"
-        )
-        await _halt(ctx, b.book, "cash_mismatch", message)
+        await _halt(ctx, b.book, "cash_mismatch", compared)
+    elif abs(checked.difference) > tolerance / 2:
+        await _incident(ctx, "P3", "cash_drift", f"{compared}: over half the tolerance {tolerance}")
     peak = await ctx.stats.raise_peak(b.book, end_equity)
     if drawdown_breached(peak, end_equity, ctx.risk.drawdown_breaker_pct):
         pct = drawdown_pct(peak, end_equity).quantize(Decimal("0.01"))
@@ -240,7 +270,16 @@ async def _breakers(ctx: EodContext, b: BookClose) -> None:
     streak = await ctx.stats.record_day(b.book, ctx.day, pnl, traded=row["n_trades"] > 0)
     if losing_streak_breached(streak, ctx.risk.consecutive_losing_days_breaker):
         await _halt(ctx, b.book, "losing_streak", f"Book {b.book}: {streak} losing sessions")
-    log.info("eod breakers", book=b.book, cash_ok=checked.ok, peak=str(peak), streak=streak)
+    log.info(
+        "eod breakers",
+        book=b.book,
+        cash_ok=checked.ok,
+        broker_cash=str(checked.broker_cash),
+        ledger_cash=str(checked.ledger_cash),
+        residual=str(checked.difference),
+        peak=str(peak),
+        streak=streak,
+    )
 
 
 async def _halt(ctx: EodContext, book: BookName, reason: HaltReason, message: str) -> None:

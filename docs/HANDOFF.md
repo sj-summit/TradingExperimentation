@@ -1,37 +1,52 @@
-# HANDOFF: G3 passed (run 2, 2026-10-14); next, two plans for the human (updated 2026-10-14, evening)
+# HANDOFF: Phase 4 under way; P4.0a and P4.0b done, P4.0c's code done (updated 2026-10-15)
 
 **Latest:**
-- **G3 passed on run 2 (D-054).** The run reached DONE with no P1, Book A was flat from 10:14, the report and journal were written, and `trader replay` matches.
-  - **The day:** 4 entries. VRNS and KBH didn't fill; BWA and FAST stopped out. Net −$4.21.
-  - **D-053 at the open:**
-    - VRNS waited 12.1 s for acceptance, and its cancel went 10.5 s after it, never during `pending_new`.
-    - FAST's partial fill was bare 1.04 s, which gave the expected P3.
-  - **Not yet exercised live:** the 20 s partial-fill allowance, re-sends, `cancel rejected`, `entry_stuck`, and a flatten with a position open.
-  - **The human's last check:** `uv run trader doctor --quick` should show Book A with `0 positions, 0 orders`. The recording already shows it flat at 16:05.
-- **Commits:**
-  - `cc6eb60` is the D-052/D-053 tree, exactly what ran.
-  - Uncommitted: D-054, the golden replay test and fixture, and these PLAN and HANDOFF updates. Commit only if asked.
-- **Golden replay:**
-  - The fixture is `tests/golden/recordings/2026-10-14/` (3.3 MB): the stream is trimmed to every trade plus at most one quote per symbol every 10 s.
-  - Rebuilder: `tests/fixtures/g3_day.py`. Pinned journal: `tests/golden/g3_2026-10-14.json`.
-  - The test is `test_the_g3_day_replays_as_it_was_recorded` (22 s). 715 tests pass.
-- **Next** (Claude, in plan mode; the human approves each plan):
-  1. **D-054's minor fixes:**
-     - the paper fee check, before about session 15;
-     - stuck-exit timing from our own send;
-     - stale marks from the broker's price;
-     - `entry_delay_ms` on one clock, plus a periodic skew reading;
-     - the skip-reason order;
-     - the polling budget;
-     - a dirty-tree flag in `boot.json`;
-     - small log and report items.
-  2. **The shadow entry on gap-through trigger bars, together with the trigger-minute rule.** The human chose to decide them together.
-     - Compare bar-open entry with resolving from the SIP trade tape, with backtest numbers for each; the human picks.
-     - Then restate D-042's shadow numbers and H4.
-  - **Timing:** Phase 3's done-when list is met, since D-042 already notes H4's direction. Both plans must land before G4b, Phase 4's first live session, because Book B's veto value and the review are judged on shadow outcomes. Neither blocks Phase 4's coding.
-  - **Still pending:** H0.2 (the Claude token, needed for G4a) and Q2 (14 symbols didn't reach the limit).
+- **Phase 4's plan is approved** (2026-10-14; `C:\Users\Admin\.claude\plans\squishy-popping-honey.md`). Order: P4.0a, P4.0b, P4.0c, P4.1–P4.6, 🛑 G4a, P4.7–P4.10, 🛑 G4b.
+- **P4.0a is done (D-055), uncommitted.**
+  - Fees are booked from Alpaca's FEE activities, at boot (before E) and at EOD. The EOD cash check is the same in paper and live, and stores its residual.
+  - D-054's fixes:
+    - #2: stuck-exit timing runs from our own send;
+    - #3: stale marks use the broker's price;
+    - #4: entry delay is on the PC clock, plus an hourly skew reading;
+    - #7: `boot.json` names the source by hash and lists the engine's capabilities.
+  - An adversarial review, and a second pass on its fixes, found 2 major and 12 minor problems; all are fixed, each with a test that fails without its fix. 763 tests pass.
+- **P4.0b is done (D-056), uncommitted.**
+  - A size skip is named by R-006 or R-007 when one also binds (labels only; G3's STT now reads `capacity_entries`, pinned as `g3_day.CODE_CHANGES`).
+  - Order submits, cancels and sells go ahead of polls in the rate limiter, and polls leave it 4 tokens; a working entry is read every 2 s, so two working entries make 120 calls a minute, not 240.
+  - Its review found no blocker; the five minor findings are fixed and tested. 784 tests pass.
+- **P4.0c's code is done (D-057), uncommitted; the task stays open for the restatement.**
+  - Shadow outcomes enter at max(trigger, the trigger minute's open), so gap-throughs are fixed (CRWG: +3.07R, not +5.08R).
+  - A trigger minute that opened below the trigger, touched the stop and closed above it is read from the SIP trade tape: live at 16:12 (one request each, capability `shadow_tape`) and in the backtest (`--tape`, cached in `bt_tape`).
+  - Its review found no blocker; every finding is fixed, including a look-ahead in cached backtest reruns that predated it. 799 tests pass.
+- **The fee probe is done (D-058).**
+  - Paper lists each trading day's CAT and REG charges, dated the trade day and posted that evening (20:05 and 20:15 ET).
+  - A dry run on a copy of the journal books 6 charges and 3 reversals, with a $0.00 residual against the broker's $996.08.
+- **Commits:** HEAD is `0226783` (Phase 3 done). Everything since is uncommitted. Commit only if asked.
+- **Waiting on the human:**
+  - **Now: the SIP-tape fetch,** `uv run trader backtest --start 2026-04-01 --end 2026-10-09 --tape`, after 16:30 ET or on a non-trading day.
+    - Between 09:00 and 16:30 ET on a trading day it refuses, as it did on 10-15 at 14:09.
+    - `--force` overrides it. That is safe only while no `run-day` is running, since the guard keeps a live session's share of the data rate limit.
+    - About 605 data requests, a few minutes. It ends by printing the report's path; paste the console output. I then restate D-042's numbers and H4 from the cache.
+  - **Before G4a:** H0.2 (Claude Code ≥ 2.1.268, `claude setup-token`, the token in `.env`).
+  - **Before G4b:** the Phase 1 checks (`trader news`, `trader filings`, `trader stream --news`) and the `ALPACA_DATA_*` keys.
+  - `run-day` isn't needed between gates: it stays a human gate until Phase 6.
+- **Next (Claude):** after the tape fetch, the D-042/H4 restatement closes P4.0c; then P4.1 (schemas).
+- **New since G3, for the G4b runbook:**
+  - **Log lines:**
+    - `fees booked`, at boot and EOD. The first boot after 10-15 should book 10-12 to 10-14's 6 charges and 3 reversals (net $0.00), leaving E at $996.08 if no day trades before it;
+    - `clock checked`, every hour;
+    - `entry cancel sent`, with why;
+    - `position opened`, `position closed` and `flatten pass`.
+  - **A P2 `clock_skew ... (hourly check)`** alerts only, and arms or disarms nothing.
+  - **New P3s:**
+    - `fees_unavailable`: fees weren't read, so a later boot or EOD books them;
+    - `cash_drift`: the EOD residual is over half the $1 tolerance;
+    - `shadow_tape_unresolved`: an ambiguous trigger minute's tape couldn't be read or settle it, so it was counted as stopped.
+  - **At 16:12 the shadow job also reads one SIP trade tape per ambiguous trigger minute** (usually a handful).
+  - **`--dry-run` prints the ledger's E before the fees are booked,** so it can differ by a few cents from the E boot uses.
+  - **A size skip reads `capacity_positions` or `capacity_entries`** when R-006 or R-007 also binds (D-056), where it used to read `insufficient_settled_cash`.
 
-To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, and D-052 to D-054. The G3 runbook below served both runs and is the template for G4b. Everything below the line further down is the older G2 handoff, kept for its environment notes and the Phase 2 code map.
+To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, the Phase 4 plan, and D-052 to D-055. The G3 runbook below served both runs and is the template for G4b. Everything below the line further down is the older G2 handoff, kept for its environment notes and the Phase 2 code map.
 
 ## Where Phase 3 stands
 
@@ -48,7 +63,7 @@ To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, and
 - **P3.9 (backtest) is done.** It ran 2026-04-01 to 2026-10-09; the results are at the end of D-042.
   - **Book A:** −20.2%; longs average −0.31R.
   - **But:** the shadow R for longs lies between −0.31 and +0.14 depending on how a trigger minute that touched both trigger and stop is read. The approved rule is the pessimistic end.
-  - **Waiting on the human:** whether to resolve it from the SIP trade tape.
+  - **Waiting on the human:** whether to resolve it from the SIP trade tape. (Decided 2026-10-14: yes, Phase 4's P4.0c, D-057.)
   - **Other fixes found by the run:** placeholder symbols are now filtered out (D-050). The cache (`runtime/backtest/cache.db`) makes reruns free.
 - **P3.8b is done (D-049).**
   - `trader replay --date D` replays a recorded day into `runtime/replay/<date>/`. It exits 1 on any divergence or difference from the journal.

@@ -1,13 +1,20 @@
 """Shadow-outcome simulation (S§7.2, P3.6a; DECISIONS D-041), on hand-computed paths."""
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
 import pytest
 
 from trader.core.clock import ET
-from trader.core.models import Bar
-from trader.memory.shadow import ShadowParams, simulate_long, simulate_short, slippage
+from trader.core.models import Bar, SipTrade
+from trader.memory.shadow import (
+    ShadowParams,
+    ambiguous,
+    resolve_trigger_minute,
+    simulate_long,
+    simulate_short,
+    slippage,
+)
 
 D = Decimal
 DAY = date(2026, 10, 13)
@@ -46,6 +53,7 @@ def test_a_stop_in_the_trigger_minute_exits_at_the_stop_even_from_an_open_below_
                         stop=D("9.90"), window_start=WINDOW, last_entry=LAST, flatten_at=FLAT,
                         params=PARAMS)  # fmt: skip
     assert (out.exit_reason, out.entry_price, out.exit_price) == ("stop", ENTRY, D("9.89"))
+    assert out.trigger_resolution == "fallback"  # ambiguous, and no tape was read (D-057)
     assert out.shadow_r == pytest.approx(r("9.89"))  # -1.089
     assert out.mfe_r == pytest.approx(r("10.05"))  # the whole trigger bar counts
     assert out.mae_r == pytest.approx(r("9.80"))
@@ -115,16 +123,91 @@ def test_no_bars_is_no_data() -> None:
     assert out.exit_reason == "no_data"
 
 
-def test_the_backtest_can_enter_at_a_gapped_open() -> None:
-    bars = [
-        m("09:36", "10.05", "10.10", "10.01", "10.08"),
-        m("15:55", "10.20", "10.2", "10.2", "10.2"),
+def test_a_gap_through_enters_at_the_open_and_a_touch_stops_it() -> None:
+    """D-057 (D-054's CRWG): a minute that opened past the trigger filled at its open."""
+    flat = m("15:55", "10.20", "10.2", "10.2", "10.2")
+    gapped = long([m("09:36", "10.05", "10.10", "10.01", "10.08"), flat])
+    assert (gapped.entry_price, gapped.trigger_bar_open) == (D("10.062"), D("10.05"))  # type: ignore[attr-defined]
+    assert gapped.trigger_resolution == "bars"  # type: ignore[attr-defined]
+    # The open came first, so a touch of the stop in that minute came after the entry.
+    touched = long([m("09:36", "10.05", "10.10", "9.85", "9.95"), flat])
+    assert (touched.exit_reason, touched.exit_price) == ("stop", D("9.89"))  # type: ignore[attr-defined]
+    assert touched.trigger_resolution == "bars"  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------- the trigger minute's tape
+
+
+def p(ss: float, price: str, *, cond: tuple[str, ...] = ("@",), u: str | None = None) -> SipTrade:
+    ts = datetime.combine(DAY, time(9, 40), ET) + timedelta(seconds=ss)
+    return SipTrade(symbol="XYZ", ts=ts, price=D(price), size=100, conditions=cond, update=u)
+
+
+AMBIGUOUS = m("09:40", "9.95", "10.05", "9.85", "9.97")  # opened short, touched, closed safe
+LATER = [m("09:41", "10.00", "10.10", "9.95", "10.05"), m("15:55", "10.30", "10.3", "10.3", "10.3")]
+
+
+def test_which_trigger_minutes_bars_cant_order() -> None:
+    def it(bar: Bar) -> bool:
+        return ambiguous(bar, sign=1, trigger=D("10.00"), stop=D("9.90"))
+
+    assert it(AMBIGUOUS)
+    assert not it(m("09:40", "10.00", "10.05", "9.85", "9.97"))  # opened at the trigger
+    assert not it(m("09:40", "9.95", "10.05", "9.85", "9.90"))  # closed at the stop
+    assert not it(m("09:40", "9.95", "10.05", "9.91", "9.97"))  # never touched the stop
+
+    def short_it(bar: Bar) -> bool:  # trigger 9.50, stop 9.60
+        return ambiguous(bar, sign=-1, trigger=D("9.50"), stop=D("9.60"))
+
+    assert short_it(m("09:40", "9.55", "9.65", "9.45", "9.52"))
+    assert not short_it(m("09:40", "9.50", "9.65", "9.45", "9.52"))  # opened at the trigger
+    assert not short_it(m("09:40", "9.55", "9.65", "9.45", "9.60"))  # closed at the stop
+    assert not short_it(m("09:40", "9.55", "9.59", "9.45", "9.52"))  # never touched the stop
+
+
+def test_an_ambiguous_minute_entered_then_stopped() -> None:
+    tape = [p(1, "9.95"), p(10, "10.01"), p(30, "9.88"), p(55, "10.05")]
+    out = long([AMBIGUOUS, *LATER], tape=tape)
+    assert (out.exit_reason, out.exit_price) == ("stop", D("9.87"))  # type: ignore[attr-defined]  # min(9.90, 9.88) - 0.01
+    assert out.trigger_resolution == "tape"  # type: ignore[attr-defined]
+    # Only the prints it held count: 10.01 at best, not the bar's high nor 10.05 after the exit.
+    assert out.mfe_r == pytest.approx(r("10.01"))  # type: ignore[attr-defined]
+    assert out.mae_r == pytest.approx(r("9.87"))  # type: ignore[attr-defined]  # the exit
+
+
+def test_an_ambiguous_minute_whose_stop_came_first_is_not_stopped() -> None:
+    tape = [p(1, "9.95"), p(10, "9.88"), p(30, "10.02"), p(50, "9.97")]
+    out = long([AMBIGUOUS, *LATER], tape=tape)
+    assert (out.exit_reason, out.exit_price) == ("flatten", D("10.30"))  # type: ignore[attr-defined]
+    assert out.trigger_resolution == "tape"  # type: ignore[attr-defined]
+    assert out.entry_price == ENTRY  # type: ignore[attr-defined]  # it opened below: at the trigger
+    assert out.tape_entry == D("10.02")  # type: ignore[attr-defined]  # the first print past it
+    # The touch at 9.88 came before the entry: the worst it saw held was 09:41's 9.95.
+    assert out.mae_r == pytest.approx(r("9.95"))  # type: ignore[attr-defined]
+    assert out.mfe_r == pytest.approx(r("10.30"))  # type: ignore[attr-defined]  # the exit
+
+
+def test_void_and_odd_lot_prints_never_order_the_minute() -> None:
+    tape = [
+        p(1, "10.01", u="canceled"),  # never happened as printed
+        p(2, "10.02", cond=("@", "I")),  # an odd lot sets no price (D-043)
+        p(10, "9.88"),  # so the stop came first...
+        p(30, "10.01", u="corrected"),  # ...and this valid correction is the entry
+        p(50, "9.97"),
     ]
-    kw = {"trigger": D("10.00"), "stop": D("9.90"), "window_start": WINDOW, "last_entry": LAST,
-          "flatten_at": FLAT, "params": PARAMS}  # fmt: skip
-    assert simulate_long(bars, **kw).entry_price == ENTRY  # type: ignore[arg-type]
-    gapped = simulate_long(bars, entry_mode="bar_open", **kw)  # type: ignore[arg-type]
-    assert (gapped.entry_price, gapped.trigger_bar_open) == (D("10.062"), D("10.05"))
+    out = long([AMBIGUOUS, *LATER], tape=tape)
+    assert (out.exit_reason, out.trigger_resolution) == ("flatten", "tape")  # type: ignore[attr-defined]
+    voided = long([AMBIGUOUS, *LATER], tape=[*tape, p(55, "9.89", u="incorrect")])
+    assert voided.exit_reason == "flatten"  # type: ignore[attr-defined]  # a void print can't stop it
+
+
+def test_a_tape_with_no_print_at_the_trigger_falls_back() -> None:
+    out = long([AMBIGUOUS, *LATER], tape=[p(1, "9.95"), p(10, "9.88"), p(50, "9.97")])
+    assert (out.exit_reason, out.exit_price) == ("stop", D("9.89"))  # type: ignore[attr-defined]
+    assert out.trigger_resolution == "fallback"  # type: ignore[attr-defined]
+    assert resolve_trigger_minute([], sign=1, trigger=D("10.00"), stop=D("9.90")) is None
+    outside = [p(-5, "10.01"), p(60, "10.01")]  # the minutes either side, 09:41:00.000 included
+    assert long([AMBIGUOUS, *LATER], tape=outside).trigger_resolution == "fallback"  # type: ignore[attr-defined]
 
 
 def test_an_early_close_flattens_at_its_own_minute() -> None:
@@ -163,3 +246,29 @@ def test_a_shadow_short_mirrors_the_rules() -> None:
         [m("09:40", "9.52", "9.55", "9.45", "9.48"), m("09:41", "9.70", "9.75", "9.6", "9.7")]
     )
     assert later.exit_price == D("9.71")  # type: ignore[attr-defined]  # max(open 9.70, stop) + 0.01
+
+
+def test_a_shadow_shorts_trigger_minute_mirrors_the_tape_rule() -> None:
+    bar = m("09:40", "9.55", "9.65", "9.45", "9.52")  # opened above, touched 9.60, closed below
+    rest = [m("15:55", "9.30", "9.31", "9.2", "9.2")]
+
+    def run(bars: list[Bar], tape: list[SipTrade] | None = None) -> object:
+        return simulate_short(
+            bars,
+            trigger=D("9.50"),
+            stop=D("9.60"),
+            window_start=WINDOW,
+            last_entry=LAST,
+            flatten_at=FLAT,
+            params=PARAMS,
+            tape=tape,
+        )
+
+    entered_first = [p(1, "9.55"), p(10, "9.49"), p(30, "9.62"), p(50, "9.52")]
+    out = run([bar, *rest], entered_first)
+    assert (out.exit_reason, out.exit_price) == ("stop", D("9.63"))  # type: ignore[attr-defined]
+    assert out.trigger_resolution == "tape"  # type: ignore[attr-defined]
+    stop_first = [p(1, "9.55"), p(10, "9.62"), p(30, "9.49"), p(50, "9.52")]
+    assert (run([bar, *rest], stop_first).exit_reason) == "flatten"  # type: ignore[attr-defined]
+    gap = run([m("09:40", "9.45", "9.48", "9.40", "9.42"), *rest])
+    assert gap.entry_price == D("9.45") - D("0.0119")  # type: ignore[attr-defined]  # opened below

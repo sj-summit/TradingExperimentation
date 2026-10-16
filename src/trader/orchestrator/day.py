@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import dataclasses
 import json
+import sqlite3
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
@@ -34,7 +35,7 @@ from trader.core.events import Event
 from trader.core.models import Asset, Signal, Snapshot, TriggerEvent
 from trader.data.recorder import BOOT_FILE, Recorder
 from trader.data.stream import MarketEvent
-from trader.execution.broker import BrokerAdapter
+from trader.execution.broker import BrokerAdapter, BrokerError
 from trader.execution.reconcile import Reconciler
 from trader.execution.records import Records, read_book_day
 from trader.execution.service import ExecutionService, FlattenResult, TradingDay
@@ -43,6 +44,7 @@ from trader.memory.journal import Journal
 from trader.memory.regime import RegimeTags, ensure_regime, load_regime, signal_features
 from trader.memory.shadow import ShadowParams, compute_shadow
 from trader.notify import Notifier, pump_alerts
+from trader.orchestrator.capabilities import CURRENT, FEES, SHADOW_TAPE, SKEW_HOURLY
 from trader.orchestrator.eod import (
     BookClose,
     EodContext,
@@ -96,6 +98,7 @@ class Cadence:
     flatten_retry_s: float = 5.0
     connect_timeout_s: float = 15.0
     unexplained_flatten_after_open_s: float = 5.0  # A§3: 09:30:05
+    skew_check_s: float = 3600.0  # the hourly clock reading (D-055)
 
 
 @dataclass(frozen=True)
@@ -124,6 +127,7 @@ class DayDeps:
     at_close: tuple[Callable[[], None], ...] = ()  # e.g. SimBroker.expire_day_orders
     boot_info: Mapping[str, Any] = field(default_factory=dict)  # config hashes, git SHA
     cadence: Cadence = Cadence()
+    capabilities: frozenset[str] = CURRENT  # a replay grants only its recording's (D-055)
 
 
 @dataclass(frozen=True)
@@ -165,6 +169,7 @@ class DayOrchestrator:
         self._regime: RegimeTags | None = None
         self._assets: dict[str, Asset] = {}
         self._skew = False
+        self._skew_alerted = False
         self._failed: list[State] = []  # states after the flatten that raised (D-051)
         self._inputs: LiveInputs | None = None
         self._heartbeat: Heartbeat | None = None
@@ -213,9 +218,13 @@ class DayOrchestrator:
                     await self._incident("P2", "state_failed", f"{self.state} failed")
                     self._failed.append(self.state)
             if self._failed:  # not DONE: run-day again today redoes only the unfinished steps
+                await self._backup()
                 note = f"{', '.join(self._failed)} failed: run run-day again today to finish"
                 return DayOutcome(self.day, self.state, note)
             await self._enter("DONE")
+            if self._heartbeat is not None:
+                await self._heartbeat.beat()  # the last heartbeat says DONE
+            await self._backup()  # after DONE is journaled, so the copy holds the whole day
             return DayOutcome(self.day, "DONE")
         finally:
             await self._shutdown()
@@ -294,6 +303,8 @@ class DayOrchestrator:
         self._spawn(every(self._clock, cadence.heartbeat_s, self._heartbeat.beat, name="heartbeat"))
         self._spawn(every(self._clock, cadence.pump_s, self._pump, name="alerts"))
         self._spawn(every(self._clock, cadence.stale_check_s, stale.check, name="staleness"))
+        if SKEW_HOURLY in d.capabilities:
+            self._spawn(self._hourly_skew())
         await d.hub.start()
         if not await d.hub.wait_connected(cadence.connect_timeout_s):
             await self._incident("P2", "stream_unavailable", "market data stream not connected")
@@ -310,14 +321,45 @@ class DayOrchestrator:
             await self._incident(
                 "P2", "clock_skew", f"clock not verified: {type(exc).__name__}; {then}"
             )
+            self._skew_alerted = True
             return True
         if abs(skew) <= MAX_CLOCK_SKEW_S:
             log.info("clock checked", skew_s=round(skew, 3))
+            self._skew_alerted = False
             return False
         await self._incident(
             "P2", "clock_skew", f"system clock is {skew:+.1f} s from Alpaca's: {then}"
         )
+        self._skew_alerted = True  # the hourly reading won't repeat it (D-055)
         return True
+
+    async def _hourly_skew(self) -> None:
+        """Read the skew every ``skew_check_s`` after boot's reading (D-055): the PC's clock
+        drifts tenths of a second over a session, and Windows can step it."""
+        period = self._d.cadence.skew_check_s
+        await self._clock.sleep_until(self._clock.now() + timedelta(seconds=period))
+        await every(self._clock, period, self._read_skew, name="clock-skew")
+
+    async def _read_skew(self) -> None:
+        """One reading, journaled in ``day_runs``; past RISK.md §9's 2 s a P2, once per
+        episode. It only alerts: boot's check alone decides whether entries are armed."""
+        try:
+            skew = await self._measure_skew()
+        except Exception as exc:
+            log.warning("clock skew not read", error=f"{type(exc).__name__}: {exc}")
+            return
+        await self._journal.execute(
+            "INSERT INTO day_runs (date, kind, name, at, detail) VALUES (?, 'clock', 'skew', ?, ?)",
+            (self.day.isoformat(), fmt_iso(self._clock.now()), f"{skew:+.3f}"),
+        )
+        log.info("clock checked", skew_s=round(skew, 3))
+        if abs(skew) <= MAX_CLOCK_SKEW_S:
+            self._skew_alerted = False
+        elif not self._skew_alerted:
+            self._skew_alerted = True
+            await self._incident(
+                "P2", "clock_skew", f"system clock is {skew:+.1f} s from Alpaca's (hourly check)"
+            )
 
     async def _measure_skew(self) -> float:
         """Seconds between the system clock and Alpaca's. A reading's window includes the
@@ -373,6 +415,8 @@ class DayOrchestrator:
             except LedgerError as exc:
                 raise LedgerError(f"Book {name}: {exc}; flatten it first") from None
             log.info("ledger seeded", book=name, cash=str(account.cash))
+        if FEES in d.capabilities:
+            await self._book_fees(name, ledger, broker)
         equity_sod = start_of_day_cash(await ledger.entries(), self.day)
         await self._stats.raise_peak(name, equity_sod)
         service = ExecutionService(
@@ -409,6 +453,20 @@ class DayOrchestrator:
         )
         if unexplained:
             self._spawn(self._flatten_unexplained(self._books[name]))
+
+    async def _book_fees(
+        self, name: BookName, ledger: SettlementLedger, broker: BrokerAdapter
+    ) -> None:
+        """Book what the broker charged since the last session, before E is computed (D-055).
+        Fees that can't be read now are booked by EOD or the next boot."""
+        try:
+            rows = await ledger.book_posted_fees(broker)
+        except BrokerError as exc:
+            await self._incident("P3", "fees_unavailable", f"Book {name}: fees not read: {exc}")
+            return
+        if rows:
+            net = sum((r.amount for r in rows), Decimal(0))
+            log.info("fees booked", book=name, rows=len(rows), net=str(net))
 
     async def _boot_reconcile(self, name: BookName, broker: BrokerAdapter, records: Records) -> str:
         """Resolution 11: what today's journal explains (a restart) is adopted by the service;
@@ -488,12 +546,16 @@ class DayOrchestrator:
             return
         books: dict[str, Any] = {}
         for name, b in sorted(self._books.items()):
-            ledger = await SettlementLedger(self._journal, name, self._clock).entries()
+            settlement = SettlementLedger(self._journal, name, self._clock)
+            ledger = await settlement.entries()
+            seeded_at = await settlement.seeded_at()
             state = await self._journal.fetch_one(
                 "SELECT * FROM book_state WHERE book = ?", (name,)
             )
             books[name] = {
                 "ledger": [e.model_dump(mode="json") for e in ledger],
+                # fee booking skips what the seed paid, so a replay needs the time (D-055)
+                "seeded_at": None if seeded_at is None else fmt_iso(seeded_at),
                 "halts": [h.model_dump(mode="json") for h in await self._halts.active(name)],
                 "book_state": dict(zip(state.keys(), tuple(state), strict=True)) if state else None,
                 "broker_cash": str((await b.broker.account()).cash),
@@ -510,6 +572,7 @@ class DayOrchestrator:
             "regime": None if self._regime is None else dataclasses.asdict(self._regime),
             "books": books,
             "calendar": [s.model_dump(mode="json") for s in sessions],
+            "capabilities": sorted(self._d.capabilities),
             **self._d.boot_info,
         }
         path = recorder.dir / BOOT_FILE
@@ -842,11 +905,11 @@ class DayOrchestrator:
             clock=self._clock,
             day=self.day,
             risk=self._d.risk,
-            mode=self._d.settings.mode,
             halts=self._halts,
             stats=self._stats,
             prices=self._d.hub,
             regime=signal_features(self._regime, self.day, self._d.events),
+            capabilities=self._d.capabilities,
         )
         tracks = self._heartbeat.tracks if self._heartbeat is not None else {}
         # A run that started after the close sampled none of the session: unknown, not 0.
@@ -858,7 +921,6 @@ class DayOrchestrator:
                 book=name,
                 broker=b.broker,
                 records=b.records,
-                equity_sod=b.equity_sod,
                 max_drawdown=(track.max_drawdown if track else Decimal(0)) if sampled else None,
             )
             await self._close_book(ctx, close, until=until)
@@ -899,10 +961,18 @@ class DayOrchestrator:
             ),
             # From the journal, not the scan-time copies: they lack triggered_at (D-051).
             signals=await load_signals(self._journal, self.day),
+            tape=SHADOW_TAPE in self._d.capabilities,
         )
         if not run.ok:
             await self._incident("P3", "shadow_unavailable", run.error or "no SIP bars")
             return
+        if run.tape_unresolved:
+            await self._incident(
+                "P3",
+                "shadow_tape_unresolved",
+                "counted as stopped in the trigger minute, the tape not settling it: "
+                + "; ".join(run.tape_unresolved),
+            )
         await mark_step(
             self._journal, self.day, "shadow", self._clock.now(), f"{len(run.outcomes)} outcomes"
         )
@@ -925,7 +995,6 @@ class DayOrchestrator:
         md, _ = write_daily(report, d.paths.reports_dir)
         if d.settings.notify.daily_summary:
             await d.notifier.send(f"trader {self.day}", report.summary(), tags=("bar_chart",))
-        await self._backup()
         if d.recorder is not None:
             d.recorder.close()
         if self._failed:  # left unmarked: the rerun that finishes the day rebuilds it (D-051)
@@ -941,8 +1010,8 @@ class DayOrchestrator:
             keep = self._d.settings.storage.db_backups_keep
             for old in sorted(backups.glob("trader-*.db"))[:-keep]:
                 old.unlink()
-        except OSError as exc:
-            log.warning("database backup failed", error=str(exc))
+        except (OSError, sqlite3.Error) as exc:  # best effort, before or after DONE
+            log.warning("database backup failed", error=f"{type(exc).__name__}: {exc}")
 
     # ---------------------------------------------------------------- helpers
 
