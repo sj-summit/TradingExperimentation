@@ -168,7 +168,7 @@ Verdicts for symbols that are not among that call's candidates are ignored and l
 - **Input:** a context pack (ARCHITECTURE.md §7). It contains:
   - index ETF pre-market moves and the prior-day regime;
   - today's scheduled events;
-  - up to 40 candidates (top gainers among eligible symbols, plus eligible symbols with news in the last 18 h) with gap %, ATR, ADV, recent news, and EDGAR filing flags;
+  - up to 40 candidates, each with gap %, ATR, ADV, recent news, and EDGAR filing flags (D-063). They are drawn from eligible symbols with a price-setting print since 04:00 ET that are above the $5 floor and not gapping at a split ratio: the top 30 gainers, then up to 10 more with news in the last 18 h;
   - the playbook (promoted lessons) and recent performance.
 - **Output:** `PremarketBrief` (`day_mode`, plus assessments with verdicts for the candidates).
 - **If the brief is missing or invalid by the deadline:** `day_mode = normal`, and every 09:35 signal goes through the vet (§5.3).

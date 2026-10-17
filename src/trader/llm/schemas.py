@@ -24,7 +24,9 @@ import argparse
 import json
 import sys
 from collections.abc import Callable, Iterator, Mapping
+from decimal import Decimal
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
@@ -60,6 +62,9 @@ OutcomeFactor = Literal[  # S§6.5: hindsight labels, never DSL fields
 ]  # fmt: skip
 Verdict = Literal["allow", "neutral", "veto"]
 DayMode = Literal["normal", "reduced", "no_trade"]
+DAY_MODE_MULTIPLIERS: Mapping[DayMode, Decimal] = MappingProxyType(  # S§5.1's size multipliers
+    {"normal": Decimal(1), "reduced": Decimal("0.5"), "no_trade": Decimal(0)}
+)
 
 PACK_ID = r"^[A-Za-z0-9-]{1,64}$"
 SYMBOL = r"^[A-Z]{1,6}$"  # core.ids.is_ticker

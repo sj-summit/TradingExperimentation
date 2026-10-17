@@ -1,4 +1,4 @@
-# HANDOFF: Phase 4 under way; P4.0a–P4.0c and P4.1 done (updated 2026-10-15)
+# HANDOFF: Phase 4 under way; P4.0a–P4.0c and P4.1–P4.3 done (updated 2026-10-17)
 
 **Latest:**
 - **Phase 4's plan is approved** (2026-10-14; `C:\Users\Admin\.claude\plans\squishy-popping-honey.md`). Order: P4.0a, P4.0b, P4.0c, P4.1–P4.6, 🛑 G4a, P4.7–P4.10, 🛑 G4b.
@@ -14,7 +14,7 @@
   - A size skip is named by R-006 or R-007 when one also binds (labels only; G3's STT now reads `capacity_entries`, pinned as `g3_day.CODE_CHANGES`).
   - Order submits, cancels and sells go ahead of polls in the rate limiter, and polls leave it 4 tokens; a working entry is read every 2 s, so two working entries make 120 calls a minute, not 240.
   - Its review found no blocker; the five minor findings are fixed and tested. 784 tests pass.
-- **P4.0c is done (D-057). D-059, uncommitted, restates the backtest from the human's tape fetch:**
+- **P4.0c is done (D-057). D-059 restates the backtest from the human's tape fetch:**
   - Book A −16.8% (D-042: −20.2%); shadow longs −0.072R, or −0.183R without one +126.7R signal Book A didn't take (MRNA, 2026-08-19).
   - H4: ranks 1–5 do best under every check, but there is no gradient below them, and the evidence is thin.
   - Shadow outcomes enter at max(trigger, the trigger minute's open), so gap-throughs are fixed (CRWG: +3.07R, not +5.08R).
@@ -23,17 +23,31 @@
 - **The fee probe is done (D-058).**
   - Paper lists each trading day's CAT and REG charges, dated the trade day and posted that evening (20:05 and 20:15 ET).
   - A dry run on a copy of the journal books 6 charges and 3 reversals, with a $0.00 residual against the broker's $996.08.
-- **D-060 (uncommitted):** verifying D-058 found a fee edge case: an older day's charge posting late could retire a later day's estimates before that day's own charge posted. Fixed in `fee_reconciliation`, with a test; D-058's dry run is unchanged.
-- **P4.1 is done (D-061), uncommitted.**
+- **D-060:** verifying D-058 found a fee edge case: an older day's charge posting late could retire a later day's estimates before that day's own charge posted. Fixed in `fee_reconciliation`, with a test; D-058's dry run is unchanged.
+- **P4.1 is done (D-061).**
   - Claude's output models and their schemas (`schemas/*.json`, `full` and `wire_safe`) are strict and closed, and each answer echoes the pack's `pack_id`.
   - Over-long free text and free lists are clamped before validation; numbers, enums, patterns and set-like lists never are.
   - `jsonschema` is a new dev dependency. Reviewed; 853 tests pass.
-- **Commits:** HEAD is `542efee` ("Pre phase 4 done", the human's commit of 2026-10-15 21:51 ET): P4.0a–P4.0c and D-055 to D-058. Uncommitted: D-059, D-060, P4.1's work and these doc updates. Commit only if asked.
+- **P4.2 is done (D-062), uncommitted.**
+  - `llm/sanitize.py` cleans news for the packs until it settles; markup that won't settle is removed and flagged.
+  - It flags injections across several views and folds. On the reviewers' corpora: no false positives on 735 benign items, and 94% of 247 attacks caught.
+  - A flagged item will set its candidate's `suspicious_content` in code (P4.4). Reviewed by three agents; 1,008 tests pass.
+- **P4.3 is done (D-063), uncommitted.**
+  - `llm/candidates.py` picks the brief's 40 candidates: 30 gainers, then 10 more with news.
+  - `llm/context.py` builds the three packs:
+    - third-party and model text only under `untrusted`;
+    - a count of what every cap leaves out;
+    - trims to 300 KB;
+    - a `pack_id` from the pack's hash;
+    - bytes that depend only on the inputs.
+  - Its review found no blocker. The one confirmed major: filings showed as "none" when never fetched.
+  - It also fixed three things in P4.2's sanitizer: a quadratic parser, a cut that wasn't idempotent, and no per-field cap for packs. 1,065 tests pass.
+- **Commits:** HEAD is `937e25c` ("P4.2 complete", the human's commit of 2026-10-16 00:12 ET): everything through D-061 and P4.1's files. Uncommitted: P4.2's files and D-062, P4.3's files and D-063, and these doc updates. Commit only if asked.
 - **Waiting on the human:**
   - **Before G4a:** H0.2 (Claude Code ≥ 2.1.268, `claude setup-token`, the token in `.env`).
   - **Before G4b:** the Phase 1 checks (`trader news`, `trader filings`, `trader stream --news`) and the `ALPACA_DATA_*` keys.
   - `run-day` isn't needed between gates: it stays a human gate until Phase 6.
-- **Next (Claude):** P4.2 (sanitizer).
+- **Next (Claude):** P4.4 (the runner, transports, budget and fake CLI).
 - **New since G3, for the G4b runbook:**
   - **Log lines:**
     - `fees booked`, at boot and EOD. The first boot after 10-15 should book 10-12 to 10-14's 6 charges and 3 reversals (net $0.00), leaving E at $996.08 if no day trades before it;
@@ -49,7 +63,7 @@
   - **`--dry-run` prints the ledger's E before the fees are booked,** so it can differ by a few cents from the E boot uses.
   - **A size skip reads `capacity_positions` or `capacity_entries`** when R-006 or R-007 also binds (D-056), where it used to read `insufficient_settled_cash`.
 
-To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, the Phase 4 plan, and D-052 to D-061. The G3 runbook below served both runs and is the template for G4b. Everything below the line further down is the older G2 handoff, kept for its environment notes and the Phase 2 code map.
+To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, the Phase 4 plan, and D-052 to D-063. The G3 runbook below served both runs and is the template for G4b. Everything below the line further down is the older G2 handoff, kept for its environment notes and the Phase 2 code map.
 
 ## Where Phase 3 stands
 

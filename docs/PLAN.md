@@ -11,7 +11,7 @@
 ```
 STATUS
 current_phase: 4 (plan approved 2026-10-14: C:\Users\Admin\.claude\plans\squishy-popping-honey.md; order P4.0a, P4.0b, P4.0c, P4.1-P4.6, G4a, P4.7-P4.10, G4b)
-last_completed_task: P4.0c (D-057, D-059): shadow entries at max(trigger, open); ambiguous trigger minutes from the SIP tape; the human's tape fetch ran 2026-10-15 and D-059 restates D-042 (Book A -16.8%, not -20.2%; shadow longs -0.072R, -0.183R without MRNA's +126.7R signal; H4: ranks 1-5 best, no gradient below them, thin evidence). P4.0a (D-055) and P4.0b (D-056) done before it; D-058 records the fee probe; D-060 fixes a fee-retirement edge case found verifying it. P4.1 done (D-061): strict output models echoing the pack_id, wire schemas (full and wire_safe), filter-clamp-validate, schemas/*.json; reviewed. The human committed P4.0a-P4.0c and D-055 to D-058 as 542efee (2026-10-15 21:51 ET); D-059 to D-061 and P4.1's files are uncommitted; 853 tests. Next: P4.2
+last_completed_task: P4.3 (D-063): the pre-market candidates (decision 12, plus S§3.2's price floor and split check) and the three context packs with encode() (trims, pack_id, untrusted placement, counts of what each cap leaves out); reviewed (4 lenses, 37 findings, none a blocker, all fixed or recorded; 52 mutations caught), with fixes to P4.2's sanitizer (pack fields read to 4,096 characters, a linear-time parser, a cut that never opens markup). Before it: P4.0a-P4.0c (D-055 to D-060; D-059 restates D-042: Book A -16.8%), P4.1 (D-061), P4.2 (D-062). Commits: the human's 937e25c ("P4.2 complete", 2026-10-16 00:12 ET) holds everything through D-061 and P4.1's files; P4.2's files, D-062, P4.3's files and D-063 are uncommitted; 1065 tests. Next: P4.4
 open_questions: read docs/HANDOFF.md first. Human steps in Phase 4: H0.2 before G4a; the Phase 1 checks (news, filings, stream --news) and ALPACA_DATA_* keys before G4b. Q2 open (run 2: 14 symbols x trades+quotes = 28, under 30, no 405; a 405 at 16 or more symbols would mean channels count toward the 30), Q4 open until G4a, Q6 partly answered
 eval_epoch: 0
 ```
@@ -168,8 +168,8 @@ The plan approved on 2026-10-14 adds three tasks first, all due before G4b: D-05
   - the ambiguous trigger minutes resolved from the SIP trade tape;
   - the backtest re-run from its cache, with D-042's numbers and H4 restated.
 - [x] **P4.1** Write `llm/schemas.py` (A§5), the schema generator to `schemas/*.json` (refs inlined, each file under 8 KB), and tests that the generated schemas validate the fixtures.
-- [ ] **P4.2** Write `llm/sanitize.py`: HTML strip, truncation, injection heuristics → `suspicious`, optional entity anonymization. Write tests with adversarial headlines.
-- [ ] **P4.3** Write `llm/context.py`: the premarket, vet, and review packs (A§8), plus size-cap tests.
+- [x] **P4.2** Write `llm/sanitize.py`: HTML strip, truncation, injection heuristics → `suspicious`, optional entity anonymization. Write tests with adversarial headlines.
+- [x] **P4.3** Write `llm/context.py`: the premarket, vet, and review packs (A§8), plus size-cap tests.
 - [ ] **P4.4** Write `llm/claude_cli.py` per A§7: isolated env and cwd, exact flags, timeout handling, envelope parsing, one repair retry, artifact persistence, and `llm_calls` rows. Add `llm/budget.py`. Test everything with `scripts/fake_claude.py` scenarios.
 - [ ] **P4.5** Turn the `prompts/` drafts into v1. Prompts stay **static**: all dynamic data, including date and playbook, goes in the context pack. Log each prompt's SHA-256 per call; a prompt change starts a new epoch.
 - [ ] **P4.6** Write `trader smoke llm`: one real call per role with fixture context packs (no market impact), printing validated outputs, durations, and envelope fields.

@@ -170,7 +170,9 @@ class ReviewRoleConfig(_Model):
     effort: Effort
     timeout_s: StrictInt = Field(gt=0)
     max_turns: StrictInt = Field(gt=0)
-    history_days: StrictInt = Field(ge=0)  # past daily summaries in the pack (STRATEGY.md §6.6)
+    # past daily summaries in the pack (STRATEGY.md §6.6); at most 30, so the review pack's
+    # history, which no trim reaches, leaves room for every target (D-063)
+    history_days: StrictInt = Field(ge=0, le=30)
     notable_untraded: StrictInt = Field(ge=0)  # largest-|shadow_r| untraded targets (§6.5)
     max_news_per_target: StrictInt = Field(ge=0)
 

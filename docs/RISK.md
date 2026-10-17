@@ -183,7 +183,7 @@ Stop live trading and return to paper if either happens:
 
 | Risk | Mitigation |
 |---|---|
-| Prompt injection via news, filings, or web pages | Text is passed as labeled untrusted data. The system prompt forbids following embedded instructions. Output is schema-constrained. Claude has no tools by default. Its output can only veto or reduce. Suspicious strings ("ignore previous instructions", etc.) set `suspicious_content`. |
+| Prompt injection via news, filings, or web pages | Text is passed as labeled untrusted data. The system prompt forbids following embedded instructions. Output is schema-constrained. Claude has no tools by default. Its output can only veto or reduce. Suspicious strings ("ignore previous instructions", etc.) flag the item (`llm/sanitize.py`, D-062). A candidate's items are also checked joined, so a phrase split across two headlines is flagged too (D-063). Code then puts `suspicious_content` in that candidate's risk flags after validation, so an injection can't suppress it. |
 | Hallucinated symbols or facts | Verdicts for symbols outside the candidate list are dropped. Reasons are journaled for audit. The post-close review scores process quality. |
 | Schema drift or invalid JSON | `--json-schema` plus pydantic validation. One repair retry, then the role's fallback (STRATEGY.md §5.4). |
 | Overfitting "lessons" | Statistical promotion gate (STRATEGY.md §6.3). Lessons are soft guidance only and can't touch rules or limits. |

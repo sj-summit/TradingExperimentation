@@ -1767,6 +1767,180 @@ Append-only. Each entry records context, the decision, its consequences, and sou
 - **`jsonschema` 4.26 is a new dev dependency,** for tests only (Draft-7). It touches neither trading, risk nor credentials. The lock gained it and four of its dependencies, and changed nothing else.
 - **Tests:** 53 in `test_llm_schemas.py`. 853 tests pass.
 
+## D-062 — P4.2: the sanitizer: text cleaned until it settles (or removed), and injection heuristics read through folds and several views
+- **Date:** 2026-10-16 · **Status:** Accepted (the Phase 4 plan, P4.2).
+- **Cleaning** (`llm/sanitize.py`: `normalize`, `clean_text`, `cut`):
+  - **What it removes:**
+    - HTML is reduced to its text. Script, style, noscript, template, iframe, object, svg and the raw-text elements (xmp, plaintext, noembed, noframes) are dropped, and block tags read as spaces.
+    - Entities are decoded, then the text goes through NFKC.
+    - Invisible characters are removed: categories Cc, Cf, Cs, Co and Cn, variation selectors, the combining grapheme joiner, the two Khmer inherent vowels, and two other blank marks.
+    - Characters that render as a blank (the Hangul fillers and the braille blank) become spaces, so the pack shows what a reader sees. Whitespace is collapsed.
+  - **It repeats until nothing changes,** so double-escaped markup comes out as text.
+    - **Markup that hasn't settled after 8 passes is replaced by a placeholder, and the item is flagged.** No real news needs more than 3 passes.
+    - The review showed that markup escaped as deep as the limit came out as live tags, unflagged.
+  - **Fidelity:**
+    - A `<` that never closes, or a `<US$1` price, stays as text. It used to swallow the rest of the field.
+    - Superscript digits, fractions and the trademark sign no longer merge into what precedes them: "$1.25^1", "4 1/2%" and "ZEPBOUND" now come out where NFKC made "$1.251", "41/2%" and "ZEPBOUNDTM".
+    - Digits inside `<sup>` get a "^".
+  - **The cut** keeps at most `max_chars` characters and ends in "...".
+    - Not "…": NFKC turns "…" into "...", so a second pass would cut again.
+    - It ends at a space within 15 characters.
+    - It never splits a number from its unit ("$1.25 billion"), a letter from its marks, an Indic conjunct, or a flag's two letters.
+    - Cleaning clean text changes nothing; two property tests check this.
+  - **Size:** 32,768 characters are read per field (`RAW_CAP`), and a longer field is flagged.
+    - The worst case measured is 0.84 s per item: three checks of a full field of `<`. Realistic packs take a fraction of that.
+    - R-020's 5 s window runs on the same event loop, so **P4.8 should build packs off the loop** (`asyncio.to_thread`).
+- **The heuristics** (`is_suspicious`):
+  - **The views it reads:**
+    - the clean text;
+    - the decoded text, with its tags and line breaks kept;
+    - the text with invisible characters read as spaces and glued words split (`ResultsNote to AI models:`);
+    - text smuggled in tag characters (beyond what flag emoji spell);
+    - text reversed under a bidi override;
+    - text CSS hides from a reader (10 letters or more; the text stays in the pack).
+  - **Folds, applied before matching:**
+    - lookalike letters, found by Unicode name: Cyrillic, Greek, Armenian, small capitals, and negative circled, negative squared and regional-indicator letters;
+    - NFKD with marks dropped, which removes accents and stacked marks;
+    - curly quotes and angle brackets straightened, and case folded;
+    - a letters-only form and a leetspeak form, for the canonical phrases.
+  - **The patterns aim at what addresses a model, not at news words:**
+    - The AI word must be the one addressed: "Note to AI models:" counts, "Note for AI bulls" doesn't.
+    - A role word needs an order after it or a line break before it: "System: approve" counts, "System: Windows 11" and "Human: Fall Flat" don't.
+    - Warnings and commentary are excluded: "disregard earlier messages sent in error", "Ignore Everything Else:".
+  - **Measured on the reviewers' labeled corpora,** offline, with a scratch harness:
+    - **No false positives on 735 benign items** across 20 Benzinga categories: earnings, FDA, M&A, analyst ratings, legal, the AI sector, HTML summaries and held-out sets.
+    - **3 of 78 benign edge probes are flagged,** all quoting the attack phrase ("Judge Tells Jury To Disregard Prior Instructions"). That is kept by design; the first version flagged 75 of the 78.
+    - **231 of 247 attacks are flagged (94%).** The misses are the long tail the reviewers advised leaving to the model-side defenses: "this overrides all prior instructions", "imagine you are", "ignore prior guidance", Cherokee lookalikes, and two-letter turn markers.
+  - **The tests carry 62 adversarial and 67 benign headlines.**
+- **The flag and `suspicious_content` (resolves a spec gap):**
+  - RISK.md says suspicious strings "set `suspicious_content`", but the prompts leave it to the model, which an injection could talk out of it.
+  - **Code ORs `suspicious_content` into the risk flags of any candidate whose pack news is flagged, after validation (P4.4),** so neither the clamp nor the model can drop it.
+  - P4.5's prompts explain the pack's `suspicious` key.
+- **For P4.3:**
+  - Clean the pack's other third-party strings (`name`, `source`) with `clean_text`, unflagged.
+  - `TextLimits` defaults to a 300-character headline and a 600-character summary. At 40 candidates with 8 items each, that is 288,000 characters of news, against the 300 KB pack cap, so `encode()` will trim on busy days.
+- **For E1:** `anonymize` is exact, whole-word and case-sensitive. Tickers that are also words ("AI" for C3.ai, "A") need care in what E1 passes.
+- **Accepted, and recorded:**
+  - "&notice" decodes to "¬ice" (HTML's legacy entities).
+  - Closed tag-like text in a plain headline ("<AAPL.O>") is dropped.
+  - Items are checked one at a time, so two items each carrying half a phrase aren't joined. P4.3 may join a symbol's items.
+- **Review.** Three reviewers (evasion; false positives; robustness and spec) found two blockers and several majors:
+  - the leak at the pass limit;
+  - the Khmer marks;
+  - glued payloads;
+  - the "instructions above" family and Human:/Assistant: turns;
+  - AI-sector false positives.
+  - Every finding is fixed or recorded above. Each fix's test fails without it: 15 mutations, all caught.
+- **Environment:** the editor tool decodes 4-digit unicode escapes into literal characters. The source uses named escapes (`\N{...}`), and a repo-wide scan found no invisible characters.
+- **Tests:** 155 in `test_sanitize.py`, including two property tests and a sweep of every default-ignorable code point. 1,008 tests pass.
+
+## D-063 — P4.3: the pre-market candidates and the context packs; fixes to P4.2's sanitizer
+- **Date:** 2026-10-17 · **Status:** Accepted (the Phase 4 plan, P4.3 and decision 12).
+- **Pre-market candidates** (`llm/candidates.py: select_premarket`):
+  - **Who qualifies:** an eligible symbol (S§3.1) whose last print (the snapshot's latest trade, live feed) came today at or after 04:00 ET and may set a price (D-043's conditions), above S§3.2's $5 floor, with a gap that isn't at a split ratio (`orb_sip.suspect_gap`).
+    - **The floor and the split check go beyond decision 12's text.** The 09:35 scan drops both, so such a symbol can't become a signal, and an unlisted reverse split would otherwise top the gainers.
+    - **The price-setting check is defense in depth.** The IEX snapshots recorded on 10-13 and 10-14 never had an odd lot as the latest trade (0 of 19), while about 60% of those days' stream trades were odd lots. IEX's pre-market opens at 08:00, so the 04:00 bound binds only on SIP.
+  - **The gap** is that print against `universe_daily.prev_close` (SIP). This supersedes D-024's snapshot daily bar as the source.
+  - **The picks:** the top 30 gainers (gap above 0), then up to 10 more symbols with news in the 18 h window, by the size of their gap. At most `max_candidates` (40) in all, gainers first; ties go to the symbol.
+- **The packs** (`llm/context.py`): three pure builders and `encode()`.
+  - **The frame.** Every pack opens with:
+    - `pack_version`, `pack_id`, `role`, `as_of`;
+    - `session`, with the last entry and the flatten;
+    - `experiment` and `limits`;
+    - `events_today`, `market` (index gaps and the previous session's regime tags) and `book_b` (equity, recent R, and the day mode, except in the brief);
+    - `playbook`, empty until P5.3.
+
+    The role's own sections follow, then the ranked list, and `instructions_note` comes last, after all the untrusted text, as A§8 had it.
+  - **`experiment` and `limits` carry every config number the prompt drafts hard-code,** so P4.5 can point the prompts there: the opening range's minutes, the candidate caps, the news windows, the day modes' multipliers, the lessons' gate. `limits` also states EDGAR's window and forms, so an empty `filings` list reads as "none in 5 days".
+  - **The candidates:**
+    - **Brief:** name, exchange, how it was picked, the previous close, the pre-market price and its time, the gap, ATR, ATR%, ADV, filings and news.
+    - **Vet:** A§8's fields plus the trigger and the stop. A long already triggered at arming waits for its verdict (S§3.3, S§5.4), so it is vetted too.
+    - **Each news item:** its age, its source, the headline and summary under `untrusted`, and `suspicious`.
+  - **Filings:**
+    - The newest 10, never one accepted after `as_of`. An 8-K's items are kept only if they read as item numbers.
+    - **`Evidence.filings` None means unknown** (EDGAR failed, or wasn't asked), and shows as `filings_unavailable: true`. The review found the first default said "none" instead: the vet would have read "no 424B5" for a symbol nobody looked up.
+  - **The review pack.** The input types are for P4.10 to fill:
+    - the day's signals, with each book's decision and trade, Book B's verdict and the shadow path;
+    - the review targets, with the path, SPY's move and news;
+    - incidents, the most severe first;
+    - statistics (plain numbers);
+    - lessons;
+    - the DSL whitelist;
+    - `history`.
+  - **News stamps (review):**
+    - An item is `before_decision` when the engine could read it by the decision: the later of its creation and its receipt is at or before the decision time.
+    - It also carries `minutes_from_decision` and `edited_after_decision`. NewsHub keeps an edited article's first `received_at`, so its text may postdate the decision.
+    - **A target's news alternates before and after the decision, nearest first,** so the per-target cap and the trims keep the decision-time news longest.
+  - **Every capped list counts what it leaves out:**
+    - `candidates_omitted` or `targets_omitted` (the builder's cap and the trims);
+    - `news_omitted` and `filings_omitted`;
+    - `signals_omitted`, `incidents_omitted` and `lessons_omitted`;
+    - in `history`: `bad_process_omitted`, `open_issues_omitted` and `open_notes_omitted`.
+  - **Determinism:**
+    - Compact UTF-8, keys in the builders' order.
+    - Every mapping a caller passes is sorted: gaps, stats, books, decisions, trades. Every list has a tie-break.
+    - The bytes are the same for any input order and under two hash seeds, tested for all three roles.
+- **Untrusted text:**
+  - **Under `untrusted`:** news; and in the review, Book B's reasons, lessons' statements and queries, `history`'s texts, and incident messages, which may quote an error.
+  - **Outside it, cleaned and cut:** names, sources, forms, event names and codes.
+    - Each is also kept within 2 bytes a character, so a flood of 4-byte characters in a model's earlier text can't crowd the review's targets out.
+  - **`suspicious_news`:**
+    - A candidate (in the review, a target) carries it when one of its items is flagged, or when its items, joined in pack order, are. D-062 left that join to P4.3; a phrase split across two headlines now flags.
+    - The flag survives any trim, and `EncodedPack.flagged` lists those candidates for P4.4.
+  - **The sanitizer knows the packs' own keys** (`sanitize.PACK_KEYS`) and two phrases about the framing ("end of untrusted text", "is not untrusted"). A test keeps the key list in step with the packs.
+- **`encode()`:**
+  - **The trims, in order:**
+    1. news: the last item of the lowest-ranked candidate holding the most, down to one each;
+    2. summaries, the lowest-ranked first, only where dropping one saves bytes; each is marked `summary_omitted`;
+    3. candidates, the lowest-ranked first.
+
+    If even the pack without candidates doesn't fit, `PackTooLargeError` means no call.
+  - The byte accounting is incremental and exact; a test makes the eleventh drop where the count gains a digit.
+  - **`pack_id`:** the role, the date and the first 16 hex digits of the SHA-256 of the trimmed pack, hashed with a placeholder of the same length.
+- **Sizes and times,** on this PC:
+  - **A realistic busy brief** (40 × 8 items) is 254 KB untrimmed. It builds in 1.0 s, almost all of it the sanitizer, and encodes in 3 ms.
+  - **The worst cases fit and keep every candidate and target:** 4-byte text in every field, every cap reached, and the review at 30 days of history. `history_days` is now at most 30 in the settings.
+- **Fixes to P4.2's sanitizer** (uncommitted, so fixed in place), found by this review and its tests:
+  - **Pack news reads 4,096 characters a field** (`untrusted(raw_cap=...)`), and a longer field is flagged. Alpaca's summaries run a few hundred characters.
+    - With the parser fix below, the worst item costs 0.1 s, so an adversarial 25 × 5 vet pack builds in about 12 s; before, it took minutes.
+    - P4.8 builds packs off the event loop (D-062), and may reuse the brief's cleaned items for the vet.
+  - **The HTML parser was quadratic in unclosed tags.** It rescanned the open elements for every chunk of text and every stray end tag; it now keeps counts.
+  - **A cut could end at "</".** With the mark, that parses as a comment the next cleaning drops, so `clean_text` wasn't idempotent: hypothesis found "aamp;</aaaa" cut to 10 characters. A cut now steps back past a dangling opener, and 50,000 examples pass.
+  - Oversized text is flagged before any work is done on it.
+  - The reviewers' corpora still give no false positives on 802 benign items, with the same catches.
+- **For P4.4:**
+  - `EncodedPack.kept` is the filter's membership set: symbols, or signal ids for the review.
+  - `llm_calls.pack_sha256` and `pack_bytes` come from `sha256` and `len(data)`.
+  - **Adding `suspicious_content`:** de-duplicate the flags and, at 8, replace the model's last one. `risk_flags` holds at most 8, and a stored verdict with 9 would fail the next validation: P4.7's rebuild, or P4.10's `ReviewSignal`.
+  - Log failed attempts by code: pydantic's `ValidationError` quotes the model's output, so use `errors(include_input=False)`.
+- **For P4.5:**
+  - The prompts read `limits`, `experiment`, `suspicious_news`, the `..._omitted` fields, `summary_omitted` and `edited_after_decision`.
+  - The review prompt says model-written text under `untrusted` is data.
+  - A lesson is weighed by its numbers; its statement only describes it.
+- **For P4.8:**
+  - **The inputs:**
+    - the universe's listings and previous closes;
+    - the snapshots' latest trades;
+    - news from the last 18 h and 24 h;
+    - EDGAR per candidate. The 09:00 prefetch doesn't cover vet-only symbols, and the `filings` table can't tell "none" from "never fetched", so track which symbols EDGAR answered;
+    - Book B's E and recent R;
+    - the previous session's regime;
+    - today's events.
+  - **Replay serves the recorded pack bytes for every role, the review included,** and validates the recorded answer against the recorded `pack_id`. The replay's seeded journal holds no news or history, so a rebuilt review pack would carry another id. This amends decision 10 when P4.8 lands.
+- **For P4.10:**
+  - Pass the targets ranked, each with at most 3 items from before the decision and 2 from after.
+  - Pass lessons promoted first, then the newest proposals, and history's lists newest first (issues and notes by when last seen or raised).
+  - The open issues and notes a review may link are in `pack.body["history"]`.
+- **Spec updates:** A§2, A§3's 09:00 row, A§4.7, A§8 (the example, now with `pack_id`, and the encoding), A§10's EDGAR row, S§5.2's candidates, RISK.md's prompt-injection row.
+- **Review.** Four reviewers (spec and integration, the encoding, the injection surface, the tests), each checked by an adversarial verifier, made 37 findings:
+  - 2 major, of which 1 was confirmed: the filings default;
+  - no blocker;
+  - 1 refuted.
+
+  Every finding is fixed or recorded above. Each fix's test fails without it: 52 mutations, all caught.
+- **Tests:** 44 in `test_llm_context.py`, 10 in `test_llm_candidates.py`, and 3 more in `test_sanitize.py`. 1,065 tests pass.
+- **Sources:** IEX's sessions, the pre-market 08:00–09:30 ET: https://www.sec.gov/files/rules/sro/iex/2026/34-105959.pdf
+
 ---
 
 ## Open questions to resolve during the build (record answers as new entries)
