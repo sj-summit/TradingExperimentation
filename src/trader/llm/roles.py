@@ -5,7 +5,9 @@ system prompt's file, the instruction that follows ``-p``, which list of the ans
 pack's candidates or targets, and the role's settings (model, effort, time and turn limits).
 """
 
+import hashlib
 from dataclasses import dataclass
+from pathlib import Path
 
 from pydantic import BaseModel
 
@@ -29,6 +31,12 @@ class RoleSpec:
     timeout_s: int
     max_turns: int
     min_attempt_s: int
+
+
+def prompt_sha256(path: Path) -> str:
+    """A prompt's SHA-256, its line endings made LF: a checkout that writes CRLF (this repo has
+    ``core.autocrlf``) doesn't change what the model reads (D-065)."""
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
 
 
 def role_specs(settings: Settings) -> dict[Role, RoleSpec]:

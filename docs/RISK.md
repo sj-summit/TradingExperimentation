@@ -187,7 +187,7 @@ Stop live trading and return to paper if either happens:
 | Hallucinated symbols or facts | Verdicts for symbols outside the candidate list are dropped. Reasons are journaled for audit. The post-close review scores process quality. |
 | Schema drift or invalid JSON | `--json-schema` plus pydantic validation. One repair retry, then the role's fallback (STRATEGY.md §5.4). |
 | Overfitting "lessons" | Statistical promotion gate (STRATEGY.md §6.3). Lessons are soft guidance only and can't touch rules or limits. |
-| Silent model changes | Log the model alias and any resolved model ID per call. A prompt or model change means a new epoch. |
+| Silent model changes | Log the model alias and any resolved model ID per call. A prompt or model change means a new epoch: boot fingerprints the LLM setup and raises a P3 `llm_fingerprint_changed` when it changes (D-065). |
 | Subscription limits or outage | Book B degrades to `llm_unavailable` skips. Book A is unaffected. Calls are capped at `llm.max_calls_per_day`. |
 | Silent API billing | The LLM subprocess env passes only an allowlist, so no `ANTHROPIC_*` or `CLAUDE_*` variable from the shell reaches a call; `ANTHROPIC_API_KEY` is set from `.env` only when `llm.provider: anthropic_api`. `--setting-sources user` keeps a project's settings (their `env` block, `apiKeyHelper`) out. `doctor` asserts `claude auth status` reports `authMethod: oauth_token` (`api_key` for that provider) (D-064). |
 
@@ -218,4 +218,4 @@ Stop live trading and return to paper if either happens:
 |---|---|---|
 | P1 | Unprotected position; not flat by close − 2 min; reconciliation mismatch with positions; daily loss limit breached beyond the configured value | Immediate push alert; auto-flatten the affected book; halt until the human acknowledges |
 | P2 | Engine heartbeat stale with no positions; data stale > 120 s; LLM degraded; clock skew | Push alert; halt new entries as the rule requires (the hourly clock reading only alerts) |
-| P3 | A single LLM failure; scan slow; a minor data gap; fees not readable; a cash residual over half the tolerance | Log; show in the daily report |
+| P3 | A single LLM failure; scan slow; a minor data gap; fees not readable; a cash residual over half the tolerance; a changed LLM setup (`llm_fingerprint_changed`) | Log; show in the daily report |

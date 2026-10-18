@@ -57,7 +57,7 @@ ai-day-trader/
 │   ├── books/      base.py baseline.py llm_filtered.py
 │   ├── risk/       caps.py gate.py ledger.py killswitch.py breakers.py
 │   ├── execution/  broker.py alpaca_broker.py sim_broker.py orders.py service.py reconcile.py
-│   ├── llm/        client.py claude_cli.py roles.py fake.py candidates.py context.py schemas.py budget.py sanitize.py
+│   ├── llm/        client.py claude_cli.py roles.py fake.py epoch.py candidates.py context.py schemas.py budget.py sanitize.py
 │   ├── memory/     journal.py migrations/0001_init.sql stats.py shadow.py lessons.py regime.py playbook.py reviews.py
 │   ├── orchestrator/ day.py tasks.py watchdog.py
 │   ├── reports/    daily.py weekly.py evaluation.py templates/
@@ -290,6 +290,7 @@ class LLMResult(Generic[T]):
 - **Transports** (`claude_cli.Transport`): `ClaudeCliTransport` runs the CLI (§7.2); `fake.ScriptedTransport` answers from a script for tests and `--sim`. P4.8 adds the recording and replaying ones.
 - **`llm.provider: anthropic_api`** runs the same CLI with `ANTHROPIC_API_KEY` in place of the subscription token, billed per token (plan decision 3; no direct API client).
 - `roles.py` holds each role's spec: its output model, prompt file, instruction and limits.
+- `epoch.py`: `epoch_fingerprint()` hashes what the calls ask (the prompts' bytes, the instructions and the repair's note, the schemas sent, the models and efforts, the flags), and `note_fingerprint()` stores it at boot, raising a P3 `llm_fingerprint_changed` that names what changed (S§9, D-065).
 - `budget.py` counts the day's attempts and failures from `llm_calls` and holds `max_concurrent` attempts at a time.
 - `candidates.py` picks the brief's pre-market candidates, and `context.py` builds the packs (§8, D-063).
 - `sanitize.py` strips HTML, truncates text, flags injection-like strings, and optionally anonymizes entities (D-062). Text that won't settle is replaced and flagged, and a flagged item sets its candidate's `suspicious_content` (P4.4).

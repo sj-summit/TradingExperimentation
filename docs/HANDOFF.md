@@ -1,4 +1,4 @@
-# HANDOFF: Phase 4 under way; P4.0a–P4.0c and P4.1–P4.4 done (updated 2026-10-18)
+# HANDOFF: Phase 4 under way; P4.0a–P4.0c and P4.1–P4.5 done (updated 2026-10-18)
 
 **Latest:**
 - **Phase 4's plan is approved** (2026-10-14; `C:\Users\Admin\.claude\plans\squishy-popping-honey.md`). Order: P4.0a, P4.0b, P4.0c, P4.1–P4.6, 🛑 G4a, P4.7–P4.10, 🛑 G4b.
@@ -42,7 +42,7 @@
     - bytes that depend only on the inputs.
   - Its review found no blocker. The one confirmed major: filings showed as "none" when never fetched.
   - It also fixed three things in P4.2's sanitizer: a quadratic parser, a cut that wasn't idempotent, and no per-field cap for packs. 1,065 tests pass.
-- **P4.4 is done (D-064), uncommitted.**
+- **P4.4 is done (D-064).**
   - `LlmCalls` (`llm/client.py`) is the one runner: an attempt and at most one repair per call, a `llm_calls` row per attempt, and `run()` never raises for a failure.
     - `LLMResult.call_id` is the attempt whose result stands: every `llm_call_id` column holds one.
     - `persist()` lets P4.7 and P4.10 store an answer in the transaction that completes it.
@@ -52,12 +52,17 @@
   - **Stopping a call:** CTRL_BREAK, 5 s, then System32's `taskkill /T /F`. Exit is read from the return code; a cancelled call, even at a loop's teardown, kills its child.
   - Tested with `scripts/fake_claude.py` (16 scenarios) and `ScriptedTransport`, also under simdrive; a guard on `subprocess.Popen` refuses the real `claude` in every test.
   - Its review found no blocker; the 7 confirmed majors are fixed (threads under simdrive, `call_id` against the foreign keys, errors leaving rows open, a lone surrogate, the CLI left running at a teardown). 1,230 tests pass; 91 mutations caught.
-- **Commits:** HEAD is `e4f6cd1` ("P4.3 done", the human's commit of 2026-10-17 02:46 ET): everything through D-063. Uncommitted: P4.4's files and D-064, and these doc updates. Commit only if asked.
+- **P4.5 is done (D-065), uncommitted.**
+  - The three prompts are v1 and hold no numbers: every setting reaches Claude in the pack (`experiment`, `limits`, `book_b`, `as_of`), so a changed setting can't leave a prompt stating the old one. Each asks for the `pack_id`; the brief's web-tools sentence is gone.
+  - A test checks that every name a prompt quotes exists in its role's real pack or in the answers' schemas.
+  - `llm/epoch.py` fingerprints what the calls ask (prompts, instructions, schemas, models, efforts, flags). A change is a P3 `llm_fingerprint_changed` at boot, wired in P4.8; bumping the epoch stays the human's call (S§9).
+  - Prompt hashes ignore line endings, since `core.autocrlf` can rewrite the prompts with CRLF on checkout. 1,255 tests pass; 20 mutations caught.
+- **Commits:** HEAD is `d46e9b6` ("P4.4 Done", the human's commit of 2026-10-18 17:53 ET): everything through D-064. Uncommitted: P4.5's files and D-065, and these doc updates. Commit only if asked.
 - **Waiting on the human:**
   - **Before G4a:** H0.2 (Claude Code ≥ 2.1.268, `claude setup-token`, the token in `.env`).
   - **Before G4b:** the Phase 1 checks (`trader news`, `trader filings`, `trader stream --news`) and the `ALPACA_DATA_*` keys.
   - `run-day` isn't needed between gates: it stays a human gate until Phase 6.
-- **Next (Claude):** P4.5 (prompts v1: no config numbers, `pack_id` requested, the epoch fingerprint).
+- **Next (Claude):** P4.6 (`trader smoke llm`: the code only; running it is G4a, the human's).
 - **New since G3, for the G4b runbook:**
   - **Log lines:**
     - `fees booked`, at boot and EOD. The first boot after 10-15 should book 10-12 to 10-14's 6 charges and 3 reversals (net $0.00), leaving E at $996.08 if no day trades before it;

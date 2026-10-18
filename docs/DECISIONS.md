@@ -2102,6 +2102,51 @@ Append-only. Each entry records context, the decision, its consequences, and sou
 
 ---
 
+## D-065 — P4.5: prompts v1 hold no numbers; the LLM setup's fingerprint
+- **Date:** 2026-10-18 · **Status:** Accepted (the Phase 4 plan, P4.5).
+- **Prompts v1** (`prompts/*.md`) stay static: everything dynamic is in the pack.
+  - **They hold no numbers.** Every number the drafts stated now comes from the pack:
+    - the opening range's length: `experiment.strategy.opening_range_minutes`;
+    - the candidate caps and the news and filings windows: `limits.max_candidates`, `limits.news_lookback_hours`, `limits.filings_lookback_days`;
+    - the reduced mode's size: `experiment.day_modes`;
+    - the lessons' gate: `experiment.lessons` (`min_n_per_side`, `min_effect_r`);
+    - how long a triggered candidate waits for the vet: `experiment.book_b.max_wait_s`;
+    - the account: `book_b.equity_usd`; the time: `as_of`.
+
+    The answers' length and count limits are left to the schema each call sends (in `wire_safe` mode, in each property's description), and the prompts say "within the schema's limits". Only SEC form names keep digits (424B5, S-3).
+  - **Each asks for the `pack_id`** ("copy the pack's `pack_id` exactly"), as each instruction does.
+  - **The brief's web-tools sentence is gone:** E5 isn't built, and config refuses `allow_web` (D-064).
+  - **They explain what the packs mark** (D-063's list for P4.5):
+    - the `..._omitted` counts and `summary_omitted`;
+    - `filings_unavailable`: unknown, not "none";
+    - `suspicious` and `suspicious_news`;
+    - in the review: `published`, `minutes_from_decision`, `edited_after_decision`, `decision_at`, `decision_basis` and `selected_for`.
+  - **The review's security note covers what a model wrote earlier:** Book B's reasons, the lessons' statements and queries, `history`, and incident messages, all under `untrusted`.
+  - **A lesson is weighed by its numbers** (`n_subset`, `n_complement`, `effect_r`, `ci`); its statement only describes it.
+  - **Two corrections to the drafts:**
+    - The brief said anything outside the schema's fields "is ignored". The schemas are closed, so an extra key fails validation.
+    - The vet's wait runs from arming or the call's start (S§5.4, decision 8), not from the trigger.
+- **Tests keep the prompts honest:**
+  - no digit outside an SEC form name;
+  - every name a prompt quotes is a key, a value or a dotted path of its role's real pack, or a field or enum value of the answers, so a renamed pack key fails. The packs are built with the live `experiment_section`, and trimmed too, so `summary_omitted` appears;
+  - each asks for the `pack_id`, and the brief never mentions the web.
+- **The fingerprint** (`llm/epoch.py`, S§9):
+  - **What it hashes:**
+    - per role: the prompt's text, the instruction, the schema sent (`wire_schema(output, schema_mode)`), the model, the effort, and the argv's flags. The argv is built by `build_argv` with placeholders for the instruction, the schema and the prompt's path, so `max_turns`, `tools_flag`, `safe_mode` and every fixed flag count;
+    - `REPAIR_NOTE`, `schema_mode` and `PACK_VERSION`.
+  - **What it leaves out:** how a call runs (timeouts, `min_attempt_s`, the budget, `kill_grace_s`, `max_pack_bytes`), and the CLI's version, which each row records and doctor checks.
+  - **A prompt's hash ignores line endings,** here and in `llm_calls.prompt_sha256` (`roles.prompt_sha256`). This repo has `core.autocrlf`, so a checkout can rewrite the prompts with CRLF, which changes no text the model reads. The prompt's path never counts, so a replay's root hashes the same.
+  - **`note_fingerprint()`,** in one transaction:
+    - the first fingerprint is stored silently;
+    - the same one does nothing;
+    - a different one raises a P3 `llm_fingerprint_changed` naming what changed (for example `roles.vet.model` or `roles.premarket.prompt_sha256`), and is stored, so each change alerts once.
+  - **Epochs stay the human's call.** A changed setup starts a new epoch unless it is a bug fix (S§9); the P3 asks the question and bumps nothing. Until P7.1 freezes the setup at epoch 1, these P3s are notes.
+- **For P4.8:** at boot when Book B runs, never on a Book-A-only day, call `note_fingerprint(journal, epoch_fingerprint(settings, prompts_dir), at=now)`, and put the fingerprint in `boot.json`'s LLM setup.
+- **Spec updates:** ARCHITECTURE §2 and §4.7, STRATEGY §9, RISK §8 and §11.
+- **Tests:** 25 in `test_llm_prompts.py`; 20 mutations, all caught. 1,255 tests pass.
+
+---
+
 ## Open questions to resolve during the build (record answers as new entries)
 
 - **Q1 (P1.2):** Is Alpaca's `movers` (top market movers) endpoint available on the free plan? If not, use the IEX snapshot gap scan. **Partly answered: D-024** (the 09:00 scan uses snapshots either way); doctor's `data.movers` check records availability once keys exist. **Answered by doctor on 2026-10-10: available** (`data.movers` PASS; the screener returned 10 gainers).

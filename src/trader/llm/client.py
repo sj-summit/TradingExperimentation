@@ -72,7 +72,7 @@ from trader.llm.claude_cli import (
 )
 from trader.llm.context import EncodedPack, Pack, Role
 from trader.llm.context import encode as encode_pack
-from trader.llm.roles import RoleSpec, role_specs
+from trader.llm.roles import RoleSpec, prompt_sha256, role_specs
 from trader.llm.schemas import (
     SchemaMode,
     SymbolAssessment,
@@ -555,7 +555,7 @@ class LlmCalls:
     ) -> _Attempt | str:
         prompt = (self._prompts / spec.prompt_file).resolve()
         try:
-            prompt_sha = await self._off(_sha256_of, prompt)
+            prompt_sha = await self._off(prompt_sha256, prompt)
         except OSError:
             return "prompt_missing"  # gone since the check
         folder = self._artifacts / day.isoformat()
@@ -882,10 +882,6 @@ def _schema(spec: RoleSpec, mode: SchemaMode) -> _Schema:
         sha256=hashlib.sha256(sent).hexdigest(),
         full=wire_schema(spec.output, "full"),
     )
-
-
-def _sha256_of(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _write_bytes(path: Path, data: bytes) -> None:

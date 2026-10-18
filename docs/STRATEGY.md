@@ -410,6 +410,8 @@ A pattern that keeps showing up in the tally and carries `knowable_at_decision: 
 
 - **During an epoch,** only bug fixes are allowed. Any change to a parameter, prompt, model, or data feed increments `eval_epoch` (stored in the DB) and gets a DECISIONS.md entry.
 - **Reporting** always shows metrics per epoch. Prompt hashes and model aliases are journaled per call.
+- **The LLM setup is fingerprinted at boot** (prompts, instructions, schemas, models, efforts and flags): a change raises a P3 `llm_fingerprint_changed` naming what changed, so it can't start a new epoch unnoticed (D-065).
+- **The prompts hold no numbers.** Every number the setup uses reaches Claude in the context pack (`experiment`, `limits`), so a changed setting can't leave a prompt stating the old one.
 
 ---
 

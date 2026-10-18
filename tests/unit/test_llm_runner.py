@@ -189,7 +189,9 @@ class SlowCommit:
         return getattr(self._journal, name)
 
 
-PROMPT_SHA = hashlib.sha256((REPO / "prompts" / "catalyst_vet.md").read_bytes()).hexdigest()
+PROMPT_SHA = hashlib.sha256(
+    (REPO / "prompts" / "catalyst_vet.md").read_bytes().replace(b"\r\n", b"\n")
+).hexdigest()  # line endings made LF (D-065)
 
 
 def artifact(row: dict[str, Any]) -> dict[str, Any]:
