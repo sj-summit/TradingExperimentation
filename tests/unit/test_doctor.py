@@ -377,6 +377,29 @@ def test_claude_too_old_fails(green: Path) -> None:
     assert check(run_doctor(green, make_deps(runner=runner)), "claude.version").status == "FAIL"
 
 
+@pytest.mark.parametrize("shim", ["claude.cmd", "claude.BAT", "claude.ps1"])
+def test_a_script_shim_fails(green: Path, shim: str) -> None:
+    """D-064: cmd.exe would mangle the inline schema and keep the interrupt from the CLI."""
+    runner = FakeRunner()
+    found = {"claude": f"C:/npm/{shim}"}
+    deps = make_deps(runner=runner, which=found.get)
+    result = check(run_doctor(green, deps), "claude.version")
+    assert result.status == "FAIL"
+    assert "shim" in result.detail
+    assert not [call for call in runner.calls if call[0][1:] == ["--version"]]  # never run
+
+
+def test_a_cli_newer_than_the_tested_one_warns(green: Path) -> None:
+    set_yaml(green / "config" / "settings.yaml", "llm.max_tested_cli_version", "2.1.270")
+    result = check(run_doctor(green, make_deps(runner=FakeRunner())), "claude.version")
+    assert result.status == "WARN"
+    assert "2.1.280 is newer than llm.max_tested_cli_version 2.1.270" in result.detail
+    set_yaml(green / "config" / "settings.yaml", "llm.max_tested_cli_version", "2.1.280")
+    assert check(run_doctor(green, make_deps(runner=FakeRunner())), "claude.version").status == (
+        "PASS"
+    )
+
+
 def test_claude_auth_runs_isolated(green: Path) -> None:
     runner = FakeRunner()
     environ = {"PATH": "C:/fake/bin", "ANTHROPIC_API_KEY": "sk-ant-api-in-shell"}

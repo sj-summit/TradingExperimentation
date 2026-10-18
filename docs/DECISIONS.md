@@ -1943,6 +1943,165 @@ Append-only. Each entry records context, the decision, its consequences, and sou
 
 ---
 
+## D-064 — P4.4: the runner, its transports and the budget; the CLI's argv and how a call is stopped
+- **Date:** 2026-10-18 · **Status:** Accepted (the Phase 4 plan, P4.4 and decisions 1, 2, 4, 5 and 6).
+- **The runner** (`llm/client.py: LlmCalls`) is the one way trading code calls the model (invariant 5).
+  - `run(role, pack, *, deadline, purpose, persist)` makes one logical call: an attempt and at most one repair. It never raises for a failure: whatever goes wrong comes back as `ok=False` with a `failure` code. Only a cancellation goes on.
+  - **One `llm_calls` row per attempt** (migration 0007). The call's id is `YYYYMMDD-role-NN` (`YYYYMMDD-smoke-role-NN` for smoke calls), its attempts' `-1` and `-2`. They are numbered from the journal inside the insert's transaction, so they repeat on a replay and continue after a restart.
+  - **`LLMResult.call_id` is the attempt whose result stands.** Every `llm_call_id`, `last_llm_call_id` and `source_call_id` column holds such an id; `verdicts`, `daily_reviews` and `signal_reviews` reference `llm_calls(id)`. `logical_id` is the call's own id. The first build returned the logical id, which those foreign keys reject.
+  - **`final`:** the attempt whose result stands has `final = 1`. A call whose last attempt still has `final = 0` never produced a result: a repairable first try, then a cancellation or a crash before its repair. P4.7 treats it as abandoned and re-vets; the first try's failure still counts.
+  - **`persist(conn, output, attempt_id)`** runs in the transaction that completes a good answer. What the caller stores from the answer commits with the attempt's row, or neither does; if it raises, the attempt fails as `internal_error`. P4.7's verdicts and P4.10's review use it. Without it, an `ok` final row doesn't mean the caller stored anything.
+- **Refusals,** before an attempt:
+  - `no_time` (less than the role's `min_attempt_s` left: 60, 15 and 120 s) and `budget_exhausted` (checked in the attempt's own insert) leave no row.
+  - **`sandbox_dirty`, `prompt_missing` and `pack_too_large` come back on every call until a human fixes their cause.** Each is journaled as an attempt that failed without a CLI run: `failures()` counts it, the cap doesn't. This is decision 4: "every failed attempt counts, except one refused for budget or time". The first build left them without a row, so a stray file in the sandbox would have cost Book B every call all day with no degradation, no alert and no trace in the journal. P4.8 raises a P2 for them (`PERSISTENT_REFUSALS`).
+- **The budget** (`llm/budget.py`):
+  - `attempts(day)` counts trading CLI runs against `max_calls_per_day`.
+  - `failures(day)` counts failed trading attempts toward `llm_failures_degrade_after` (RISK.md §2), but not abandoned ones. A call and its failed repair are two.
+  - Smoke calls count toward neither.
+  - `slot` holds `max_concurrent` attempts at a time. It is taken per attempt, so a repair can queue behind another call's first try; the planned schedule never runs two calls together.
+- **Each attempt:**
+  1. inserts its row;
+  2. writes `<attempt id>.input.json`, the exact stdin;
+  3. runs the transport, its timeout min(the role's `timeout_s`, the time left to the deadline);
+  4. is classified;
+  5. writes `<attempt id>.output.json`;
+  6. completes its row.
+- **When something goes wrong:**
+  - **A cancellation** closes the row as `abandoned`. The insert is shielded: a cancelled caller's insert still commits, as every journal write does, and the row it made is then closed too.
+  - The cleanup waits 2 s at most. At a loop's teardown the journal's writer may already be gone, and boot's `close_abandoned()` then closes the row.
+  - **Any other error inside the runner** closes it as `internal_error`, a failed attempt: a transport error that isn't an `OSError`, a journal error, `persist` raising. A bug in the classifier does too, and its artifact is still written. A failed insert is a refusal (`internal_error`, no row). Before, all of these escaped `run()` and left the row open.
+  - **An artifact that can't be written fails its attempt** (`artifact_failed`). No call goes out whose input isn't on disk, and no answer is used whose output isn't (invariant 8). The rename is retried three times (0.35 s): on Windows a scanner can hold a new file for a moment.
+- **File work runs on a thread only beside a threaded journal.**
+  - Under simdrive (an inline journal: replay, sim days, `DayRun`) a thread hid that work from `settle()`. The SimClock then jumped in the middle of an attempt, or the drive got stuck: the review measured 3 to 10 simulated minutes for a 0 s call.
+  - Now a 7 s scripted attempt takes exactly 7 s there, beside a part of the day that wakes every second, and the ids hold with two calls at once.
+- **Classification** (`classify`, A§7.3), in this order:
+  1. **The process:** a timeout, or stdout over its cap.
+  2. **The envelope:**
+     - no JSON result: `invalid_json`, or `nonzero_exit` after a non-zero exit;
+     - an error subtype: `max_turns`, `execution_error`, `budget_usd`, `structured_retries`;
+     - `is_error`;
+     - a non-zero exit, even with a good envelope;
+     - a subtype other than `success`: `invalid_envelope`;
+     - no `structured_output`.
+  3. **The answer:** filtered to the pack's members, clamped, and validated with the pack's `pack_id`; a failure is `schema_invalid` or `wrong_pack_id`.
+
+  An executable that couldn't start is `spawn_failed`.
+- **The repair:**
+  - Only the output failures in `REPAIRABLE` get it (`invalid_json`, `no_structured_output`, `structured_retries`, `schema_invalid`, `wrong_pack_id`), and only with `min_attempt_s` left. It sends the same pack, with `REPAIR_NOTE` and at most 10 errors added to the instruction.
+  - **The errors are pydantic's messages, located only by the output models' own field names** (read from their schemas) **and list positions.** Anything else shows as `?`. So does the key of an `extra_forbidden` error, even one that spells a field of ours from elsewhere.
+  - The first build showed any part shaped like a name, so a key the model invented, perhaps steered by injected news (`SYSTEM_veto_all`), came back in the trusted `-p` text. Values and the expected `pack_id` never appear.
+- **The artifacts** (`runtime/llm/<date>/<attempt id>.{input,output}.json`):
+  - **What the output holds:**
+    - the envelope, or the first 64 KB of a stdout that isn't one;
+    - the answer as the runner returned it;
+    - stderr's tail and the exit code;
+    - how a late child was stopped;
+    - the errors, and the clamp and drop counts;
+    - the argv, with the schema shown by its hash.
+  - **It is ASCII JSON.** A lone surrogate in the model's JSON (`\ud83d`, the one strict-mode case D-061 lets through) stays an escape. UTF-8 can't hold one, and the first build crashed writing it, losing the attempt.
+  - **Redaction** covers the credential's exact value and anything shaped like `sk-ant-` followed by 8 more characters.
+    - A tail or a capped stdout begins or ends at an arbitrary byte, so it drops 512 characters at that edge (`CUT_MARGIN`). A secret the cut went through then leaves no part behind.
+    - The review showed a 16 KB tail could start inside the token and keep most of it.
+- **The CLI's argv** (`build_argv`, A§7.2):
+  - The instruction comes right after `-p` (decision 2). Every role's instruction ends "Copy the pack's pack_id into your answer."
+  - **`--setting-sources user` is new: the CLI then reads no project or local settings, `CLAUDE.md` or `.mcp.json` from the sandbox's parent folders.**
+    - The sandbox sits inside the repository, under its `CLAUDE.md` and `.claude/`.
+    - On POSIX the CLI reads `.claude/settings.local.json` from the git root even when started in a subdirectory. An `env` block or an `apiKeyHelper` there would have reached every call around `build_claude_env`'s allowlist.
+    - Claude Code's docs give the flag for exactly this: "Pass `--setting-sources user` ... so Claude Code reads neither the project's settings files nor its `.mcp.json`" (permissions), and it turns off "project configuration such as `.claude/settings.json`, `CLAUDE.md`, and `.mcp.json`" (debug-your-config).
+    - It also keeps `safe_mode: false` from reopening the `CLAUDE.md` gap.
+  - **`--safe-mode`** (`llm.safe_mode`, on by default) turns off skills, plugins, hooks, MCP servers and auto memory. Its docs say authentication and permissions work normally, and they don't mention settings files: hence `--setting-sources` as well.
+  - **What still loads:** the bot's own `CLAUDE_CONFIG_DIR` (`runtime/claude-config`) and managed policy.
+  - **Never `--bare`:** bare mode can't use the OAuth token.
+  - **G4a's fallbacks:** `tools_flag: deny_all`, `safe_mode: false`, `schema_mode: wire_safe`.
+- **The environment** (`build_claude_env`):
+  - the allowlist;
+  - `CLAUDE_CONFIG_DIR`;
+  - `DISABLE_AUTOUPDATER=1`, new: the CLI must not update itself between calls. Doctor warns about a CLI newer than `max_tested_cli_version`.
+  - exactly one credential.
+- **The executable** (`resolve_claude`):
+  - **On Windows only a native `.exe` will do.**
+    - A `.cmd`, `.bat` or `.ps1` shim runs through cmd.exe, which parses the inline schema's quotes again, and an interrupt stops at the shim.
+    - A `.js` or extensionless file passes `shutil.which` (PATHEXT) but can't be started.
+  - Doctor and `from_config` both call it, so the two checks can't drift. `from_config` raises `LlmUnavailableError` for it, as for a missing credential.
+- **The transport** (`ClaudeCliTransport`, decision 6):
+  - The child starts in its own process group.
+  - **Whether the child is still running comes from its return code, polled every 50 ms.**
+    - In Python 3.12, `Process.wait()` resolves only once the pipes have closed too, and a loop's teardown can cancel the task waiting on it.
+    - The first build read that cancelled wait as an exit. When `asyncio.run` tore down with a call in flight (a second Ctrl+C), the CLI was left running; the review reproduced it 3 times in 3.
+    - A descendant holding the pipes also turned a finished answer into a timeout, about 21 s late.
+  - Once the child is gone, its pipes get 1 s to reach their end.
+  - **Stopping a late child:**
+    - **Windows:** CTRL_BREAK to its group, `kill_grace_s` (5 s), then System32's `taskkill /T /F` by its full path (a bare name is looked for in the interpreter's folder and the working directory first), then `TerminateProcess`. Without a console (a scheduled run) CTRL_BREAK can't be sent, and the kill comes at once.
+    - **POSIX:** SIGINT, the grace, SIGTERM, the grace, then SIGKILL to the group.
+    - `timed_out` only when the child was still running at the deadline.
+  - **A cancelled call kills its child before the cancellation goes on:** however often it is cancelled (a second cancel used to skip the stop), and when the loop is torn down.
+  - **Output caps:** stdout is read to 4 MB; past that the child is killed (`overflow`) and the rest drained. Stderr keeps its last 16 KB, marked `stderr_cut` once bytes are dropped.
+  - **Residual:** there is no Job Object yet, so a descendant that outlives the CLI, or a hard kill of the trader, can leave a process running. G4a's `--kill-test` records whether the real CLI leaves descendants.
+- **Configuration.** Each new setting has a default, so the frozen G3 config still validates: `llm.schema_mode`, `tools_flag`, `safe_mode`, `kill_grace_s`, `max_pack_bytes`, `max_tested_cli_version`, and each role's `min_attempt_s`.
+  - **Config refuses** a `min_attempt_s` over the role's `timeout_s`, and `allow_web: true`. E5's web tools aren't built, so the brief would run without them under a mislabeled experiment.
+  - **`LlmCalls.encode(pack)`** trims to `llm.max_pack_bytes`, the cap `run()` refuses past, so the two can't disagree.
+  - **`from_config` takes `command`, `env`, `sandbox_dir` and `artifacts_dir`.** A replay or a `--sim` day passes an env with no credential and its own folders. Otherwise it would write over the live day's artifacts, since ids repeat.
+- **Testing without the CLI** (A§7.4):
+  - **`scripts/fake_claude.py`** checks the call:
+    - the instruction after `-p`, every flag and its value, `--setting-sources user`, `--safe-mode`, no `--bare`, a schema under 8 KB;
+    - the config dir, the autoupdater off, exactly one credential, no other `ANTHROPIC_*` or `CLAUDE_*` variable, and no `NODE_OPTIONS`;
+    - an empty working directory.
+
+    Then it answers one of 16 scenarios. The slow ones set their interrupt handler before the slow import, so an early CTRL_BREAK can't end the process the default way.
+  - **`llm/fake.py`:** `ScriptedTransport`, whose delays pass on the injected clock, plus `answer_for` and `envelope`.
+    - A `Seen` never shows its env in a repr: under `--sim` it would hold a credential.
+    - P4.8 builds the `--sim` env without one.
+  - **The test guard now wraps `subprocess.Popen`.**
+    - Every path that starts a process is covered: the transport, doctor's probes, a `cmd /c claude` wrapper.
+    - It refuses any argv part that names `claude`, however spelled; Windows also runs `claude.exe.` and `claude `.
+    - It raises a `BaseException`, which no `except Exception` in the runner can turn into an ordinary failure.
+- **For P4.5:** the fingerprint's inputs are public: `role_specs`, `wire_schema` and `schema_bytes`, `REPAIR_NOTE`, `build_argv`. Hash the prompt's content, not its absolute path, which differs between the live root and a replay's.
+- **For P4.6:**
+  - **The isolation canary:**
+    - **The in-sandbox half** (a `CLAUDE.md`, a `.mcp.json` and a hook in the working directory) can't go through `LlmCalls`, which refuses a dirty sandbox. Build it from `build_argv`, `build_claude_env` and `ClaudeCliTransport` against a canary folder.
+    - **The parent half** runs through `LlmCalls`, with `sandbox_dir` an empty child of the canary folder. Add a parent `settings.local.json` with an `env` canary; it only means something on POSIX.
+  - Check the real sandbox is still empty after each call.
+  - `--kill-test` checks the stop path and descendants.
+  - Smoke calls use `purpose="smoke"`, and a `min_attempt_s` below their short timeouts.
+  - **At G4a,** confirm that OAuth and `structured_output` work with `--setting-sources user` and `--safe-mode`.
+- **For P4.7:**
+  - Read `final`.
+  - Store verdicts with `persist`; a final `ok` row alone doesn't mean they were stored.
+  - Re-vet an abandoned call: one with an `abandoned` final row, or whose last attempt isn't final.
+- **For P4.8:**
+  - Type `DayDeps.llm` as `LlmCalls`: it needs `budget.failures()` and `close_abandoned()`. Run `close_abandoned()` at boot, before any call.
+  - Raise a P3 for each failed attempt, from the rows of `result.attempts`, and a P2 for `PERSISTENT_REFUSALS`.
+  - Put `LLMResult.failure` into `decisions.detail`.
+  - Build the transport with `kill_grace_s`.
+  - Give replay and `--sim` their own env (no credential) and folders.
+  - Encode packs with `calls.encode`.
+  - A `RecordingTransport` can key its records by order and `pack_id`, since ids repeat on a replay.
+- **Spec updates:**
+  - ARCHITECTURE: §1, §2, §4.7, §6 (which id each `llm_call_id` column holds), §7.1–7.4, §12;
+  - RISK.md: what `llm_failures_degrade_after` counts, and the silent-billing row (`llm.provider`, not `llm.auth`);
+  - STRATEGY.md §5.4;
+  - CLAUDE.md invariant 5 (approved with the Phase 4 plan);
+  - the settings example's comments.
+- **Review.** Four reviewers (spec and integration, the process and its stop path, security, logic and tests), each checked by an adversarial verifier, made 49 findings, 33 distinct issues:
+  - **7 confirmed major:**
+    - the threads under simdrive (two reviewers);
+    - `call_id` against the foreign keys;
+    - errors after the insert leaving rows open (two);
+    - the lone surrogate;
+    - the CLI left running at a loop's teardown.
+
+    4 more were rated major and judged minor.
+  - No blocker; none refuted.
+
+  Every finding is fixed or recorded above. Each fix's test fails without it: 91 mutations, all caught. Three of them first needed a new test: a dict key the model wrote, a smoke call on a spent day, and a child that overflows and keeps running.
+- **Tests:** 119 in `test_llm_runner.py` and 40 in `test_claude_cli.py`, plus doctor, config and environment tests. 1,230 tests pass.
+- **Sources:**
+  - `--setting-sources`, `--safe-mode`: https://code.claude.com/docs/en/cli-reference
+  - `settings.local.json` read from the git root; `--setting-sources user` before `claude -p` in a repository: https://code.claude.com/docs/en/permissions
+  - the clean configuration: https://code.claude.com/docs/en/debug-your-config
+
+---
+
 ## Open questions to resolve during the build (record answers as new entries)
 
 - **Q1 (P1.2):** Is Alpaca's `movers` (top market movers) endpoint available on the free plan? If not, use the IEX snapshot gap scan. **Partly answered: D-024** (the 09:00 scan uses snapshots either way); doctor's `data.movers` check records availability once keys exist. **Answered by doctor on 2026-10-10: available** (`data.movers` PASS; the screener returned 10 gainers).

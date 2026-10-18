@@ -33,7 +33,7 @@ This is paper trading only until the human completes the go-live gate in `docs/P
 5. **No unofficial automation.**
    - Never automate Fidelity or any broker without an official API.
    - Never script claude.ai.
-   - LLM access goes only through `llm/client.py`: the `claude` CLI with the subscription token, or an Anthropic API key. Never pass the OAuth token to any other tool.
+   - LLM access goes only through `llm/client.py`'s `LlmCalls` (the `LLMClient`): the `claude` CLI with the subscription token or, when `llm.provider: anthropic_api`, an Anthropic API key. Doctor's `claude --version` and `claude auth status` probes are not model calls. Never pass the OAuth token to any other tool.
 6. **Secrets stay in `.env`** (gitignored). Never print, log, or commit secret values; `trader doctor` prints key *names* only.
 7. **Time comes from `core/clock.py`.** All timestamps are timezone-aware America/New_York. No naive datetimes and no `datetime.now()` outside that module.
 8. **Everything that can lead to a trade is journaled:** signal, each book's decision and reason code, the risk-gate result, orders, fills, and LLM call artifacts.

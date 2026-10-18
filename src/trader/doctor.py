@@ -45,7 +45,7 @@ from trader.data.alpaca_rest import (
     Timeframe,
 )
 from trader.data.ratelimit import RateLimiter
-from trader.llm.claude_cli import build_claude_env
+from trader.llm.claude_cli import ClaudeBinaryError, build_claude_env, resolve_claude
 from trader.memory.journal import open_database
 
 Status = Literal["PASS", "WARN", "FAIL", "SKIP"]
@@ -182,10 +182,14 @@ def run_doctor(root: Path, deps: DoctorDeps, *, quick: bool = False) -> list[Che
     elif quick:
         checks.append(_skip("claude", "--quick"))
     else:
-        exe = deps.which(cfg.settings.llm.claude_bin)
-        add("claude.version", lambda: _claude_version(cfg, deps, exe))
+        try:
+            exe: str | None = str(resolve_claude(cfg.settings.llm.claude_bin, which=deps.which))
+            unusable = None
+        except ClaudeBinaryError as exc:  # missing, or a shim (D-064): the runner refuses it too
+            exe, unusable = None, str(exc)
+        add("claude.version", lambda: _claude_version(cfg, deps, exe, unusable))
         if exe is None:
-            checks.append(_skip("claude.auth", "claude binary not found"))
+            checks.append(_skip("claude.auth", "no usable claude binary"))
         else:
             add("claude.auth", lambda: _claude_auth(cfg, deps, exe))
     add("claude.token", lambda: _token_age(cfg, deps))
@@ -465,13 +469,12 @@ def parse_version(text: str) -> tuple[int, int, int] | None:
     return (int(match[1]), int(match[2]), int(match[3])) if match else None
 
 
-def _claude_version(cfg: AppConfig, deps: DoctorDeps, exe: str | None) -> Result:
+def _claude_version(
+    cfg: AppConfig, deps: DoctorDeps, exe: str | None, unusable: str | None
+) -> Result:
     llm = cfg.settings.llm
     if exe is None:
-        return "FAIL", (
-            f"`{llm.claude_bin}` not found: add its folder (e.g. %USERPROFILE%\\.local\\bin) "
-            "to PATH, or set llm.claude_bin to the full path"
-        )
+        return "FAIL", unusable or f"`{llm.claude_bin}` not found"
     result = deps.run(
         [exe, "--version"],
         env=_claude_env(cfg, deps),
@@ -485,6 +488,12 @@ def _claude_version(cfg: AppConfig, deps: DoctorDeps, exe: str | None) -> Result
     shown = ".".join(map(str, found))
     if minimum is not None and found < minimum:
         return "FAIL", f"{shown} is older than llm.min_cli_version {llm.min_cli_version}"
+    tested = parse_version(llm.max_tested_cli_version or "")
+    if tested is not None and found > tested:
+        return "WARN", (
+            f"{shown} is newer than llm.max_tested_cli_version {llm.max_tested_cli_version}: "
+            "run `trader smoke llm` before trading on it"
+        )
     return "PASS", f"{shown} ({exe})"
 
 

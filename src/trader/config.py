@@ -152,6 +152,7 @@ class PremarketRoleConfig(_Model):
     allow_web: StrictBool
     max_candidates: StrictInt = Field(gt=0)
     max_news_per_symbol: StrictInt = Field(ge=0)
+    min_attempt_s: StrictInt = Field(default=60, gt=0)  # an attempt needs this long (D-064)
 
 
 class VetRoleConfig(_Model):
@@ -163,6 +164,7 @@ class VetRoleConfig(_Model):
     revet_premarket: StrictBool
     anonymize_entities: StrictBool
     max_news_per_symbol: StrictInt = Field(ge=0)
+    min_attempt_s: StrictInt = Field(default=15, gt=0)
 
 
 class ReviewRoleConfig(_Model):
@@ -175,6 +177,7 @@ class ReviewRoleConfig(_Model):
     history_days: StrictInt = Field(ge=0, le=30)
     notable_untraded: StrictInt = Field(ge=0)  # largest-|shadow_r| untraded targets (§6.5)
     max_news_per_target: StrictInt = Field(ge=0)
+    min_attempt_s: StrictInt = Field(default=120, gt=0)
 
 
 class LlmRolesConfig(_Model):
@@ -193,6 +196,13 @@ class LlmConfig(_Model):
     max_calls_per_day: StrictInt = Field(gt=0)
     max_concurrent: StrictInt = Field(gt=0)
     roles: LlmRolesConfig
+    # The call itself (D-064). Each has a default, so a config written before P4.4 validates.
+    schema_mode: Literal["full", "wire_safe"] = "full"  # wire_safe if the CLI refuses full
+    tools_flag: Literal["empty", "deny_all"] = "empty"  # deny_all: A§7.2's fallback
+    safe_mode: StrictBool = True  # --safe-mode: no CLAUDE.md, hooks, MCP or skills load
+    kill_grace_s: float = Field(default=5.0, gt=0, le=60)  # interrupt, wait, then kill
+    max_pack_bytes: StrictInt = Field(default=300_000, gt=0, le=10_000_000)  # stdin: 10 MB
+    max_tested_cli_version: str | None = Field(default=None, pattern=r"^\d+\.\d+\.\d+$")
 
 
 class LessonsConfig(_Model):
@@ -487,6 +497,21 @@ def consistency_problems(settings: Settings, risk: RiskConfig) -> list[str]:
         out.append(
             f"settings.strategy.entry.entry_timeout_s ({entry_timeout}) must equal "
             f"risk.entry_timeout_s ({risk.entry_timeout_s}); risk.yaml is authoritative"
+        )
+    for name, role in (
+        ("premarket", settings.llm.roles.premarket),
+        ("vet", settings.llm.roles.vet),
+        ("review", settings.llm.roles.review),
+    ):
+        if role.min_attempt_s > role.timeout_s:
+            out.append(
+                f"settings.llm.roles.{name}.min_attempt_s ({role.min_attempt_s}) must not exceed "
+                f"its timeout_s ({role.timeout_s})"
+            )
+    if settings.llm.roles.premarket.allow_web:
+        out.append(
+            "settings.llm.roles.premarket.allow_web must be false: the brief's web tools (E5) "
+            "aren't built, so it would run without them (D-064)"
         )
     if settings.books.A.policy != "baseline":
         out.append("settings.books.A.policy must be 'baseline' (Book A is rules only)")

@@ -54,7 +54,7 @@ Every layer must work even if the layers above it fail.
 | `drawdown_breaker_pct` | 10.0 | Peak-to-trough equity per book → halt until a human resumes |
 | `consecutive_losing_days_breaker` | 5 | → halt until a human resumes |
 | `event_blackout_before_min` / `after_min` | 5 / 10 | Around high-impact events in `config/events.yaml` |
-| `llm_failures_degrade_after` | 3 | Book B: no new entries for the rest of the day |
+| `llm_failures_degrade_after` | 3 | Failed attempts in a day: each first try or repair that failed, and each refusal that repeats on every call (a dirty sandbox, a missing prompt, a pack over its cap); not one refused for time or the budget, nor one abandoned in a crash (plan decision 4, D-064). Book B: no new entries for the rest of the day |
 
 ## 3. Pre-trade risk gate rules
 
@@ -189,7 +189,7 @@ Stop live trading and return to paper if either happens:
 | Overfitting "lessons" | Statistical promotion gate (STRATEGY.md §6.3). Lessons are soft guidance only and can't touch rules or limits. |
 | Silent model changes | Log the model alias and any resolved model ID per call. A prompt or model change means a new epoch. |
 | Subscription limits or outage | Book B degrades to `llm_unavailable` skips. Book A is unaffected. Calls are capped at `llm.max_calls_per_day`. |
-| Silent API billing | The LLM subprocess env strips `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` unless `llm.auth: api_key`. `doctor` asserts `claude auth status` reports `authMethod: oauth_token`. |
+| Silent API billing | The LLM subprocess env passes only an allowlist, so no `ANTHROPIC_*` or `CLAUDE_*` variable from the shell reaches a call; `ANTHROPIC_API_KEY` is set from `.env` only when `llm.provider: anthropic_api`. `--setting-sources user` keeps a project's settings (their `env` block, `apiKeyHelper`) out. `doctor` asserts `claude auth status` reports `authMethod: oauth_token` (`api_key` for that provider) (D-064). |
 
 ## 9. Operational risks
 

@@ -190,7 +190,7 @@ Verdicts for symbols that are not among that call's candidates are ignored and l
 | Verdict still pending | Hold until the verdict arrives or `max_wait_s` (60 s) after arming, whichever comes first; then apply it, re-checking the chase guard | `entered_after_wait` / `chased_after_wait` / `vetoed` |
 | Still pending after that | Skip | `vet_timeout` |
 | The LLM call covering it failed or returned invalid output (after one repair retry) | Skip | `llm_unavailable` |
-| 3 or more failed LLM calls today (`llm_failures_degrade_after` in risk.yaml) | No new Book B entries for the rest of the day | `llm_degraded` |
+| 3 or more failed LLM attempts today (`llm_failures_degrade_after` in risk.yaml): a call and its failed repair are two, and a refusal that repeats on every call counts (RISK.md §2, D-064) | No new Book B entries for the rest of the day | `llm_degraded` |
 | `day_mode = no_trade` | Skip all | `day_mode_no_trade` |
 
 Signals that haven't triggered yet keep waiting for their verdict; a late verdict (for example, from a repair call) still applies to them. Book A is never affected by any of these.

@@ -8,6 +8,12 @@ import yaml
 
 REPO = Path(__file__).resolve().parents[1]
 
+
+class RealClaudeError(BaseException):
+    """A test tried to run the real claude CLI (CLAUDE.md invariant 9). A BaseException, so no
+    ``except Exception`` in the code under test can turn it into an ordinary failure."""
+
+
 # Distinctive fake values. Tests assert none of them ever reaches logs or command output.
 FAKE_SECRETS: dict[str, str] = {
     "ALPACA_PAPER_A_KEY_ID": "PKTESTAAAAKEYID00001",

@@ -21,6 +21,8 @@ PARENT = {
     "CLAUDE_CODE_USE_FOUNDRY": "1",
     "CLAUDE_CONFIG_DIR": "C:/Users/me/.claude",
     "CLAUDE_CODE_OAUTH_TOKEN": "parent-token",
+    "CLAUDE_CODE_SIMPLE": "1",  # bare mode, which never reads the token
+    "NODE_OPTIONS": "--require evil.js",
     "AWS_SECRET_ACCESS_KEY": "aws",
     "ALPACA_PAPER_A_SECRET_KEY": "alpaca",
     "SOMETHING_ELSE": "x",
@@ -35,8 +37,10 @@ def test_only_os_basics_and_our_settings_pass_through() -> None:
         "USERPROFILE",
         "CLAUDE_CONFIG_DIR",
         "CLAUDE_CODE_OAUTH_TOKEN",
+        "DISABLE_AUTOUPDATER",
     }
     assert env["CLAUDE_CONFIG_DIR"] == str(CONFIG_DIR)
+    assert env["DISABLE_AUTOUPDATER"] == "1"  # no update between calls (D-064)
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "bot-token"
 
 

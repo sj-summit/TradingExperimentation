@@ -27,7 +27,7 @@ Design rules:
   - `Clock` → `RealClock` / `SimClock`
   - `BrokerAdapter` → `AlpacaBroker` / `SimBroker`
   - `MarketData` → `AlpacaMarketData` / `ReplayMarketData`
-  - `LLMClient` → `ClaudeCliClient` / `FakeLLMClient`
+  - `LLMClient` → `LlmCalls` with a `Transport`: `ClaudeCliTransport` / `ScriptedTransport` (D-064)
 - **If alpaca-py's stream clients run their own event loop,** run each in a dedicated thread and bridge events into asyncio through `loop.call_soon_threadsafe`. Never block the main loop. (Moot: both streams use our own asyncio clients, DECISIONS D-027 and D-030.)
 
 ---
@@ -57,7 +57,7 @@ ai-day-trader/
 │   ├── books/      base.py baseline.py llm_filtered.py
 │   ├── risk/       caps.py gate.py ledger.py killswitch.py breakers.py
 │   ├── execution/  broker.py alpaca_broker.py sim_broker.py orders.py service.py reconcile.py
-│   ├── llm/        client.py claude_cli.py anthropic_api.py candidates.py context.py schemas.py budget.py sanitize.py
+│   ├── llm/        client.py claude_cli.py roles.py fake.py candidates.py context.py schemas.py budget.py sanitize.py
 │   ├── memory/     journal.py migrations/0001_init.sql stats.py shadow.py lessons.py regime.py playbook.py reviews.py
 │   ├── orchestrator/ day.py tasks.py watchdog.py
 │   ├── reports/    daily.py weekly.py evaluation.py templates/
@@ -273,16 +273,24 @@ See §7 for the CLI contract.
 
 ```python
 class LLMClient(Protocol):
-    async def run(self, role: Role, context: dict, out_model: type[T], prompt_file: Path) -> LLMResult[T]: ...
+    async def run(self, role: Role, pack: EncodedPack, *, deadline: datetime,
+                  purpose: Literal["trading", "smoke"] = "trading",
+                  persist: Callable[[Connection, BaseModel, str], None] | None = None) -> LLMResult[Any]: ...
 
-@dataclass
+@dataclass(frozen=True)
 class LLMResult(Generic[T]):
-    ok: bool; output: T | None; call_id: str; duration_ms: int; error: str | None
+    ok: bool; output: T | None
+    call_id: str | None        # the attempt whose result stands: what every llm_call_id column holds
+    duration_ms: int           # all attempts
+    error: str | None; failure: str | None    # failure: the code (timeout, schema_invalid, no_time, ...)
+    attempts: tuple[str, ...]; logical_id: str | None
 ```
 
-- `ClaudeCliClient` is the default.
-- `AnthropicApiClient` is optional. It is only used if `llm.provider: anthropic_api`, with an API key, billed per token.
-- `budget.py` enforces `max_calls_per_day` and `max_concurrent`.
+- **`client.py`: `LlmCalls`** is the one runner (D-064). It owns the call ids, the budget, the `llm_calls` rows (one per attempt), the artifacts, the classification, the clamp and validation, and the one repair. `run()` never raises for a failure; only a cancellation goes on. `persist` runs in the transaction that completes a good answer, so what the caller stores from it commits with its row.
+- **Transports** (`claude_cli.Transport`): `ClaudeCliTransport` runs the CLI (§7.2); `fake.ScriptedTransport` answers from a script for tests and `--sim`. P4.8 adds the recording and replaying ones.
+- **`llm.provider: anthropic_api`** runs the same CLI with `ANTHROPIC_API_KEY` in place of the subscription token, billed per token (plan decision 3; no direct API client).
+- `roles.py` holds each role's spec: its output model, prompt file, instruction and limits.
+- `budget.py` counts the day's attempts and failures from `llm_calls` and holds `max_concurrent` attempts at a time.
 - `candidates.py` picks the brief's pre-market candidates, and `context.py` builds the packs (§8, D-063).
 - `sanitize.py` strips HTML, truncates text, flags injection-like strings, and optionally anonymizes entities (D-062). Text that won't settle is replaced and flagged, and a flagged item sets its candidate's `suspicious_content` (P4.4).
 
@@ -498,7 +506,11 @@ CREATE TABLE shadow_outcomes (signal_id TEXT PRIMARY KEY REFERENCES signals(id),
 CREATE TABLE llm_calls (id TEXT PRIMARY KEY, date TEXT, role TEXT, model_alias TEXT, model_resolved TEXT,
   prompt_sha256 TEXT, schema_sha256 TEXT, started_at TEXT, ended_at TEXT, duration_ms INTEGER,
   exit_code INTEGER, is_error INTEGER, num_turns INTEGER, cost_estimate_usd REAL, schema_valid INTEGER,
-  repair_attempted INTEGER, input_path TEXT, output_path TEXT, error TEXT);
+  repair_attempted INTEGER, input_path TEXT, output_path TEXT, error TEXT,
+  logical_id TEXT, attempt INTEGER, final INTEGER, ok INTEGER,   -- from 0007: a row per attempt (D-064)
+  failure TEXT, subtype TEXT, session_id TEXT, timed_out INTEGER, effort TEXT,
+  purpose TEXT, deadline TEXT, pack_id TEXT, pack_sha256 TEXT, pack_bytes INTEGER,   -- purpose: trading | smoke
+  candidates_json TEXT, cli_version TEXT, schema_mode TEXT, clamped INTEGER, eval_epoch INTEGER);
 CREATE TABLE verdicts (id INTEGER PRIMARY KEY, date TEXT, symbol TEXT, source TEXT, verdict TEXT,
   confidence REAL, catalyst_type TEXT, catalyst_fresh INTEGER, catalyst_confirmed INTEGER,
   risk_flags_json TEXT, reason TEXT, llm_call_id TEXT REFERENCES llm_calls(id));
@@ -552,11 +564,15 @@ CREATE INDEX ix_news_created ON news(created_at);
 CREATE INDEX ix_day_runs_date ON day_runs(date, kind);                              -- from 0004
 CREATE UNIQUE INDEX ux_day_runs_step ON day_runs(date, name) WHERE kind = 'step';  -- each EOD step once
 CREATE INDEX ix_decisions_signal_book ON decisions(signal_id, book, id);
+CREATE INDEX ix_llm_calls_day ON llm_calls(date, purpose, role);                    -- from 0007
+CREATE UNIQUE INDEX ux_llm_calls_attempt ON llm_calls(logical_id, attempt);
 CREATE VIEW final_decisions AS          -- decisions are append-only; this is the latest per (signal, book)
   SELECT d.* FROM decisions d
   WHERE d.id = (SELECT MAX(d2.id) FROM decisions d2
                 WHERE d2.signal_id = d.signal_id AND d2.book = d.book);
 ```
+
+**`llm_calls` holds one row per attempt** (D-064): `id` is the attempt's (`YYYYMMDD-role-NN-1`, the repair `-2`), `logical_id` the call's. Every `llm_call_id`, `last_llm_call_id` and `source_call_id` column, foreign key or not, holds an attempt id: `LLMResult.call_id`, the attempt whose result stands. A call whose last attempt has `final = 0` never produced a result (it was cut off before its repair), and readers treat it as abandoned.
 
 ---
 
@@ -569,14 +585,17 @@ CREATE VIEW final_decisions AS          -- decisions are append-only; this is th
 - The human runs `claude setup-token` once. It prints a one-year OAuth token for the subscription.
 - The token goes in `.env` as `CLAUDE_CODE_OAUTH_TOKEN`, with `CLAUDE_TOKEN_CREATED=YYYY-MM-DD` so `doctor` can warn before expiry.
 
-**Subprocess environment:** built explicitly, never inherited blindly.
+**Subprocess environment:** built explicitly, never inherited blindly (`build_claude_env`).
 
-- **Remove** `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_PROFILE`, and `CLAUDE_CODE_USE_BEDROCK|VERTEX|FOUNDRY`.
-  - Claude Code ranks these above `CLAUDE_CODE_OAUTH_TOKEN`, so a stray API key would silently switch billing to the API.
+- **Pass only an allowlist** of OS basics (PATH, SYSTEMROOT, the temp and home folders, the locale) and network plumbing (proxies, CA bundles). Everything else is dropped, `ANTHROPIC_*` and `CLAUDE_*` included.
+  - Claude Code ranks `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and the provider switches above `CLAUDE_CODE_OAUTH_TOKEN`, so a stray one would silently switch billing or the endpoint (D-002, D-021).
 - **Set** `CLAUDE_CONFIG_DIR=<repo>/runtime/claude-config`. This is a dedicated config dir, so the human's personal `~/.claude` settings, hooks, MCP servers, memory, and user `CLAUDE.md` never leak into trading calls.
-- **Set** `CLAUDE_CODE_OAUTH_TOKEN` from `.env`.
+- **Set** `DISABLE_AUTOUPDATER=1`, so the CLI never updates itself between calls (D-064).
+- **Set** `CLAUDE_CODE_OAUTH_TOKEN` from `.env`, or `ANTHROPIC_API_KEY` alone when `llm.provider: anthropic_api`.
 
-**Working directory:** `runtime/llm_sandbox/`. It's empty, with no `CLAUDE.md`, no `.mcp.json`, and no `.claude/`. A `-p` run in a project folder would otherwise load that project's hooks and MCP servers without a trust prompt.
+**Working directory:** `runtime/llm_sandbox/`. It must be empty, with no `CLAUDE.md`, no `.mcp.json`, and no `.claude/`. A `-p` run in a project folder would otherwise load that project's hooks and MCP servers without a trust prompt. The runner checks it before every attempt and refuses the call (`sandbox_dirty`) if anything is in it.
+
+**Parent folders:** the sandbox sits inside the repository, under its `CLAUDE.md` and `.claude/`. `--setting-sources user` keeps every project and local source out (settings files, `CLAUDE.md`, `.mcp.json`, and on POSIX the repository root's `settings.local.json`), and `--safe-mode` turns off the remaining customizations. Settings from `CLAUDE_CONFIG_DIR` and managed policy still load (D-064).
 
 **Do not use `--bare`.** Bare mode never reads OAuth credentials or `CLAUDE_CODE_OAUTH_TOKEN`; it needs an API key.
 
@@ -588,7 +607,7 @@ CREATE VIEW final_decisions AS          -- decisions are append-only; this is th
 ### 7.2 Invocation (per call)
 
 ```bash
-claude -p \
+claude -p "<role instruction, e.g. 'Produce the VetBatch for the candidates in the JSON context pack on stdin. Copy the pack's pack_id into your answer.'>" \
   --output-format json \
   --json-schema "<compact JSON schema for the role's output model, refs inlined>" \
   --model <alias: opus|sonnet|haiku> \
@@ -597,17 +616,19 @@ claude -p \
   --tools "" \
   --disallowedTools "mcp__*" \
   --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
+  --setting-sources user \
   --permission-mode dontAsk \
   --permission-prompts none \
   --max-turns <role.max_turns> \
   --no-session-persistence \
-  "<role instruction, e.g. 'Produce the VetBatch for the candidates in the JSON context pack on stdin.'>" \
-  < <context pack file>
+  --safe-mode \
+  < <context pack, piped>
 ```
 
-- **Web research (`allow_web: true`, pre-market only, default off):**
-  - replace `--tools ""` with `--tools "WebSearch,WebFetch"` and `--allowedTools "WebSearch,WebFetch"`;
-  - raise `--max-turns` (default 12).
+- **The instruction comes right after `-p`** (plan decision 2): an instruction last could be read as a value of a variadic flag.
+- **The executable** is `llm.claude_bin` resolved on PATH (`resolve_claude`). On Windows it must be the native `.exe`: a `.cmd` or `.ps1` shim runs through cmd.exe, which parses the inline schema's quotes again, and an interrupt stops at the shim. Doctor FAILs on one, and the runner refuses it.
+- **Fallbacks, set at G4a if the CLI needs them:** `llm.tools_flag: deny_all` drops `--tools` and sends `--disallowedTools "*"`; `llm.safe_mode: false` drops `--safe-mode`; `llm.schema_mode: wire_safe`.
+- **Web research (`allow_web`)** is E5's and isn't built: config refuses `allow_web: true` until it is.
 - **Phase 4 verification task.** Confirm empirically, and record the results in DECISIONS.md:
   1. `--tools ""` combined with `--json-schema` still returns `structured_output`.
   2. The JSON envelope fields.
@@ -617,39 +638,51 @@ claude -p \
 - **Stdin limit:** context packs are files piped to stdin; stdin is capped at 10 MB. Keep packs under 300 KB.
 - **Command line:** schemas are passed inline. Keep each under 8 KB, because Windows has command-line length limits.
 - **Schema:** `wire_schema(model, llm.schema_mode)` (§5): `full`, unless G4a shows the CLI needs `wire_safe`. Compacted they are 1.4–3.6 KB (D-061).
-- **Timeout:** per-role `timeout_s`. On timeout, send SIGINT, wait 5 s, then SIGTERM (exit code 143). Record the call as a timeout.
-- **Concurrency:** `llm.max_concurrent` (default 1). Calls are spaced and counted in `budget.py` (`max_calls_per_day`, default 12).
+- **Timeout:** each attempt gets min(the role's `timeout_s`, the time left to the call's deadline). No attempt starts with less than the role's `min_attempt_s` left (60, 15 and 120 s); the repair is skipped then.
+- **Stopping a late call** (plan decision 6). The child starts in its own process group.
+  - **Windows:** CTRL_BREAK to the group, wait `llm.kill_grace_s` (5 s), then System32's `taskkill /T /F`, then `TerminateProcess` if it is still there. Without a console (a scheduled run) CTRL_BREAK can't be sent, and the kill comes at once.
+  - **POSIX:** SIGINT, the grace, SIGTERM, the grace, then SIGKILL to the group.
+  - Whether the child is still running comes from its return code alone: `Process.wait()` also waits for the pipes, which a descendant can hold open. Once the child is gone its pipes get 1 s to reach their end.
+  - **A cancelled call kills its child** before the cancellation goes on, however often it is cancelled, and also when the event loop is torn down.
+  - Stdout is read to `MAX_STDOUT_BYTES` (4 MB); a child that writes more is killed (`output_too_large`). Stderr keeps its last 16 KB.
+- **Concurrency:** `llm.max_concurrent` (default 1) attempts at a time. `budget.py` counts attempts against `max_calls_per_day` (default 12), each first try and each repair; smoke calls never count.
 
 ### 7.3 Output handling
 
-1. Parse stdout as JSON. Expect `structured_output` (when `--json-schema` is used), `result`, `session_id`, `total_cost_usd`, `is_error`, `num_turns`, and `subtype`. Parse defensively; store the whole envelope.
+0. **Refusals,** before an attempt:
+   - `no_time` and `budget_exhausted` leave no row. The cap is checked in the attempt's own insert, so two attempts can't take the last call.
+   - `sandbox_dirty`, `prompt_missing` and `pack_too_large` would come back on every call until a human fixes their cause. Each is journaled as an attempt that failed without a CLI run: it counts toward `llm_failures_degrade_after`, never toward `max_calls_per_day`, and P4.8 raises a P2 for it (D-064).
+1. **Classify the process first, then the envelope** (`classify`): a timeout, stdout over its cap, no JSON result (`invalid_json`, or `nonzero_exit` when the exit code wasn't 0), an error subtype (`max_turns`, `execution_error`, `budget_usd`, `structured_retries`), `is_error`, a non-zero exit even with a good envelope, a subtype other than `success` (`invalid_envelope`), no `structured_output`. A spawn failure is `spawn_failed`. Store the whole envelope.
 2. **Filter, clamp, then validate** (D-061):
    - **Drop what doesn't belong,** on the raw output: assessments whose symbol isn't one of the pack's candidates, and signal reviews whose `signal_id` isn't a review target. A stray entry then can't take a real one's place in a capped list. An entry too malformed to name a symbol or a signal is left to validation.
    - **Clamp** with `clamp_to_schema` and the `full` schema.
      - Cut: over-long free text, and the tails of the free lists (risk flags, factors, process issues, notes, lesson proposals). Each cut is counted in `llm_calls.clamped`.
      - Never cut: numbers, patterned strings, and the assessment, review and filter lists.
    - **Validate** `structured_output` with the pydantic model, with the pack's `pack_id` in the validation context.
-   - On failure (a type, an enum, a pattern, a range, a required field, a list over its cap, a wrong `pack_id`), make **one** repair call: same role, same pack, with the validation errors appended to the instruction. The errors never name the expected `pack_id`.
-   - If that also fails, the result is `ok=False`.
+   - On an output failure (`invalid_json`, `no_structured_output`, `structured_retries`, `schema_invalid`, `wrong_pack_id`), make **one** repair attempt, if `min_attempt_s` is left: same role, same pack, with the validation errors appended to the instruction.
+     - The errors are pydantic's messages, located only by the output models' own field names and list positions. A key the model invented shows as `?`, and its values never appear, nor the expected `pack_id`.
+   - If that also fails, the result is `ok=False`. Process and envelope failures get no repair.
 3. Post-validation filters:
    - de-duplicate by symbol, keeping the higher-confidence entry;
    - review only: log targets left unreviewed; treat an `existing_issue_id` or `existing_note_id` that isn't open in the pack as a new entry.
-4. Persist:
-   - context pack → `runtime/llm/YYYY-MM-DD/<call_id>.input.json`
-   - envelope → `<call_id>.output.json`
-   - a row in `llm_calls`
+4. Persist, per attempt:
+   - the exact stdin → `runtime/llm/YYYY-MM-DD/<attempt id>.input.json`, written before the CLI starts;
+   - `<attempt id>.output.json`: the envelope (or the first 64 KB of a stdout that isn't one), the answer as the runner returns it, stderr's tail, the exit code, how a late child was stopped, and the argv with the schema shown by its hash. It is ASCII JSON (a lone surrogate from the model stays an escape) and redacted: the credential's exact value and anything shaped like `sk-ant-...`. A tail or a capped stdout loses 512 characters at its cut edge, where a secret cut in two would otherwise survive in part;
+   - an artifact that can't be written fails its attempt (`artifact_failed`): no call goes out whose input isn't on disk, and no answer is used whose output isn't (CLAUDE.md invariant 8);
+   - the attempt's row in `llm_calls`, inserted at the start and completed at the end. A cancellation closes it as `abandoned`; any other error inside the runner as `internal_error`; a crash leaves it to boot's `close_abandoned()`;
    - verdicts and day mode to their tables;
    - the review's parts to `daily_reviews`, `signal_reviews`, `process_issues`, `review_notes`, and `lessons` (via `memory/reviews.py` and `memory/lessons.py`).
 5. `total_cost_usd` is a client-side estimate. On a subscription it isn't a bill, but log it to watch usage trends.
 
 ### 7.4 Testing without the network
 
-`scripts/fake_claude.py` is a stand-in executable, selected with `llm.claude_bin`, that:
+- **`scripts/fake_claude.py`** runs as a real subprocess: `[python, scripts/fake_claude.py, --scenario NAME, <the argv after the executable>]`.
+  - It first checks the call as the real CLI would see it, and exits 2 naming each problem: the instruction right after `-p`, every flag with its value, `--setting-sources user`, `--safe-mode`, no `--bare`, a JSON schema under 8 KB; `CLAUDE_CONFIG_DIR`, `DISABLE_AUTOUPDATER=1`, exactly one credential and no other `ANTHROPIC_*` or `CLAUDE_*` variable, nor `NODE_OPTIONS`; an empty working directory.
+  - **Scenarios:** `valid`, `invalid_json`, `schema_invalid`, `repair_ok`, `no_structured_output`, `structured_retries`, `is_error`, `max_turns`, `nonzero_exit`, `nonzero_with_envelope`, `slow`, `slow_stubborn`, `wrong_pack_id`, `huge`, `leaky`, `stdin_missing`.
+- **`llm/fake.py`:** `ScriptedTransport` answers each attempt from a script, its delays passing on the injected clock, so a `SimClock` day takes simulated time; `answer_for(pack)` is a cautious valid answer, and `envelope()` wraps one as the CLI does.
+- **The guard:** an autouse fixture refuses any process whose argv names `claude`, however it is spelled, through `subprocess.Popen` (asyncio's included), and raises a `BaseException` no runner code can catch (invariant 9).
 
-- reads its args and stdin;
-- returns canned envelopes from `tests/fixtures/llm/`: valid, invalid JSON, schema-invalid, `is_error`, a slow response for the timeout path, and non-zero exits.
-
-All `ClaudeCliClient` tests use it. The real CLI runs only in `trader smoke llm` (HUMAN GATE).
+The real CLI runs only in `trader smoke llm` (HUMAN GATE).
 
 ---
 
@@ -767,7 +800,7 @@ Per-role contents:
 | Layer | What | Tooling |
 |---|---|---|
 | Unit | indicators (ATR Wilder vs hand-computed fixtures), OR features, rel_vol, ranking, sizing, rounding, IDs, calendar (DST, early close), ledger (T+1 across weekends and holidays), every RiskGate rule, breakers, reason codes, schema validation, sanitizer, DSL evaluator, bootstrap determinism | pytest, hypothesis |
-| Component | MarketDataHub reconnect and backfill (fake WS), ExecutionService with SimBroker (fills, partials, rejects, timeouts, unprotected-position path), ClaudeCliClient with `fake_claude.py` | pytest-asyncio |
+| Component | MarketDataHub reconnect and backfill (fake WS), ExecutionService with SimBroker (fills, partials, rejects, timeouts, unprotected-position path), `LlmCalls` and `ClaudeCliTransport` with `fake_claude.py`, and under simdrive with `ScriptedTransport` | pytest-asyncio |
 | Integration | Full simulated day: synthetic fixture day plus one recorded real day (G3 run 2, `tests/golden/recordings/2026-10-14/`, D-054), through `replay` with SimClock, SimBroker or the recorded broker answers, compared against a golden journal snapshot | pytest |
 | Manual (gated) | `smoke paper`, `smoke llm`, a supervised `run-day` | CLI |
 

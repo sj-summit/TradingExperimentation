@@ -84,7 +84,7 @@ Role = Literal["premarket", "vet", "review"]
 Json = dict[str, Any]
 
 PACK_VERSION = 1
-MAX_PACK_BYTES = 300_000  # A§7.2; P4.4's llm.max_pack_bytes passes its own
+MAX_PACK_BYTES = 300_000  # A§7.2; LlmCalls.encode passes llm.max_pack_bytes (D-064)
 ID_HEX = 16  # hex digits of the pack's SHA-256 in its id: 64 bits no answer can guess
 # Characters read per news field. Alpaca's summaries run a few hundred; a longer field is
 # flagged, and the cap bounds the sanitizer's work at about 0.1 s an item (D-063).

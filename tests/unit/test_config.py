@@ -194,6 +194,19 @@ def test_env_prefix_must_name_known_keys(repo: Path) -> None:
     assert has(problems_of(repo), "ALPACA_PAPER_C_KEY_ID is not a known .env key")
 
 
+def test_an_attempt_must_fit_its_own_timeout(repo: Path) -> None:
+    set_yaml(repo / SETTINGS, "llm.roles.vet.min_attempt_s", 61)
+    assert has(problems_of(repo), "llm.roles.vet.min_attempt_s (61)", "timeout_s (60)")
+    set_yaml(repo / SETTINGS, "llm.roles.vet.min_attempt_s", 60)
+    load_config(repo)  # equal is fine
+
+
+def test_the_briefs_web_tools_stay_off_until_built(repo: Path) -> None:
+    """E5 isn't built: allow_web true would run the brief without web tools, unnoticed."""
+    set_yaml(repo / SETTINGS, "llm.roles.premarket.allow_web", True)
+    assert has(problems_of(repo), "allow_web must be false")
+
+
 # ---------------------------------------------------------------- .env
 
 

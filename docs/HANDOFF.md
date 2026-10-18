@@ -1,4 +1,4 @@
-# HANDOFF: Phase 4 under way; P4.0a–P4.0c and P4.1–P4.3 done (updated 2026-10-17)
+# HANDOFF: Phase 4 under way; P4.0a–P4.0c and P4.1–P4.4 done (updated 2026-10-18)
 
 **Latest:**
 - **Phase 4's plan is approved** (2026-10-14; `C:\Users\Admin\.claude\plans\squishy-popping-honey.md`). Order: P4.0a, P4.0b, P4.0c, P4.1–P4.6, 🛑 G4a, P4.7–P4.10, 🛑 G4b.
@@ -32,7 +32,7 @@
   - `llm/sanitize.py` cleans news for the packs until it settles; markup that won't settle is removed and flagged.
   - It flags injections across several views and folds. On the reviewers' corpora: no false positives on 735 benign items, and 94% of 247 attacks caught.
   - A flagged item will set its candidate's `suspicious_content` in code (P4.4). Reviewed by three agents; 1,008 tests pass.
-- **P4.3 is done (D-063), uncommitted.**
+- **P4.3 is done (D-063).**
   - `llm/candidates.py` picks the brief's 40 candidates: 30 gainers, then 10 more with news.
   - `llm/context.py` builds the three packs:
     - third-party and model text only under `untrusted`;
@@ -42,12 +42,22 @@
     - bytes that depend only on the inputs.
   - Its review found no blocker. The one confirmed major: filings showed as "none" when never fetched.
   - It also fixed three things in P4.2's sanitizer: a quadratic parser, a cut that wasn't idempotent, and no per-field cap for packs. 1,065 tests pass.
-- **Commits:** HEAD is `937e25c` ("P4.2 complete", the human's commit of 2026-10-16 00:12 ET): everything through D-061 and P4.1's files. Uncommitted: P4.2's files and D-062, P4.3's files and D-063, and these doc updates. Commit only if asked.
+- **P4.4 is done (D-064), uncommitted.**
+  - `LlmCalls` (`llm/client.py`) is the one runner: an attempt and at most one repair per call, a `llm_calls` row per attempt, and `run()` never raises for a failure.
+    - `LLMResult.call_id` is the attempt whose result stands: every `llm_call_id` column holds one.
+    - `persist()` lets P4.7 and P4.10 store an answer in the transaction that completes it.
+  - **Refusals:** for time or the cap, no row. A dirty sandbox, a missing prompt or a pack over its cap is journaled as a failed attempt that counts toward `llm_degraded` but not the cap (decision 4).
+  - **Artifacts:** ASCII, redacted (a cut tail loses 512 characters at its edge), and fail-closed: no call without its input on disk, no answer without its output.
+  - **The CLI** runs with the instruction right after `-p`, `--setting-sources user` (new: nothing from the repository's `CLAUDE.md` or `.claude/` loads) and `--safe-mode`. On Windows only the native `claude.exe` will do.
+  - **Stopping a call:** CTRL_BREAK, 5 s, then System32's `taskkill /T /F`. Exit is read from the return code; a cancelled call, even at a loop's teardown, kills its child.
+  - Tested with `scripts/fake_claude.py` (16 scenarios) and `ScriptedTransport`, also under simdrive; a guard on `subprocess.Popen` refuses the real `claude` in every test.
+  - Its review found no blocker; the 7 confirmed majors are fixed (threads under simdrive, `call_id` against the foreign keys, errors leaving rows open, a lone surrogate, the CLI left running at a teardown). 1,230 tests pass; 91 mutations caught.
+- **Commits:** HEAD is `e4f6cd1` ("P4.3 done", the human's commit of 2026-10-17 02:46 ET): everything through D-063. Uncommitted: P4.4's files and D-064, and these doc updates. Commit only if asked.
 - **Waiting on the human:**
   - **Before G4a:** H0.2 (Claude Code ≥ 2.1.268, `claude setup-token`, the token in `.env`).
   - **Before G4b:** the Phase 1 checks (`trader news`, `trader filings`, `trader stream --news`) and the `ALPACA_DATA_*` keys.
   - `run-day` isn't needed between gates: it stays a human gate until Phase 6.
-- **Next (Claude):** P4.4 (the runner, transports, budget and fake CLI).
+- **Next (Claude):** P4.5 (prompts v1: no config numbers, `pack_id` requested, the epoch fingerprint).
 - **New since G3, for the G4b runbook:**
   - **Log lines:**
     - `fees booked`, at boot and EOD. The first boot after 10-15 should book 10-12 to 10-14's 6 charges and 3 reversals (net $0.00), leaving E at $996.08 if no day trades before it;

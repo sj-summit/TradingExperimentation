@@ -73,21 +73,28 @@ schedule:                        # normal days; early-close days shift per ARCHI
 llm:
   enabled: true                  # Book B only; Book A never depends on the LLM
   provider: claude_cli           # claude_cli (subscription token) | anthropic_api (API key, billed per token)
-  claude_bin: claude             # tests point this at scripts/fake_claude.py
+  claude_bin: claude             # found on PATH, or a full path; on Windows only the native .exe (D-064)
   min_cli_version: "2.1.268"
   config_dir: runtime/claude-config    # isolated CLAUDE_CONFIG_DIR (DECISIONS D-002)
   sandbox_dir: runtime/llm_sandbox     # empty cwd for every call
   max_calls_per_day: 12
   max_concurrent: 1              # Book B degradation threshold lives in risk.yaml (llm_failures_degrade_after)
+  schema_mode: full              # full | wire_safe (the fallback if the CLI refuses full; DECISIONS D-061)
+  tools_flag: empty              # empty: --tools "" | deny_all: --disallowedTools "*" (A§7.2's fallback)
+  safe_mode: true                # --safe-mode: no skills, plugins, hooks, MCP servers or auto memory load (D-064)
+  kill_grace_s: 5                # a call past its time is interrupted, then killed this long after
+  max_pack_bytes: 300000         # A§7.2; the CLI caps stdin at 10 MB
+  max_tested_cli_version: null   # set at G4a; doctor warns about a newer CLI
   roles:
     premarket:
       model: opus
       effort: high
       timeout_s: 600
       max_turns: 3
-      allow_web: false           # E5 experiment; when true, tools = WebSearch,WebFetch and max_turns 12
+      allow_web: false           # E5 experiment, not built yet: true is refused (D-064)
       max_candidates: 40
       max_news_per_symbol: 8
+      min_attempt_s: 60          # no attempt starts with less time than this before the deadline
     vet:
       model: sonnet
       effort: low
@@ -97,6 +104,7 @@ llm:
       revet_premarket: false
       anonymize_entities: false  # E1 experiment
       max_news_per_symbol: 5
+      min_attempt_s: 15
     review:
       model: opus
       effort: high
@@ -105,6 +113,7 @@ llm:
       history_days: 10           # past daily summaries recalled into the review pack (STRATEGY.md §6.6)
       notable_untraded: 5        # extra triggered signals reviewed: largest |shadow_r| that no book traded (§6.5)
       max_news_per_target: 5
+      min_attempt_s: 120
 
 lessons:
   min_n_per_side: 20
