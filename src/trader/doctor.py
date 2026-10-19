@@ -8,7 +8,6 @@ import asyncio
 import json
 import os
 import platform
-import re
 import shutil
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
@@ -45,7 +44,12 @@ from trader.data.alpaca_rest import (
     Timeframe,
 )
 from trader.data.ratelimit import RateLimiter
-from trader.llm.claude_cli import ClaudeBinaryError, build_claude_env, resolve_claude
+from trader.llm.claude_cli import (
+    ClaudeBinaryError,
+    build_claude_env,
+    parse_version,
+    resolve_claude,
+)
 from trader.memory.journal import open_database
 
 Status = Literal["PASS", "WARN", "FAIL", "SKIP"]
@@ -462,11 +466,6 @@ def _claude_env(cfg: AppConfig, deps: DoctorDeps) -> dict[str, str]:
         oauth_token=token.get_secret_value() if token and llm.provider == "claude_cli" else None,
         api_key=key.get_secret_value() if key and llm.provider == "anthropic_api" else None,
     )
-
-
-def parse_version(text: str) -> tuple[int, int, int] | None:
-    match = re.search(r"(\d+)\.(\d+)\.(\d+)", text)
-    return (int(match[1]), int(match[2]), int(match[3])) if match else None
 
 
 def _claude_version(

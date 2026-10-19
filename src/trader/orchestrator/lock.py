@@ -12,6 +12,8 @@ from pathlib import Path
 from types import TracebackType
 from typing import Self
 
+LOCK_NAME = "run-day.lock"  # beside the journal; `smoke llm` takes it too, for the sandbox
+
 
 class RunLockError(RuntimeError):
     """Another engine holds the lock."""

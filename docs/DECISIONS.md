@@ -2147,6 +2147,73 @@ Append-only. Each entry records context, the decision, its consequences, and sou
 
 ---
 
+## D-066 — P4.6: `trader smoke llm`: real calls on fictional packs, an isolation canary with its control, and a kill test that watches for leftovers
+- **Date:** 2026-10-18 · **Status:** Accepted (the Phase 4 plan, P4.6, and D-064's notes for P4.6). The code only: running it is G4a, the human's.
+- **The command:** `trader smoke llm [--role all|none|premarket|vet|review] [--schema-mode full|wire_safe] [--tools-flag empty|deny_all] [--no-canary] [--canary-control] [--kill-test]` (`llm/smoke.py`). Its last line is `SMOKE LLM PASSED` or `SMOKE LLM FAILED`, with exit 1.
+  - **Preflight:** the executable (`resolve_claude`), the credential, `claude --version` under the calls' own environment (not a model call), a version no older than `llm.min_cli_version`, and an empty sandbox.
+  - **One call per role,** through `LlmCalls` with purpose `smoke`: ids `YYYYMMDD-smoke-role-NN`, never counted toward the cap or Book B's degradation (D-064). They run in the real sandbox, with the settings' models, efforts and timeouts; the deadline leaves two attempts (2 × `timeout_s` + 30 s). Artifacts go to `runtime/llm/smoke/<date>/`.
+  - **What it prints,** per attempt, from its row and its redacted artifact:
+    - the result and duration, the exit code, the subtype, `is_error`, turns, clamped and dropped counts, the session id, the cost estimate, the resolved model, and the envelope's keys;
+    - on a failure, the CLI's own message (`result`, `errors`), the validation errors, how a late child was stopped, and stderr's last lines, with control characters removed;
+    - the answer by its counts only, never the model's free text, and what became of the injection headline.
+
+    After each call the sandbox must still be empty: the next trading call would refuse a sandbox that isn't.
+  - **It holds `run-day.lock`** (`orchestrator/lock.LOCK_NAME`). A smoke run beside a session would share its sandbox, and a file the CLI left there for a moment would make Book B's calls refuse.
+  - **Two additions to the plan's options:**
+    - `--tools-flag` tries A§7.2's first fallback, as `--schema-mode` tries the schema's, without editing `settings.yaml`;
+    - `--role none` runs only the canary or the kill test, for a rerun that spends nothing on the roles.
+- **The packs** (`llm/smoke_packs.py`, from the package data `llm/smoke_data.json`):
+  - **Forty fictional issuers** with six-letter symbols, which no US exchange lists; made-up news from five kinds of stories; the live `experiment` and `limits`, so the prompts read what a trading day's packs hold (D-065).
+  - **The brief:** 40 candidates (30 gainers, then 10 with news), up to 3 news items each; filings that are a prospectus, an 8-K, unknown (EDGAR failed) or none. About 40 KB.
+  - **The vet at full size:** 25 candidates with 5 news items each. About 58 KB.
+  - **The review:** 25 signals, 8 of them targets (2 traded, 2 vetoed by Book B, 4 notable), with news either side of each decision, incidents, a lesson and `history`. About 34 KB.
+  - **The canary's:** a vet pack of 3 candidates.
+  - **One issuer's news carries an injection headline** in every pack. The sanitizer flags it, and the runner adds `suspicious_content` to its assessment.
+  - The same bytes every run, so a pack's id repeats across runs.
+- **The isolation canary,** under `runtime/llm_canary/<stamp>/`, plants each source of configuration a call could pick up, each with its own way of showing that it loaded:
+  - **Instructions:** `CLAUDE.md` and `CLAUDE.local.md` asking for a code word in every free-text field. CLAUDE.md reaches the model as a user message after the system prompt (memory docs), so one that loaded shows in the answer.
+  - **Settings:** `.claude/settings.json` and `settings.local.json`, holding:
+    - hooks on `SessionStart`, `UserPromptSubmit`, `Stop` and `SessionEnd` that append to a marker file: `echo <event> >> '<path>'`, which Git Bash, sh and PowerShell all run (the CLI's shells for hooks; a test runs it in Git Bash and PowerShell 7);
+    - an `env` block pointing `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL` at `canary-model-<place>`. Project and local settings may set these: they aren't on the docs' list of variables ignored there. A leaked block fails the call, or names the model;
+    - an `apiKeyHelper` printing `canary-key-<place>`. It outranks the token (D-021), so a leaked one fails the call too;
+    - `enableAllProjectMcpServers: true`.
+  - **An `.mcp.json`** whose server is our Python writing a marker when started: no shell.
+  - **Why each matters, from the docs:**
+    - in a `-p` run, a folder's hooks, `env` block and helpers are used, and its `.mcp.json` servers connected without asking ("What runs before you trust a folder"; headless);
+    - hooks and `settings.json` load from the working directory's `.claude/` only, and `settings.local.json` from the git root except on Windows;
+    - `CLAUDE.md` loads from the working directory and every folder above it.
+  - **Two halves,** as D-064 planned:
+    - **the parent half** plants them above an empty sandbox and calls through `LlmCalls`;
+    - **the in-sandbox half** plants them in the working directory itself and calls `ClaudeCliTransport` with `build_argv`'s argv, since `LlmCalls` refuses a dirty sandbox. Its redacted record is written beside the canary.
+
+    Both roots are made git repositories when git is on PATH, so POSIX's git-root rule is exercised. A half passes when its call succeeds and shows no code word, no marker, no planted model or key, and no new file (git's own excluded).
+  - **The control** (`--canary-control`) repeats the in-sandbox half without `--setting-sources user`, `--safe-mode`, `--strict-mcp-config` and `--mcp-config`:
+    - with a `CLAUDE_CONFIG_DIR` of its own, so the bot's stays clean;
+    - without the `env` block or `apiKeyHelper`, which would fail its call and hide the code word.
+
+    Its three detectors (instructions, hooks, the MCP server) must each fire, or the canary can't vouch for that one. The model and key canaries need no control: they fail any call they reach. The control also loads the `CLAUDE.md` files above `runtime/`, the repository's own, which is harmless.
+  - **A clean canary removes its folder,** so no stray `CLAUDE.md` stays under `runtime/`. A canary that found something keeps it for the human.
+  - **Two changes to the plan's canary:**
+    - It calls the vet, not the brief: the canary needs only a call, and the vet is the cheapest.
+    - The control drops `--setting-sources` and the strict MCP flags as well as `--safe-mode`: since D-064 added `--setting-sources user`, dropping `--safe-mode` alone would leave the canary nothing to fire on.
+- **The kill test** (`--kill-test`): the vet with a 3 s timeout, through `LlmCalls` and the real transport (`min_attempt_s` 1 for it).
+  - **It passes when** the call times out, is stopped (interrupt, terminate or kill), and nothing the CLI started outlives the stop. It answers D-064's residual for the real CLI.
+  - **`llm/descendants.py`'s `DescendantWatch`** follows the child from the transport's `on_spawn`:
+    - **Windows:** it lists the processes (Toolhelp32) every 0.2 s while the child runs, and keeps the child's descendants by their parent links. It counts only processes that started after the watch did, so a reused parent id can't adopt an older process. After the stop, a survivor is a seen pid still running under the same name.
+    - **POSIX:** whether the child's process group still has a member.
+  - **Found while building it:** the venv's `python.exe` is a launcher that starts the interpreter as its own child. Killing the launcher kills the interpreter, but a process the interpreter started survives. Parent links break once an intermediate process dies, so descendants must be seen while the child runs, not looked up after.
+  - `scripts/fake_claude.py`'s new `slow_orphan` scenario leaves a process behind that ignores the interrupt. The kill test reports it, with its pid.
+- **Changes to existing code:**
+  - `client.py`: `credentialed_env`, `redactor` and `artifact_text` are public, so the canary's records are redacted as the runner's artifacts are; `from_config(roles=...)`.
+  - `parse_version` moved from `doctor.py` to `claude_cli.py`.
+  - `orchestrator/lock.py`: `LOCK_NAME`, used by `live.py` and the command.
+- **Not done:** `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` would turn off every `CLAUDE.md` as a third layer, beside `--setting-sources user` and `--safe-mode`. The canary shows at G4a whether the two suffice; if a code word ever comes back, this variable is the next step.
+- **For G4a (D-067):** record whether `structured_output` works with `--tools ""`, `--setting-sources user` and `--safe-mode` (Q4); the envelope's keys and subtypes; `schema_mode`; the exit codes seen; the canary's and the control's results; each role's duration against its timeout; the kill test's stop and any survivor; whether `.claude.json` is in the config dir (D-021); and the version for `llm.max_tested_cli_version`.
+- **Spec updates:** ARCHITECTURE §2, §4.7, §4.11 and §7.4; CLAUDE.md's Commands; HANDOFF's G4a runbook.
+- **Tests:** 53 in `test_smoke_llm.py`, none of which runs the real CLI. They cover the packs, every role call's lines, the preflight's refusals, each canary detector with a stand-in that reads the planted files as a CLI that isn't isolated would, the planted hook in Git Bash and PowerShell, the control, the kill test on `fake_claude.py` (interrupted, killed, and an orphan left running), and the watch on a real grandchild. 50 mutations, all caught. 1,308 tests pass.
+
+---
+
 ## Open questions to resolve during the build (record answers as new entries)
 
 - **Q1 (P1.2):** Is Alpaca's `movers` (top market movers) endpoint available on the free plan? If not, use the IEX snapshot gap scan. **Partly answered: D-024** (the 09:00 scan uses snapshots either way); doctor's `data.movers` check records availability once keys exist. **Answered by doctor on 2026-10-10: available** (`data.movers` PASS; the screener returned 10 gainers).

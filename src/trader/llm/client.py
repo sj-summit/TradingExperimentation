@@ -352,8 +352,7 @@ class LlmCalls:
         self.budget = budget
         self._schema_mode, self._tools_flag, self._safe_mode = schema_mode, tools_flag, safe_mode
         self._max_pack_bytes, self._cli_version = max_pack_bytes, cli_version
-        # what the artifacts never show: the credential the calls run with
-        self._secrets = {name: value for name in _CREDENTIALS if (value := self._env.get(name))}
+        self._redact = redactor(self._env)  # the artifacts never show the calls' credential
         self._schemas = {role: _schema(spec, schema_mode) for role, spec in self._roles.items()}
 
     @classmethod
@@ -370,6 +369,7 @@ class LlmCalls:
         artifacts_dir: Path | None = None,
         cli_version: str | None = None,
         parent_env: Mapping[str, str] | None = None,
+        roles: Mapping[Role, RoleSpec] | None = None,
     ) -> Self:
         """The runner the settings describe. Raises ``LlmUnavailableError`` without the
         credential or the executable.
@@ -381,10 +381,12 @@ class LlmCalls:
           ``--sim``) passes its own, with no credential in it.
         - ``sandbox_dir``, ``artifacts_dir``: by default the settings'. A replay or a sim day
           passes its own, or it would write over the live day's artifacts (ids repeat).
+        - ``roles``: by default the settings' (``role_specs``); ``smoke llm --kill-test`` passes
+          a vet with a short timeout.
         """
         llm = cfg.settings.llm
         if env is None:
-            env = _credentialed_env(cfg, os.environ if parent_env is None else parent_env)
+            env = credentialed_env(cfg, os.environ if parent_env is None else parent_env)
         if command is None:
             try:
                 command = (str(resolve_claude(llm.claude_bin)),)
@@ -395,7 +397,7 @@ class LlmCalls:
             clock=clock,
             transport=transport,
             command=command,
-            roles=role_specs(cfg.settings),
+            roles=role_specs(cfg.settings) if roles is None else roles,
             env=env,
             prompts_dir=cfg.root / "prompts",
             sandbox_dir=cfg.path(llm.sandbox_dir) if sandbox_dir is None else sandbox_dir,
@@ -648,7 +650,7 @@ class LlmCalls:
                 except Exception:  # a bug here must still close the row, as a failure
                     log.exception("llm attempt not classified", attempt=attempt_id)
                     outcome = Outcome("internal_error")
-            text = self._output_text(attempt_id, argv, result, outcome)
+            text = artifact_text(attempt_id, argv, result, outcome, self._redact)
             output_path = await self._save(folder / f"{attempt_id}.output.json", text.encode())
             if output_path is None:
                 outcome = dataclasses.replace(
@@ -811,45 +813,57 @@ class LlmCalls:
             )
         )
 
-    def _output_text(
-        self, attempt_id: str, argv: Sequence[str], result: TransportResult, outcome: Outcome
-    ) -> str:
-        """The output artifact, redacted. ASCII, so the model's JSON can't make it unwritable
-        (a lone surrogate stays an escape). Text cut at an arbitrary byte loses ``CUT_MARGIN``
-        characters at the cut, which takes any part of a secret the cut went through."""
-        envelope = outcome.envelope
-        stdout = None
-        if envelope is None:
-            stdout = result.stdout[:MAX_RAW_STDOUT].decode("utf-8", errors="replace")
-            if result.overflow or len(result.stdout) > MAX_RAW_STDOUT:
-                stdout = stdout[:-CUT_MARGIN]
-        stderr = result.stderr_tail.decode("utf-8", errors="replace")
-        if result.stderr_cut:
-            stderr = stderr[CUT_MARGIN:]
-        record = {
-            "attempt": attempt_id,
-            "argv": _shown(argv),
-            "exit_code": result.exit_code,
-            "timed_out": result.timed_out,
-            "overflow": result.overflow,
-            "stopped": result.stopped,
-            "duration_ms": int(result.duration_s * 1000),
-            "failure": outcome.failure,
-            "errors": list(outcome.errors),
-            "clamped": outcome.clamped,
-            "dropped": outcome.dropped,
-            "output": None if outcome.output is None else outcome.output.model_dump(mode="json"),
-            "envelope": envelope,
-            "stdout": stdout,
-            "stderr_tail": stderr,
-        }
-        return self._redact(json.dumps(record, ensure_ascii=True, indent=1))
 
-    def _redact(self, text: str) -> str:
-        return _KEY_LIKE.sub("***KEY***", redact_text(text, self._secrets))
+def artifact_text(
+    attempt_id: str,
+    argv: Sequence[str],
+    result: TransportResult,
+    outcome: Outcome,
+    redact: Callable[[str], str],
+) -> str:
+    """An attempt's output artifact, redacted. ASCII, so the model's JSON can't make it
+    unwritable (a lone surrogate stays an escape). Text cut at an arbitrary byte loses
+    ``CUT_MARGIN`` characters at the cut, which takes any part of a secret the cut went
+    through."""
+    envelope = outcome.envelope
+    stdout = None
+    if envelope is None:
+        stdout = result.stdout[:MAX_RAW_STDOUT].decode("utf-8", errors="replace")
+        if result.overflow or len(result.stdout) > MAX_RAW_STDOUT:
+            stdout = stdout[:-CUT_MARGIN]
+    stderr = result.stderr_tail.decode("utf-8", errors="replace")
+    if result.stderr_cut:
+        stderr = stderr[CUT_MARGIN:]
+    record = {
+        "attempt": attempt_id,
+        "argv": _shown(argv),
+        "exit_code": result.exit_code,
+        "timed_out": result.timed_out,
+        "overflow": result.overflow,
+        "stopped": result.stopped,
+        "duration_ms": int(result.duration_s * 1000),
+        "failure": outcome.failure,
+        "errors": list(outcome.errors),
+        "clamped": outcome.clamped,
+        "dropped": outcome.dropped,
+        "output": None if outcome.output is None else outcome.output.model_dump(mode="json"),
+        "envelope": envelope,
+        "stdout": stdout,
+        "stderr_tail": stderr,
+    }
+    return redact(json.dumps(record, ensure_ascii=True, indent=1))
 
 
-def _credentialed_env(cfg: AppConfig, parent: Mapping[str, str]) -> dict[str, str]:
+def redactor(env: Mapping[str, str]) -> Callable[[str], str]:
+    """What keeps the credential ``env`` holds, and anything shaped like an API key, out of
+    text an artifact keeps."""
+    secrets = {name: value for name in _CREDENTIALS if (value := env.get(name))}
+    return lambda text: _KEY_LIKE.sub("***KEY***", redact_text(text, secrets))
+
+
+def credentialed_env(cfg: AppConfig, parent: Mapping[str, str]) -> dict[str, str]:
+    """The calls' environment (``build_claude_env``) with the provider's credential from
+    ``.env``. Raises ``LlmUnavailableError`` without it."""
     llm = cfg.settings.llm
     name = "CLAUDE_CODE_OAUTH_TOKEN" if llm.provider == "claude_cli" else "ANTHROPIC_API_KEY"
     secret = cfg.secrets.secret(name)

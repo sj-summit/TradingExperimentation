@@ -847,6 +847,87 @@ async def _smoke_paper(root: Path, *, symbol: str, marketable: bool) -> None:
         raise typer.Exit(code=1)
 
 
+# ---------------------------------------------------------------- smoke (HUMAN GATE G4a)
+
+
+@smoke_app.command("llm")
+def smoke_llm(
+    ctx: typer.Context,
+    role: Annotated[
+        str, typer.Option("--role", help="all, none, premarket, vet or review.")
+    ] = "all",
+    schema_mode: Annotated[
+        str | None,
+        typer.Option("--schema-mode", help="full or wire_safe. Default: llm.schema_mode."),
+    ] = None,
+    tools_flag: Annotated[
+        str | None,
+        typer.Option(
+            "--tools-flag",
+            help='empty (--tools "") or deny_all (--disallowedTools "*"). Default: llm.tools_flag.',
+        ),
+    ] = None,
+    no_canary: Annotated[
+        bool, typer.Option("--no-canary", help="Skip the isolation canary.")
+    ] = False,
+    canary_control: Annotated[
+        bool,
+        typer.Option(
+            "--canary-control",
+            help="Also run the canary with the isolation flags off, to show it sees a leak.",
+        ),
+    ] = False,
+    kill_test: Annotated[
+        bool,
+        typer.Option("--kill-test", help="Also run a vet call with a 3 s timeout: the stop path."),
+    ] = False,
+) -> None:
+    """HUMAN GATE G4a: real calls to the claude CLI (your subscription) on packs of fictional
+    issuers, then an isolation canary. Nothing can trade; smoke calls never count toward the
+    day's budget. Exits 1 unless the last line is SMOKE LLM PASSED."""
+    _run(
+        _smoke_llm(
+            ctx.obj,
+            role=role,
+            schema_mode=schema_mode,
+            tools_flag=tools_flag,
+            canary=not no_canary,
+            control=canary_control,
+            kill_test=kill_test,
+        )
+    )
+
+
+async def _smoke_llm(
+    root: Path,
+    *,
+    role: str,
+    schema_mode: str | None,
+    tools_flag: str | None,
+    canary: bool,
+    control: bool,
+    kill_test: bool,
+) -> None:
+    from trader.llm.smoke import run_smoke_llm, smoke_options
+    from trader.orchestrator.lock import LOCK_NAME, RunLock
+    from trader.runtime import open_local
+
+    options = smoke_options(
+        role=role,
+        schema_mode=schema_mode,
+        tools_flag=tools_flag,
+        canary=canary,
+        control=control,
+        kill_test=kill_test,
+    )
+    async with open_local(root) as local:
+        db = local.cfg.path(local.cfg.settings.storage.db_path)
+        with RunLock(db.parent / LOCK_NAME):  # no session shares the sandbox meanwhile
+            ok = await run_smoke_llm(local.cfg, local.journal, local.clock, typer.echo, options)
+    if not ok:
+        raise typer.Exit(code=1)
+
+
 def _run(job: Coroutine[Any, Any, None]) -> None:
     """Run an async command; expected failures print one line and exit 1, never a traceback."""
     from trader.config import ConfigError

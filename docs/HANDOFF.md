@@ -1,4 +1,4 @@
-# HANDOFF: Phase 4 under way; P4.0a–P4.0c and P4.1–P4.5 done (updated 2026-10-18)
+# HANDOFF: Phase 4 under way; P4.0a–P4.0c and P4.1–P4.6 done; next 🛑 G4a (updated 2026-10-18)
 
 **Latest:**
 - **Phase 4's plan is approved** (2026-10-14; `C:\Users\Admin\.claude\plans\squishy-popping-honey.md`). Order: P4.0a, P4.0b, P4.0c, P4.1–P4.6, 🛑 G4a, P4.7–P4.10, 🛑 G4b.
@@ -52,17 +52,22 @@
   - **Stopping a call:** CTRL_BREAK, 5 s, then System32's `taskkill /T /F`. Exit is read from the return code; a cancelled call, even at a loop's teardown, kills its child.
   - Tested with `scripts/fake_claude.py` (16 scenarios) and `ScriptedTransport`, also under simdrive; a guard on `subprocess.Popen` refuses the real `claude` in every test.
   - Its review found no blocker; the 7 confirmed majors are fixed (threads under simdrive, `call_id` against the foreign keys, errors leaving rows open, a lone surrogate, the CLI left running at a teardown). 1,230 tests pass; 91 mutations caught.
-- **P4.5 is done (D-065), uncommitted.**
+- **P4.5 is done (D-065).**
   - The three prompts are v1 and hold no numbers: every setting reaches Claude in the pack (`experiment`, `limits`, `book_b`, `as_of`), so a changed setting can't leave a prompt stating the old one. Each asks for the `pack_id`; the brief's web-tools sentence is gone.
   - A test checks that every name a prompt quotes exists in its role's real pack or in the answers' schemas.
   - `llm/epoch.py` fingerprints what the calls ask (prompts, instructions, schemas, models, efforts, flags). A change is a P3 `llm_fingerprint_changed` at boot, wired in P4.8; bumping the epoch stays the human's call (S§9).
   - Prompt hashes ignore line endings, since `core.autocrlf` can rewrite the prompts with CRLF on checkout. 1,255 tests pass; 20 mutations caught.
-- **Commits:** HEAD is `d46e9b6` ("P4.4 Done", the human's commit of 2026-10-18 17:53 ET): everything through D-064. Uncommitted: P4.5's files and D-065, and these doc updates. Commit only if asked.
+- **P4.6 is done (D-066), uncommitted: `trader smoke llm`, the code only.** Running it is G4a (the runbook below).
+  - **A call per role** on packs of fictional issuers (six-letter symbols; the vet at full size, 25 candidates with 5 news items each), through `LlmCalls` with purpose `smoke`, so nothing counts toward the day's budget. Each prints the envelope's fields, the answer's counts, and what became of the injection headline. The sandbox must stay empty.
+  - **The isolation canary** plants every source of configuration a call could pick up: instructions with a code word; settings whose hooks leave a marker and whose `env` block and `apiKeyHelper` would fail the call; an `.mcp.json` server that leaves a marker. It plants them above an empty sandbox and in the working directory. `--canary-control` reruns it with the isolation flags off, to show each detector fires.
+  - **`--kill-test`:** the vet with a 3 s timeout, watched for the processes the CLI starts (`llm/descendants.py`), so G4a shows how the real CLI stops and whether anything outlives it (D-064's residual).
+  - It holds `run-day.lock`, so a session and a smoke run never share the sandbox. 1,308 tests pass; 50 mutations caught.
+- **Commits:** HEAD is `b42d5fd` ("P4.5 Done", the human's commit of 2026-10-18 18:43 ET): everything through D-065. Uncommitted: P4.6's files and D-066, and these doc updates. Commit only if asked.
 - **Waiting on the human:**
-  - **Before G4a:** H0.2 (Claude Code ≥ 2.1.268, `claude setup-token`, the token in `.env`).
+  - **G4a:** H0.2 (Claude Code ≥ 2.1.268, `claude setup-token`, the token in `.env`), then the runbook below.
   - **Before G4b:** the Phase 1 checks (`trader news`, `trader filings`, `trader stream --news`) and the `ALPACA_DATA_*` keys.
   - `run-day` isn't needed between gates: it stays a human gate until Phase 6.
-- **Next (Claude):** P4.6 (`trader smoke llm`: the code only; running it is G4a, the human's).
+- **Next (Claude):** after G4a, D-067 from its output; then P4.7 (Book B).
 - **New since G3, for the G4b runbook:**
   - **Log lines:**
     - `fees booked`, at boot and EOD. The first boot after 10-15 should book 10-12 to 10-14's 6 charges and 3 reversals (net $0.00), leaving E at $996.08 if no day trades before it;
@@ -78,7 +83,67 @@
   - **`--dry-run` prints the ledger's E before the fees are booked,** so it can differ by a few cents from the E boot uses.
   - **A size skip reads `capacity_positions` or `capacity_entries`** when R-006 or R-007 also binds (D-056), where it used to read `insufficient_settled_cash`.
 
-To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, the Phase 4 plan, and D-052 to D-063. The G3 runbook below served both runs and is the template for G4b. Everything below the line further down is the older G2 handoff, kept for its environment notes and the Phase 2 code map.
+To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, the Phase 4 plan, and D-052 to D-066. The G4a runbook below is the human's next step. The G3 runbook further down served both runs and is the template for G4b. Everything below the line further down is the older G2 handoff, kept for its environment notes and the Phase 2 code map.
+
+## 🛑 G4a: `trader smoke llm` (the human)
+
+**Before, once (H0.2),** in PowerShell at the repo root:
+1. Claude Code 2.1.268 or later, as the native `claude.exe`: `where.exe claude` should print `C:\Users\Admin\.local\bin\claude.exe`, and `claude --version` a version.
+2. `claude setup-token`. Copy the printed token into `.env` as `CLAUDE_CODE_OAUTH_TOKEN=...`, and add `CLAUDE_TOKEN_CREATED=` with today's date (YYYY-MM-DD).
+3. `uv run trader doctor`. Expect:
+   - `claude.version` PASS (`llm.max_tested_cli_version` stays unset until G4a, so no WARN yet);
+   - `claude.auth` PASS: `authMethod oauth_token, isolated config dir runtime/claude-config`;
+   - `claude.token` PASS.
+
+**The run,** with no `run-day` going (the command takes `run-day.lock` and refuses otherwise). It uses the subscription: three role calls, three canary calls and the kill test, for about 5 to 15 minutes.
+
+```powershell
+uv run trader smoke llm --canary-control --kill-test
+```
+
+**Pass criteria:**
+1. **The last line is `SMOKE LLM PASSED`.**
+2. **Each role** (`-- premarket`, `-- vet`, `-- review`):
+   - its last attempt reads `ok`, with `exit 0, subtype success, is_error no`;
+   - `envelope keys:` includes `structured_output`;
+   - the answer covers its pack: `40 assessments of 40 candidates`, `25 assessments of 25 candidates`, `8 reviews of 8 targets`;
+   - an `injection: QZIVOR flagged in the pack; ..., flags: ... suspicious_content` line for the brief and the vet, and `injection: flagged in the pack: 20261103-QZIVOR-orb5` for the review;
+   - `the sandbox is empty after the ... call`.
+3. **The canary:** `parent half: clean`, `in-sandbox half: clean`, then `control: every detector fired (instructions, hooks, the MCP server)` and `canary clean: its folder is removed`.
+4. **The kill test:** `stopped by ...`, then `nothing it started outlived the stop`.
+
+**Not failures** (paste them anyway: they are what G4a records):
+- an attempt `-1` that failed with `schema_invalid`, `wrong_pack_id` or `no_structured_output` and was repaired, with attempt `-2` `ok`;
+- any mix of verdicts and any day mode, including on QZIVOR: what matters is its flag;
+- `not assessed: ...` or `not reviewed: ...`: a gap, recorded at G4a. Book B will treat a candidate the answer leaves out as `llm_unavailable` (plan decision 8);
+- the durations, the cost estimates and the resolved model names;
+- `stopped by a kill of its process tree`: the CLI ignored CTRL_BREAK for the 5 s grace;
+- `.claude.json is there` or `is not there`: either answers D-021;
+- `git isn't on PATH`.
+
+**Stop and paste everything:**
+- `SMOKE LLM FAILED`, or a traceback.
+- **A role fails with `no_structured_output`, `structured_retries`, `invalid_envelope`, `is_error` or `nonzero_exit`.** Paste it, then try A§7.2's fallbacks one at a time and paste each:
+  ```powershell
+  uv run trader smoke llm --role vet --no-canary --tools-flag deny_all
+  uv run trader smoke llm --role vet --no-canary --schema-mode wire_safe
+  ```
+- **A `canary` FAIL line** (a code word, a hook, an MCP server, a planted model or key, a file left behind): the isolation is broken, so Book B must not run. The folder stays under `runtime\llm_canary\` for me to read; delete it once I have.
+- **A `control:` FAIL line:** the canary can't vouch for the detectors it names.
+- **`still running after the stop: <name> (<pid>)`:** paste it, then end each with `Stop-Process -Id <pid>`.
+- **`the sandbox ... holds ...`:** paste it, then empty it with `Remove-Item runtime\llm_sandbox\* -Recurse`.
+
+**After G4a (Claude):**
+1. Record DECISIONS D-067 from the output and the artifacts in `runtime\llm\smoke\<date>\`:
+   - whether `structured_output` works with `--tools ""`, `--setting-sources user` and `--safe-mode` (Q4);
+   - the envelope's keys, the subtypes and the exit codes seen;
+   - `schema_mode`, and any fallback that was needed;
+   - the canary's and the control's results;
+   - each role's duration against its timeout;
+   - the kill test's stop, and any process left behind;
+   - D-021's `.claude.json` answer.
+2. The human sets `llm.max_tested_cli_version` (and any fallback) in `config/settings.yaml`.
+3. Tick G4a in PLAN, then P4.7 (Book B).
 
 ## Where Phase 3 stands
 

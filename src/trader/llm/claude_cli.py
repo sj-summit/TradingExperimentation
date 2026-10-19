@@ -20,6 +20,7 @@
 import asyncio
 import contextlib
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -160,6 +161,12 @@ def resolve_claude(
             "mangles the inline schema and swallows the interrupt (D-064)"
         )
     return path
+
+
+def parse_version(text: str) -> tuple[int, int, int] | None:
+    """The first ``X.Y.Z`` in ``text``, such as ``claude --version``'s output."""
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", text)
+    return (int(match[1]), int(match[2]), int(match[3])) if match else None
 
 
 # ---------------------------------------------------------------- the transport

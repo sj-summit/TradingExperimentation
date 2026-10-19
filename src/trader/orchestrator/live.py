@@ -54,7 +54,7 @@ from trader.memory.incidents import record_incident
 from trader.memory.journal import Journal
 from trader.notify import notifier_from_config
 from trader.orchestrator.day import DayDeps, DayOrchestrator, DayPaths
-from trader.orchestrator.lock import RunLock
+from trader.orchestrator.lock import LOCK_NAME, RunLock
 from trader.orchestrator.ports import DayMarket
 from trader.orchestrator.provenance import source_sha256
 from trader.risk.killswitch import KILL_FILE
@@ -107,7 +107,7 @@ def folders(cfg: AppConfig, day: date, *, sim: bool) -> Folders:
             reports=cfg.path(storage.reports_dir),
             backups=db.parent / "backups",
             heartbeat=db.parent / "heartbeat.json",
-            lock=db.parent / "run-day.lock",
+            lock=db.parent / LOCK_NAME,
         )
     base = cfg.path(storage.db_path).parent / "sim" / day.isoformat()
     return Folders(
@@ -117,7 +117,7 @@ def folders(cfg: AppConfig, day: date, *, sim: bool) -> Folders:
         reports=base / "reports",
         backups=base / "backups",
         heartbeat=base / "heartbeat.json",
-        lock=base / "run-day.lock",
+        lock=base / LOCK_NAME,
     )
 
 

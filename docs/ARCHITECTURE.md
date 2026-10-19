@@ -57,13 +57,13 @@ ai-day-trader/
 │   ├── books/      base.py baseline.py llm_filtered.py
 │   ├── risk/       caps.py gate.py ledger.py killswitch.py breakers.py
 │   ├── execution/  broker.py alpaca_broker.py sim_broker.py orders.py service.py reconcile.py
-│   ├── llm/        client.py claude_cli.py roles.py fake.py epoch.py candidates.py context.py schemas.py budget.py sanitize.py
+│   ├── llm/        client.py claude_cli.py roles.py fake.py epoch.py candidates.py context.py schemas.py budget.py sanitize.py smoke.py smoke_packs.py smoke_data.json descendants.py
 │   ├── memory/     journal.py migrations/0001_init.sql stats.py shadow.py lessons.py regime.py playbook.py reviews.py
 │   ├── orchestrator/ day.py tasks.py watchdog.py
 │   ├── reports/    daily.py weekly.py evaluation.py templates/
 │   └── notify.py
 ├── tests/       unit/ integration/ fixtures/ (calendars, bars, news, llm envelopes, recorded day)
-└── runtime/     (gitignored) trader.db logs/ recordings/ llm/ claude-config/ llm_sandbox/ playbook.md heartbeat.json KILL
+└── runtime/     (gitignored) trader.db logs/ recordings/ llm/ claude-config/ llm_sandbox/ llm_canary/ playbook.md heartbeat.json KILL
 ```
 
 ---
@@ -294,6 +294,10 @@ class LLMResult(Generic[T]):
 - `budget.py` counts the day's attempts and failures from `llm_calls` and holds `max_concurrent` attempts at a time.
 - `candidates.py` picks the brief's pre-market candidates, and `context.py` builds the packs (§8, D-063).
 - `sanitize.py` strips HTML, truncates text, flags injection-like strings, and optionally anonymizes entities (D-062). Text that won't settle is replaced and flagged, and a flagged item sets its candidate's `suspicious_content` (P4.4).
+- `smoke.py` is `trader smoke llm` (G4a, D-066):
+  - a call per role through `LlmCalls` with purpose `smoke`, on `smoke_packs.py`'s packs of fictional issuers (from `smoke_data.json`);
+  - the isolation canary and its control;
+  - `--kill-test`, whose child `descendants.py` watches for processes that outlive the stop.
 
 ### 4.8 memory
 
@@ -357,7 +361,7 @@ class LLMResult(Generic[T]):
 | `halt`, `resume`, `flatten` | Kill switch | `resume` requires typed confirmation |
 | `watchdog` | Independent safety check | — |
 | `smoke paper` | Places and cancels a non-marketable 1-share OTO in paper | HUMAN GATE |
-| `smoke llm` | One call per role with fixture context packs | HUMAN GATE (uses subscription) |
+| `smoke llm [--role …] [--schema-mode …] [--tools-flag …] [--no-canary] [--canary-control] [--kill-test]` | A call per role on packs of fictional issuers, the isolation canary, the stop path (D-066) | HUMAN GATE (uses subscription) |
 | `schedule install\|uninstall\|show` | OS scheduler entries | HUMAN GATE |
 
 ---
@@ -679,11 +683,11 @@ claude -p "<role instruction, e.g. 'Produce the VetBatch for the candidates in t
 
 - **`scripts/fake_claude.py`** runs as a real subprocess: `[python, scripts/fake_claude.py, --scenario NAME, <the argv after the executable>]`.
   - It first checks the call as the real CLI would see it, and exits 2 naming each problem: the instruction right after `-p`, every flag with its value, `--setting-sources user`, `--safe-mode`, no `--bare`, a JSON schema under 8 KB; `CLAUDE_CONFIG_DIR`, `DISABLE_AUTOUPDATER=1`, exactly one credential and no other `ANTHROPIC_*` or `CLAUDE_*` variable, nor `NODE_OPTIONS`; an empty working directory.
-  - **Scenarios:** `valid`, `invalid_json`, `schema_invalid`, `repair_ok`, `no_structured_output`, `structured_retries`, `is_error`, `max_turns`, `nonzero_exit`, `nonzero_with_envelope`, `slow`, `slow_stubborn`, `wrong_pack_id`, `huge`, `leaky`, `stdin_missing`.
+  - **Scenarios:** `valid`, `invalid_json`, `schema_invalid`, `repair_ok`, `no_structured_output`, `structured_retries`, `is_error`, `max_turns`, `nonzero_exit`, `nonzero_with_envelope`, `slow`, `slow_stubborn`, `slow_orphan` (leaves a process behind that ignores the interrupt), `wrong_pack_id`, `huge`, `leaky`, `stdin_missing`.
 - **`llm/fake.py`:** `ScriptedTransport` answers each attempt from a script, its delays passing on the injected clock, so a `SimClock` day takes simulated time; `answer_for(pack)` is a cautious valid answer, and `envelope()` wraps one as the CLI does.
 - **The guard:** an autouse fixture refuses any process whose argv names `claude`, however it is spelled, through `subprocess.Popen` (asyncio's included), and raises a `BaseException` no runner code can catch (invariant 9).
 
-The real CLI runs only in `trader smoke llm` (HUMAN GATE).
+The real CLI runs only in `trader smoke llm` (HUMAN GATE G4a, D-066).
 
 ---
 

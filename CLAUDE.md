@@ -64,6 +64,7 @@ This is paper trading only until the human completes the go-live gate in `docs/P
 | Types | `uv run mypy src` |
 | Health check | `uv run trader doctor` |
 | Full paper day (HUMAN GATE until Phase 6 is done) | `uv run trader run-day --books A,B` |
+| LLM smoke test (HUMAN GATE G4a; uses the subscription) | `uv run trader smoke llm --canary-control --kill-test` |
 | Replay a recorded day offline | `uv run trader replay --date YYYY-MM-DD` |
 | Emergency stop | `uv run trader halt --flatten --book all` |
 

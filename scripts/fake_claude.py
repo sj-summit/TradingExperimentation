@@ -16,6 +16,7 @@ Then it reads the pack on stdin and answers as the scenario says. It never touch
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -39,8 +40,15 @@ OURS = frozenset({*CREDENTIALS, "CLAUDE_CONFIG_DIR"})  # the only ANTHROPIC_* or
 SCENARIOS = {
     "valid", "invalid_json", "schema_invalid", "repair_ok", "no_structured_output",
     "structured_retries", "is_error", "max_turns", "nonzero_exit", "nonzero_with_envelope",
-    "slow", "slow_stubborn", "wrong_pack_id", "huge", "leaky", "stdin_missing",
+    "slow", "slow_stubborn", "slow_orphan", "wrong_pack_id", "huge", "leaky", "stdin_missing",
 }  # fmt: skip
+# a process that ignores the interrupt and outlives its parent (smoke llm --kill-test)
+ORPHAN = (
+    "import signal, time; "
+    "interrupts = {signal.SIGINT, getattr(signal, 'SIGBREAK', signal.SIGINT)}; "
+    "[signal.signal(s, signal.SIG_IGN) for s in interrupts]; "
+    "time.sleep(60)"
+)
 
 
 def problems(argv: list[str], env: dict[str, str], cwd: Path) -> list[str]:
@@ -116,7 +124,7 @@ def handle_interrupts(scenario: str) -> None:
     interrupt = getattr(signal, "SIGBREAK", signal.SIGINT)
     if scenario == "slow_stubborn":
         signal.signal(interrupt, signal.SIG_IGN)
-    elif scenario == "slow":
+    elif scenario in ("slow", "slow_orphan"):
         signal.signal(interrupt, lambda *_: INTERRUPTED.append(True))
 
 
@@ -166,7 +174,13 @@ def main() -> None:
         sys.exit(1)
     if scenario == "nonzero_with_envelope":
         say(envelope(answer), 1)  # a good answer, but the run says it failed
-    if scenario in ("slow", "slow_stubborn"):
+    if scenario == "slow_orphan":  # leaves a process behind that ignores the interrupt
+        python = getattr(sys, "_base_executable", sys.executable)  # no venv launcher between
+        quiet = subprocess.DEVNULL
+        orphan = subprocess.Popen([python, "-c", ORPHAN], stdin=quiet, stdout=quiet, stderr=quiet)
+        sys.stderr.write(f"fake_claude: orphan {orphan.pid}\n")
+        sys.stderr.flush()
+    if scenario in ("slow", "slow_stubborn", "slow_orphan"):
         wait()
     if scenario == "wrong_pack_id":
         say(envelope({**answer, "pack_id": "vet-20990101-0123456789abcdef"}))
