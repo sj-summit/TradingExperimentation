@@ -176,6 +176,40 @@ async def test_an_arm_check_uses_its_own_price_and_time(journal: Journal, tmp_pa
     assert (got.last_price, got.quote_age_s, market.calls) == (D("12.33"), 1.5, 0)
 
 
+async def test_a_trigger_that_waited_is_priced_from_the_feed(
+    journal: Journal, tmp_path: Path
+) -> None:
+    """Book B asks again after waiting up to a minute for its verdict (D-068): an arm check's
+    own price and time are that old by then."""
+    clock, hub, market = SimClock(NOW), Hub(SimClock(NOW)), Market()
+    hub.trade = Trade(symbol="XYZ", ts=NOW - timedelta(seconds=2), price=D("12.36"), size=100)
+    live = inputs(journal, clock, hub, market, Broker(), tmp_path / "KILL")
+    got = await live.prepare("A", SIG, event("arm_check", "12.33", ago_s=0.5), waited=True)
+    assert (got.last_price, got.quote_age_s, market.calls) == (D("12.36"), 2.0, 0)
+
+
+async def test_a_trigger_that_waited_with_no_feed_price_takes_the_snapshots(
+    journal: Journal, tmp_path: Path
+) -> None:
+    """After a restart the hub may have a fresh quote but no trade yet, and a minute-old
+    trigger price won't do: one snapshot supplies the last trade."""
+    clock, hub, market = SimClock(NOW), Hub(SimClock(NOW)), Market()
+    hub.quote = Quote(symbol="XYZ", ts=NOW - timedelta(seconds=0.5), bid=D("12.35"),
+                      bid_size=1, ask=D("12.38"), ask_size=1)  # fmt: skip
+    trade = Trade(symbol="XYZ", ts=NOW - timedelta(seconds=1), price=D("12.37"), size=100)
+    market.snaps = {"XYZ": Snapshot(symbol="XYZ", latest_trade=trade)}
+    live = inputs(journal, clock, hub, market, Broker(), tmp_path / "KILL")
+    got = await live.prepare("B", SIG, event("arm_check", "12.33", ago_s=0.2), waited=True)
+    assert (got.last_price, got.quote_age_s, market.calls) == (D("12.37"), 0.5, 1)
+    again = await live.prepare("A", SIG, event("stream_trade"))  # Book A's: as before
+    assert (again.last_price, again.quote_age_s, market.calls) == (None, 0.5, 1)
+    hub.quote = hub.quote.model_copy(update={"ts": NOW - timedelta(seconds=40)})
+    stale = await live.prepare("A", SIG, event("stream_trade"))
+    # the snapshot refreshes the quote's age (its trade is 1 s old), but Book A's price stays
+    # the hub's
+    assert (stale.last_price, stale.quote_age_s, market.calls) == (None, 1.0, 2)
+
+
 async def test_a_stale_quote_is_refreshed_over_rest(journal: Journal, tmp_path: Path) -> None:
     clock, hub, market = SimClock(NOW), Hub(SimClock(NOW)), Market()
     hub.quote = Quote(

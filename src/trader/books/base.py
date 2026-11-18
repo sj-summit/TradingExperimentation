@@ -1,9 +1,12 @@
-"""Books (A§4.4; DECISIONS D-044): what a book does with a trigger, and the decision log.
+"""Books (A§4.4; DECISIONS D-044, D-068): what a book does with a trigger, and the decision log.
 
 Decisions are append-only. A row is written when a signal triggers (or is missed at arming);
 an outcome row is appended later only when it says something new: ``broker_rejected`` at once,
 ``entry_unfilled`` at EOD for an entry that never filled, ``restart_lost`` after a crash. The
 ``final_decisions`` view is the latest row per signal and book, which reports and stats read.
+
+Book B may answer a trigger with ``Defer`` while its verdict is pending (S§5.4): it is asked
+again later, with ``waited=True``, and only then decides and journals.
 """
 
 import sqlite3
@@ -32,6 +35,18 @@ class BookDecision:
     detail: str = ""
     intent: OrderIntent | None = None
     entry: EntryResult | None = None
+    # Book B: the attempt whose answer the decision rests on (an llm_calls.id, D-064)
+    llm_call_id: str | None = None
+
+
+@dataclass(frozen=True)
+class Defer:
+    """Book B's verdict is pending (S§5.4; the Phase 4 plan's decision 8): ask again at
+    ``until``, or sooner once the verdicts change, with ``waited=True``. Nothing is journaled
+    meanwhile."""
+
+    until: datetime
+    detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -51,9 +66,12 @@ class PreparedInputs:
 
 
 class EntryInputs(Protocol):
-    """Gathers the gate's inputs (implemented by the orchestrator)."""
+    """Gathers the gate's inputs (implemented by the orchestrator). ``waited``: the trigger
+    waited for its verdict, so its own price is old; the price comes from the feed."""
 
-    async def prepare(self, book: BookName, sig: Signal, ev: TriggerEvent) -> PreparedInputs: ...
+    async def prepare(
+        self, book: BookName, sig: Signal, ev: TriggerEvent, *, waited: bool = False
+    ) -> PreparedInputs: ...
 
     def builder(
         self, book: BookName, sig: Signal, prepared: PreparedInputs
@@ -63,7 +81,9 @@ class EntryInputs(Protocol):
 class Book(Protocol):
     name: BookName
 
-    async def on_trigger(self, ev: TriggerEvent, sig: Signal) -> BookDecision: ...
+    async def on_trigger(
+        self, ev: TriggerEvent, sig: Signal, *, waited: bool = False
+    ) -> BookDecision | Defer: ...
 
 
 def decision_for(
@@ -124,6 +144,7 @@ async def record_decision(journal: Journal, decision: BookDecision, *, at: datet
             reason=decision.reason,
             detail=decision.detail,
             at=at,
+            llm_call_id=decision.llm_call_id,
         )
     )
 

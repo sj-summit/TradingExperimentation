@@ -75,6 +75,7 @@ llm:
   provider: claude_cli           # claude_cli (subscription token) | anthropic_api (API key, billed per token)
   claude_bin: claude             # tests point this at scripts/fake_claude.py
   min_cli_version: "2.1.268"
+  max_tested_cli_version: "2.1.296"
   config_dir: runtime/claude-config    # isolated CLAUDE_CONFIG_DIR (DECISIONS D-002)
   sandbox_dir: runtime/llm_sandbox     # empty cwd for every call
   max_calls_per_day: 12

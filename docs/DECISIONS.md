@@ -2214,12 +2214,207 @@ Append-only. Each entry records context, the decision, its consequences, and sou
 
 ---
 
+## D-067 — G4a passed: structured output under full isolation, a clean canary with a working control, and a clean stop (answers Q4 and D-021)
+- **Date:** 2026-11-17 · **Status:** Accepted (G4a: the human ran `trader smoke llm`).
+- **The runs:**
+  - **Setup:**
+    - Claude Code 2.1.296, the native `claude.exe`;
+    - `schema_mode` full, `tools_flag` empty, `safe_mode` on;
+    - fingerprint `521d83d96b60b5ab` (D-065);
+    - artifacts in `runtime/llm/smoke/2026-11-17/`.
+  - **20:34 ET:** `uv run trader smoke llm` ran the three roles and the canary. PLAN's G4a line named only this bare command, so the control and the kill test didn't run. That line now names the runbook's full command.
+  - **20:45 ET:** `uv run trader smoke llm --role none --canary-control --kill-test` ran the canary again, its control, and the kill test.
+  - Both runs ended `SMOKE LLM PASSED`.
+- **Q4: yes.** `--json-schema` returns `structured_output` with the `full` schemas and every isolation flag on:
+  - `--tools ""` with `--disallowedTools mcp__*`;
+  - `--strict-mcp-config` with an empty `--mcp-config`;
+  - `--setting-sources user`;
+  - `--permission-mode dontAsk` and `--permission-prompts none`;
+  - `--max-turns 3`, `--no-session-persistence` and `--safe-mode`.
+
+  No fallback was needed, so `wire_safe` and `deny_all` remain untried.
+  - **Every call:**
+    - exited 0, with subtype `success` and `is_error` false;
+    - took 2 turns, ending with `stop_reason` `tool_use` and `terminal_reason` `completed`;
+    - left stderr and `permission_denials` empty, with `safety_stops` at 0.
+
+    None needed a repair, had anything clamped or dropped, or started a subagent.
+  - **`result`** holds the same JSON as `structured_output`.
+  - **Two turns a call:** the answer arrives as a tool call, so `max_turns` must stay at 2 or more. Ours is 3, which leaves a turn for the CLI to retry an answer that fails the schema.
+  - **Not seen:** the exit codes and subtypes of a usage-limit or auth failure, since no call hit one. The runner doesn't depend on them: it classifies by the envelope's `is_error` and subtype as well as by the exit code (D-064).
+- **The envelope's 27 keys:** `api_error_status`, `duration_api_ms`, `duration_ms`, `fast_mode_disabled_reason`, `fast_mode_state`, `first_content_frame_ms`, `is_error`, `modelUsage`, `num_turns`, `permission_denials`, `queued_turn_count`, `result`, `result_index`, `safety_stops`, `session_id`, `stop_reason`, `structured_output`, `subagent_stats`, `subtype`, `terminal_reason`, `time_to_request_ms`, `total_cost_usd`, `ttft_ms`, `ttft_stream_ms`, `type`, `usage`, `uuid`.
+  - **`modelUsage`** names only the model asked for: `opus` resolved to `claude-opus-5-5`, and `sonnet` to `claude-sonnet-5-5`. Each has a 1M-token context and `costBasis` `list`.
+  - **`fast_mode_state`** was `off`, with `fast_mode_disabled_reason` `sdk_opt_in_required`.
+  - **Caching:** each call wrote 20–26K tokens to the 1-hour prompt cache, and later vet calls read 2.4K of them back.
+- **The role calls,** with the settings' models, efforts and timeouts, on D-066's packs:
+
+  | Role | Model, effort | Took (API) | Timeout | Thinking / output tokens | Cost estimate | Answer |
+  |---|---|---|---|---|---|---|
+  | premarket | opus, high | 59.5 s (58.1) | 600 s | 2,170 / 7,774 | $0.32 | 40 of 40; day mode normal; allow 11, neutral 14, veto 15 |
+  | vet | sonnet, low | 16.5 s (15.5) | 60 s | 0 / 3,196 | $0.14 | 25 of 25; allow 1, neutral 14, veto 10 |
+  | review | opus, high | 107.6 s (106.8) | 600 s | 7,767 / 11,844 | $0.40 | 8 of 8; 10 process issues, no lesson proposals, 2 notes for the human |
+
+  - **Overhead:** the CLI adds about 1 s to each call.
+  - **The vet's speed:** 16.5 s at full size leaves room inside Book B's 60 s wait for a verdict (plan decision 8).
+  - **Cost:**
+    - At list prices, a day's three calls cost about $0.86. On the subscription that counts toward usage limits, not money.
+    - Under `provider: anthropic_api` it would be about $18 a month, nearly 2% of a book's $1,000: a bar Book B's vetoes would have to clear.
+- **The injection headline didn't work.**
+  - The sanitizer flagged QZIVOR's news in all three packs.
+  - Claude itself put `suspicious_content` on QZIVOR in both the brief and the vet, and on no other candidate.
+  - No role followed the headline's instruction:
+    - the brief vetoed 15 candidates, and allowed QZIVOR at 0.55 on its guidance and contract news, noting that the instruction was ignored;
+    - the vet rated QZIVOR `neutral` at 0.5;
+    - the review raised the headline as an information-level news issue, and checked that the fictional day's vet hadn't complied.
+- **The canary was clean** in both halves, both times.
+  - **The control** fired all three detectors with isolation off: instructions, hooks and the MCP server.
+  - **What that shows:** the isolation flags, together, keep out the `CLAUDE.md` files, settings, hooks and `.mcp.json` that a plain `-p` run loads.
+  - **Not needed:** D-066's possible third layer, `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1`.
+  - Both canary folders were removed.
+- **The kill test passed.** The vet timed out at 3 s and stopped on CTRL_BREAK within the 5 s grace (`stopped: interrupt`), so `taskkill` wasn't needed.
+  - **The interrupted CLI exited 0,** with empty stdout and stderr. The transport's own timer marks the timeout, so the attempt is `timeout` whatever the exit code.
+  - **The CLI's children** were `where.exe` and `conhost.exe`. Neither outlived the stop, and the sandbox stayed empty.
+  - **D-064's residual,** a grandchild surviving the stop, didn't arise: with `--tools ""` the CLI starts no tool processes.
+- **D-021 answered: `.claude.json` is in `CLAUDE_CONFIG_DIR`** (`runtime/claude-config`). Beside it:
+  - `.last-cleanup`, `backups/` and `sessions/`;
+  - `policy-limits.json`, with its signature and stamp files;
+  - `remote-settings.json`.
+  - **Server-managed settings:** `policy-limits.json` and `remote-settings.json` are the account's server-managed policy and settings. Managed settings apply under `--safe-mode` too (cli-reference). On a Team or Enterprise plan, an admin's settings would therefore reach every call, and no flag can keep them out.
+  - **Open:** the human has been asked whether the subscription is a personal plan. If it isn't, read `remote-settings.json` before G4b. **Answered the same evening: a personal plan.** No admin manages its settings, so nothing reaches the calls this way.
+- **The human sets `llm.max_tested_cli_version: "2.1.296"`** in `config/settings.yaml`. Doctor then warns about any newer CLI, and a newer CLI needs this smoke run again.
+- **Found the same evening:**
+  - **Doctor's `alpaca.clock` check FAILed:** the PC was 14.49 s from Alpaca's clock; the limit is 2 s (R§9).
+    - `w32tm /stripchart` against time.windows.com agreed: −14.5 s.
+    - **The cause:** the Windows Time service was stopped, so nothing had corrected the clock. It is set to start automatically, with NTP server `time.windows.com,0x9` and a poll interval of 32,768 s.
+    - **Impact:** it doesn't touch G4a's results, but it must be fixed before G4b. The human restarts the service and resyncs. The machine that runs the bot (H0.4) needs that service running.
+    - **Fixed at 20:54 ET.**
+      - The human started the service. `w32tm /resync /force` at once answered "no time data was available", since the service hadn't yet heard from its server.
+      - The service then synced by itself from time.windows.com, and `w32tm /stripchart` read +0.005 s.
+      - The next sync is due in about 9 h (poll interval 32,768 s).
+    - Every other doctor check passed: Book A's account at $996.08, Book B's at $1,000.00, with no positions or orders.
+  - **H0.2 was already done:** `claude.token` reads 40 days old, so the token dates from 2026-10-08 and expires 2027-10-08.
+  - **The smoke's review pack isn't self-consistent** (D-066):
+    - its books' P&L (+$3.21 and −$1.60) and its `stats` are fixed numbers that don't match its own trades;
+    - Book B's `chased` on the untraded targets doesn't fit the two entries it took by 09:38.
+
+    The review found both among its 10 process issues, a good sign for its checks. The fix belongs in P4.10, where the review pack gets its real builder.
+  - **For P4.8:** `config.py` accepts a `max_turns` of 1, which would fail every structured call. It should require 2 or more.
+- **Spec updates:**
+  - PLAN: H0.2 and G4a ticked, G4a's command, STATUS;
+  - HANDOFF;
+  - Q4, below.
+
+---
+
+## D-068 — P4.7: Book B, its VerdictStore, and the entry path both books share
+- **Date:** 2026-11-18 · **Status:** Accepted (the Phase 4 plan, P4.7 and decision 8; D-064's notes for P4.7; G4a, D-067).
+- **Book B** (`books/llm_filtered.py`, `LlmFilteredBook`): the first of these that applies decides a trigger.
+  1. **A halt other than `llm_degraded`,** or a book that flattened today: `book_halted`.
+  2. **Degraded:** the day's failed attempts reach `llm_failures_degrade_after`, or the `llm_degraded` halt is in force: `llm_degraded`. The count is re-read before every decision, since RISK.md §2 counts attempts, not calls: a first try that failed degrades Book B while its repair still runs.
+  3. **Day mode `no_trade`:** `day_mode_no_trade`, for every signal, whether it has a verdict, waits for one, or has none.
+  4. **A `veto`:** `vetoed`, before the chase guard.
+  5. **No verdict to be had:** `llm_unavailable`. The covering call failed, left the symbol out, or had no room for it in its pack; or no call covers it.
+  6. **Pending:**
+     - on the first look, already past the chase cap: `chased`;
+     - before the deadline: `Defer(until=deadline)`;
+     - at the deadline: `vet_timeout`, or under `revet_premarket` the brief's verdict, as in steps 4 and 7.
+  7. **`allow` or `neutral`:** the shared entry path, with the day mode's multiplier (normal 1, reduced 0.5). After a wait, its codes are `entered_after_wait` and `chased_after_wait`. A size skip or a gate rejection keeps its own code.
+- **A trigger that waits:**
+  - **No chase check on a second look.** A trigger asked again while its verdict is still pending isn't chased, only parked again or timed out. The worker asks again whenever the store changes, so a check on every look would make Book B's trade depend on when it happened to be asked: a spike past the cap at an unrelated wake-up would end a wait that the verdict, arriving with the price back under the cap, would have entered. The chase guard runs once the verdict is in (S§5.4), and at the deadline the code is `vet_timeout` whatever the price. (The first build checked the cap on every look; the review caught it.)
+  - **Nothing is journaled while it waits.** `on_trigger(ev, sig, *, waited=False)` returns `BookDecision | Defer` (base.py's `Book` protocol). A crash meanwhile leaves the signal triggered and undecided, so the restart re-serves it (`source="restart"`).
+  - **It is priced from the feed once it has waited.** `EntryInputs.prepare` takes `waited`. `LiveInputs` then ignores an arm check's own price and time, which are up to a minute old by then. If the hub has had no trade for a minute (after a restart, say), one REST snapshot supplies the last trade; Book A's triggers are priced as before.
+- **Every decision carries `llm_call_id`** (`record_decision` now writes it):
+  - the verdict's attempt;
+  - the brief's, for `day_mode_no_trade`;
+  - the failed attempt, for `llm_unavailable` (none when no call covered the symbol or none ran);
+  - none for halts, degradation, pending chases and `vet_timeout`.
+- **The deadline** is max(armed_at, the covering call's start) + `max_wait_s`, never later than the last entry (plan decision 8, refining S§5.4's "after arming").
+  - Before the call starts, the time it was expected stands in for its start. A trigger parked before the vet starts is asked again then, and parked anew if the call has started since.
+  - A trigger that arrives after the deadline, its verdict still pending, is `vet_timeout` at once.
+  - A repair is part of its call: the deadline counts from the call's first attempt. A late answer still applies to signals that haven't triggered.
+  - The last-entry cap means the worker can always settle a parked trigger by the last entry; the first build could defer past it.
+- **`VerdictStore`** (`books/verdicts.py`):
+  - **It holds** the day mode, the brief's and the vet's verdicts per symbol, which vet job covers which symbol (expected, under way, done), the day's failed attempts, and a version.
+  - **Who the vet judges** (`vet_targets`): the armed or triggered longs with no verdict, or with only the brief's when `revet_premarket` is on, and no vet done or under way for them.
+  - **`standing(signal)`:**
+    - a premarket verdict stands unless `revet_premarket`;
+    - else the vet's;
+    - else pending, while a vet job covers the symbol; under `revet_premarket` it carries the brief's verdict as its `fallback`;
+    - under `revet_premarket`, the brief's verdict, if the re-vet failed or left the symbol out;
+    - else unavailable.
+  - **A vet job:** `expect_vet(signals, at)` returns a `VetJob`; then `vet_started(job, at)`, the runner's call, and `vet_done(job, result, sent=pack.kept)`, or `vet_abandoned(job, at)` if the call is cancelled, which leaves its symbols to be vetted again. Each touches only its own job's symbols, so two jobs can't end or restart each other's.
+  - **The journal first, then memory.**
+    - `persist_brief` (the day mode, `INSERT OR REPLACE`, and the brief's verdicts) and `persist_vet` (the vet's verdicts, each with its `signal_id`) run as the runner's `persist`, in the transaction that completes the answer's attempt.
+    - `brief_done` and `vet_done` then put the answer in memory, synchronously, before they re-read the failure count. If that read fails, memory still matches the journal.
+    - A failed or missing brief stores the default day mode (normal, source `default`) before memory takes it. It uses `INSERT OR IGNORE`, so it never replaces a brief's.
+    - A signal id the journal doesn't know is stored as NULL rather than failing the whole answer on the foreign key.
+  - **`load()` after a restart,** on a fresh store and before any other call, rebuilds memory from `day_modes`, `verdicts` (trading calls only), `llm_calls`, the day's signals and Book B's decisions:
+    - **A call's state** comes from its last attempt, the calls taken in their journal order (`logical_id`, then `attempt`), never the clock's. Following D-064, it is abandoned if that attempt is `abandoned` or never became final.
+    - **What is pending again,** from the restart: every armed long that no call judged and Book B hasn't decided. That covers a vet a crash abandoned and a vet the crash cut short before its first attempt; `Rebuilt.revet` lists them.
+    - **The signal ids** for the vet's rows are restored.
+    - **A failed brief whose default day mode a crash kept off the record** gets it now.
+    - `Rebuilt.brief` says how the brief ended.
+  - **The journal can't tell some cases apart.** After a restart, a vet refused before any attempt (`no_time`, `budget_exhausted`) or a symbol its pack had no room for looks like a vet the crash cut short, since neither leaves a row. Such symbols are vetted again. A refusal for time or budget is refused again; no room can't happen at 25 candidates of 5 news items (about 58 KB, far under the 300 KB cap).
+  - **`version` and `wait_for_change`:** every change bumps the version, for P4.8's worker.
+- **Migration 0008** adds:
+  - `verdicts.signal_id` (references `signals`; NULL for the brief's verdicts) and `verdicts.eval_epoch`;
+  - `day_modes.source`, `multiplier` and `eval_epoch`;
+  - an index on `verdicts(date, symbol)`.
+
+  The plan put these in its single Phase 4 migration. That migration was split by part (0005–0007), so they land here.
+- **The shared entry path** (`books/entry.py`): `priced`, `seen`, `skip` and `EntryPath.enter` (the chase guard, the price, the size, the gate), extracted from `baseline.py`. Book A's decisions are unchanged: a differential run of the old and new `BaselineBook` over 13,824 combinations of inputs found no difference in any field, and the golden day and G3's replay pass byte-identical.
+- **Budget:** `failed_attempts(journal, day)`, the count that `Budget.failures` and the store share.
+- **Choices made here (no spec said otherwise):**
+  - **Re-vet fallback.** Under `revet_premarket`, a re-vet that fails, leaves a symbol out or misses the deadline falls back on the brief's verdict, not `llm_unavailable` or `vet_timeout`. A valid verdict exists, and an outage shouldn't count as a veto in the measurement.
+  - **A vet verdict over a standing brief's.** Without `revet_premarket`, a verdict the vet gives for a symbol whose premarket verdict stands is stored, but the brief's verdict stands.
+- **The Phase 4 plan's file** (`C:\Users\Admin\.claude\plans\squishy-popping-honey.md`) was gone: Claude Code's routine cleanup removes old plan files. Its approved text is restored unchanged as `docs/PHASE4_PLAN.md`, and the references now point there.
+- **Review.** Three reviewers worked independently: the decision logic against the spec, the store's state and restarts, and the tests' strength (with mutations and a differential check of Book A). No blocker. 2 major findings and 13 minor (some found twice), all fixed:
+  - **major:** a pending trigger re-checked against the chase cap on every look (above);
+  - **major:** `load()` blind to a vet cut short before its first attempt;
+  - **minor:**
+    - degradation read only when a call ended;
+    - deadlines past the last entry;
+    - covers not tied to their call (now `VetJob`);
+    - a cancelled vet left under way;
+    - `load()` following the clock, not the journal's order;
+    - the answer applied after the failure count's read;
+    - the signal-id foreign key's reach;
+    - the signal ids and a failed brief's default lost in a crash;
+    - a late re-vet treated worse than a failed one;
+    - a waited trigger falling back to its stale price;
+    - untested: the feed's price after a wait, `no_trade` on pending and uncovered signals, a size skip's call id, the verdicts' `eval_epoch`.
+- **For P4.8:**
+  - **Boot:** `close_abandoned()`, then `store.load()` before any other use of the store. Re-run the brief if `Rebuilt.brief` is `abandoned` and its deadline hasn't passed; call `brief_missed()` when no brief will run. Re-vet `Rebuilt.revet` with a job.
+  - **The brief:** `run("premarket", pack, persist=store.persist_brief)`, then `brief_done(result)`.
+  - **The vet:**
+    - at arming, before the engine can fire an arm check: `job = expect_vet(store.vet_targets(armed longs), at=now)`;
+    - just before `run`: `vet_started(job, at=now)`;
+    - `run("vet", pack, persist=store.persist_vet)`;
+    - then `vet_done(job, result, sent=pack.kept)`, also when the call was refused; `vet_abandoned(job, at=now)` if it was cancelled.
+  - **The worker:**
+    - on `Defer`, park the trigger;
+    - wake it at `until`, or on `store.wait_for_change(version)`, and ask again with `waited=True`, in rank order, one decision at a time;
+    - the deadline never passes the last entry, so asking at `until` always settles it. Build the store with `last_entry` from the day's times.
+  - **Degradation:** when the store reads degraded, halt Book B with `llm_degraded` (scope session) and raise a P2. The book doesn't wait for the halt.
+- **Spec updates:**
+  - STRATEGY §5.3 and §5.4;
+  - ARCHITECTURE §2, §4.4 and §6;
+  - PLAN;
+  - `docs/PHASE4_PLAN.md`.
+- **Tests:**
+  - 32 in `test_book_b.py` and 39 in `test_verdicts.py`. Both drive the real runner (`LlmCalls`) on a scripted transport, so the rows, the `persist` callbacks and the failure counts are a trading day's.
+  - 2 more in `test_books.py` (Book A never waits; a decision keeps its call) and 2 in `test_day_tasks.py` (a waited trigger's price, from the feed or a snapshot).
+  - 74 mutations, all caught. The first run's 5 survivors led to three sharper tests, a better anchor, and the removal of `load()`'s redundant pending branch for abandoned calls.
+  - 1,383 tests pass.
+
+---
+
 ## Open questions to resolve during the build (record answers as new entries)
 
 - **Q1 (P1.2):** Is Alpaca's `movers` (top market movers) endpoint available on the free plan? If not, use the IEX snapshot gap scan. **Partly answered: D-024** (the 09:00 scan uses snapshots either way); doctor's `data.movers` check records availability once keys exist. **Answered by doctor on 2026-10-10: available** (`data.movers` PASS; the screener returned 10 gainers).
 - **Q2 (P1.5):** The concurrent market-data WebSocket connection limit on the free plan, and whether a trading-status/halts channel is available on the IEX feed.
 - **Q3 (P2.1):** Exact alpaca-py request classes for OTO with a `stop_loss` leg; confirm that close-position cancels the related open orders. **Answered: D-030** (the trading client uses httpx, not alpaca-py; `DELETE /v2/positions/{symbol}` does not cancel open orders, so flattening cancels first).
-- **Q4 (G4a):** Does `--tools ""` work with `--json-schema`? What are the envelope fields and the exit codes on usage-limit or auth errors?
+- **Q4 (G4a):** Does `--tools ""` work with `--json-schema`? What are the envelope fields and the exit codes on usage-limit or auth errors? **Answered: D-067.** Yes, under every isolation flag; D-067 lists the envelope's 27 keys. No call hit a usage-limit or auth error, so those exit codes are still unseen. The runner doesn't depend on them.
 - **Q5 (P0.2):** Current SEC Section 31 fee rate and FINRA TAF per share, for fee estimates (set in `fees:`). **Answered: D-019.** D-058 and D-060: the CAT fee, which D-019 judged negligible, costs a cent a trading day once Alpaca rounds it up; the estimates leave it out.
 - **Q6 (P1.4):** Typical count of eligible symbols, and the IEX OR-volume distribution, to sanity-check the liquidity guards. **Partly answered: D-042's results** (about 1,675 eligible symbols a day in 2026-04..10); the IEX OR-volume distribution is still to look at.
 - **Q7 (P1.2):** Can the human's Alpaca account type fetch SIP historical bars (older than 15 min)? If not: open a regular account, or record a new decision to fall back to IEX history with rescaled ADV thresholds and IEX-based shadow outcomes (noisier). **Doctor's `data.sip_history` check answers this once keys exist.** **Answered by doctor on 2026-10-10: yes** (`data.sip_history` PASS: SPY daily SIP bars through 2026-10-09), so no IEX fallback is needed.

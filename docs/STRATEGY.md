@@ -179,7 +179,7 @@ Verdicts for symbols that are not among that call's candidates are ignored and l
 - **Model:** fast (default `sonnet`, effort `low`). **Timeout:** 60 s.
 - **Input:** OR features (rel_vol, rank, OR range ÷ ATR, OR return), gap, news (last 24 h), filings, and the promoted lessons that match each candidate's features (code pre-computes the matches).
 - **Output:** `VetBatch` (one assessment per candidate).
-- A pre-market verdict for a symbol stands. The vet does not re-judge it unless `revet_premarket: true`.
+- A pre-market verdict for a symbol stands. The vet does not re-judge it unless `revet_premarket: true`. Then the vet's verdict replaces the brief's. If the re-vet fails, leaves the symbol out, or misses the deadline (§5.4), the brief's verdict stands (D-068).
 
 ### 5.4 Pending and failure policy (Book B)
 
@@ -187,13 +187,27 @@ Verdicts for symbols that are not among that call's candidates are ignored and l
 |---|---|---|
 | Verdict is `allow` or `neutral` | Enter (normal path) | `taken` |
 | Verdict is `veto` | Skip | `vetoed` |
-| Verdict still pending | Hold until the verdict arrives or `max_wait_s` (60 s) after arming, whichever comes first; then apply it, re-checking the chase guard | `entered_after_wait` / `chased_after_wait` / `vetoed` |
-| Still pending after that | Skip | `vet_timeout` |
-| The LLM call covering it failed or returned invalid output (after one repair retry) | Skip | `llm_unavailable` |
+| Verdict still pending, and already past the chase cap | Skip | `chased` |
+| Verdict still pending | Hold until the verdict arrives or the deadline, whichever comes first; then apply it, re-checking the chase guard. The deadline is `max_wait_s` (60 s) after arming or after the covering call starts, whichever is later, and never after the last entry (D-068) | `entered_after_wait` / `chased_after_wait` / `vetoed` |
+| Still pending at the deadline | Skip | `vet_timeout` |
+| The LLM call covering it failed or returned invalid output (after one repair retry), its answer left the symbol out, or no call covers it | Skip | `llm_unavailable` |
 | 3 or more failed LLM attempts today (`llm_failures_degrade_after` in risk.yaml): a call and its failed repair are two, and a refusal that repeats on every call counts (RISK.md §2, D-064) | No new Book B entries for the rest of the day | `llm_degraded` |
 | `day_mode = no_trade` | Skip all | `day_mode_no_trade` |
 
 Signals that haven't triggered yet keep waiting for their verdict; a late verdict (for example, from a repair call) still applies to them. Book A is never affected by any of these.
+
+**While a trigger waits** (D-068):
+- Nothing is journaled; its decision is, once made.
+- It isn't checked against the chase cap again: whether Book B trades mustn't depend on when it happens to be asked.
+- Once its verdict is in, it is priced from the live feed, not from the trigger's own print.
+**Precedence,** when more than one row applies (the Phase 4 plan's decision 8):
+1. a halt other than `llm_degraded` (`book_halted`);
+2. degradation;
+3. `no_trade`;
+4. a veto, before the chase guard;
+5. `llm_unavailable`;
+6. a pending verdict;
+7. the chase guard and the entry.
 
 ### 5.5 Catalyst taxonomy and risk flags (shared enums in `llm/schemas.py`)
 

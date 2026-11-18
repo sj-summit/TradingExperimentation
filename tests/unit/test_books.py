@@ -9,6 +9,7 @@ import pytest
 
 from tests.fixtures.exec_harness import RISK, SETTINGS, TIMES
 from trader.books.base import (
+    BookDecision,
     PreparedInputs,
     decided,
     finalize_decisions,
@@ -132,6 +133,21 @@ async def test_a_trigger_is_priced_sized_and_taken(journal: Journal) -> None:
     assert "qty 39" in decision.detail
     assert service.states[0].quote_age_s == 0.4
     assert await rows(journal) == [("A", 1, "taken")]
+
+
+async def test_book_a_never_waits(journal: Journal) -> None:
+    """``waited`` is Book B's: Book A decides at once, so it changes nothing (D-068)."""
+    decision = await book(journal, Service()).on_trigger(event(), signal(), waited=True)
+    assert (decision.reason, decision.llm_call_id) == ("taken", None)
+
+
+async def test_a_decision_keeps_the_llm_call_it_rests_on(journal: Journal) -> None:
+    decision = BookDecision(book="B", signal_id="20261013-XYZ-orb5", take=False,
+                            reason="vetoed", llm_call_id="20261013-vet-01-1")  # fmt: skip
+    assert await record_decision(journal, decision, at=NOW)
+    row = await journal.fetch_one("SELECT reason_code, llm_call_id FROM decisions")
+    assert row is not None
+    assert (row["reason_code"], row["llm_call_id"]) == ("vetoed", "20261013-vet-01-1")
 
 
 async def test_an_arm_check_trigger_uses_its_own_price(journal: Journal) -> None:

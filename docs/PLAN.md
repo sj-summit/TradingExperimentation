@@ -10,9 +10,9 @@
 
 ```
 STATUS
-current_phase: 4 (plan approved 2026-10-14: C:\Users\Admin\.claude\plans\squishy-popping-honey.md; order P4.0a, P4.0b, P4.0c, P4.1-P4.6, G4a, P4.7-P4.10, G4b)
-last_completed_task: P4.6 (D-066): `trader smoke llm`, the code only: a call per role on packs of fictional issuers (the vet at full size), through LlmCalls with purpose smoke; the isolation canary (instructions, settings with hooks, an env block and an apiKeyHelper, an .mcp.json) planted above an empty sandbox and in the working directory, with --canary-control showing each detector fires; --kill-test, watched by llm/descendants.py for processes that outlive the stop; 50 mutations caught. Before it: P4.5 (D-065), P4.4 (D-064), P4.0a-P4.3 (D-055 to D-063). Commits: the human's b42d5fd ("P4.5 Done", 2026-10-18 18:43 ET) holds everything through D-065; P4.6's files and D-066 are uncommitted; 1308 tests. Next: 🛑 G4a (the human: H0.2, then `uv run trader smoke llm --canary-control --kill-test`; the runbook is in HANDOFF)
-open_questions: read docs/HANDOFF.md first. Human steps in Phase 4: H0.2, then G4a (HANDOFF's runbook); the Phase 1 checks (news, filings, stream --news) and ALPACA_DATA_* keys before G4b. Q2 open (run 2: 14 symbols x trades+quotes = 28, under 30, no 405; a 405 at 16 or more symbols would mean channels count toward the 30), Q4 open until G4a, Q6 partly answered
+current_phase: 4 (plan approved 2026-10-14, now docs/PHASE4_PLAN.md; order P4.0a, P4.0b, P4.0c, P4.1-P4.6, G4a, P4.7-P4.10, G4b)
+last_completed_task: P4.7 (D-068): Book B (books/llm_filtered.py) with decision 8's precedence and Defer for a pending verdict, never chased on a second look; its VerdictStore (books/verdicts.py: persist then memory, vet jobs, deadlines capped at the last entry, failures re-read per decision, load() after a restart); the entry path both books share (books/entry.py; Book A unchanged); migration 0008; a waited trigger priced from the feed. Three adversarial reviews: no blocker, 2 major and 13 minor findings, all fixed; 74 mutations caught. Before it: G4a (D-067), P4.6 (D-066), P4.0a-P4.5 (D-055 to D-065). Commits: the human's b2b0697 ("P4.6 done", 2026-10-18 22:13 ET) holds everything through D-066; D-067, P4.7 and D-068 are uncommitted; 1383 tests. Next: P4.8 (orchestrator, live wiring, recording, replay, reports)
+open_questions: read docs/HANDOFF.md first. Human steps before G4b: the Phase 1 checks (news, filings, stream --news) and the ALPACA_DATA_* keys. (llm.max_tested_cli_version is set to 2.1.296; the PC clock was fixed 2026-11-17; D-067.) Q2 open (run 2: 14 symbols x trades+quotes = 28, under 30, no 405; a 405 at 16 or more symbols would mean channels count toward the 30), Q6 partly answered
 eval_epoch: 0
 ```
 
@@ -26,7 +26,7 @@ Specs referenced: ARCHITECTURE.md (A§), STRATEGY.md (S§), RISK.md (R§).
 
 - [x] **H0.1** Create an Alpaca account. In the dashboard, create **two paper accounts with a $1,000 starting balance each**: click the paper account number → "Open New Paper Account". Generate API keys for each.
   - **Data note:** Alpaca says *paper-only* accounts are entitled to IEX data only. The plan uses free 15-minute-delayed SIP *history* (ADV/ATR filters, shadow outcomes), which the free plan gives regular accounts. So prefer a regular brokerage account (identity check; no deposit needed to start) and create the paper accounts under it. P1.2 verifies access (DECISIONS Q7).
-- [ ] **H0.2** Install Claude Code ≥ 2.1.268. Run `claude setup-token`, then copy the printed token into `.env` as `CLAUDE_CODE_OAUTH_TOKEN`, with `CLAUDE_TOKEN_CREATED=<today>`.
+- [x] **H0.2** Install Claude Code ≥ 2.1.268. Run `claude setup-token`, then copy the printed token into `.env` as `CLAUDE_CODE_OAUTH_TOKEN`, with `CLAUDE_TOKEN_CREATED=<today>`.
 - [x] **H0.3** Copy `config/env.example` → `.env`, `config/settings.example.yaml` → `config/settings.yaml`, and `config/risk.example.yaml` → `config/risk.yaml`. Fill in `.env`, including `SEC_EDGAR_USER_AGENT` with your name and email.
 - [ ] **H0.4** Pick the machine that will run the bot: always on, awake 08:15–16:45 ET on weekdays, with a stable network. A desktop, mini PC, or small VPS all work.
 - [ ] **H0.5** (Optional) Pick a notification channel (ntfy topic or Discord webhook).
@@ -149,7 +149,7 @@ Specs referenced: ARCHITECTURE.md (A§), STRATEGY.md (S§), RISK.md (R§).
 
 ## Phase 4 — LLM layer and Book B
 
-The plan approved on 2026-10-14 adds three tasks first, all due before G4b: D-054's fixes and the shadow rule the human chose. The plan file is `C:\Users\Admin\.claude\plans\squishy-popping-honey.md`.
+The plan approved on 2026-10-14 adds three tasks first, all due before G4b: D-054's fixes and the shadow rule the human chose. The plan is `docs/PHASE4_PLAN.md` (restored there on 2026-11-18, unchanged, after its original file outside the repository was cleaned up; D-068).
 
 - [x] **P4.0a** D-054's fixes, part 1:
   - the stuck-exit cap times from our own send;
@@ -173,8 +173,8 @@ The plan approved on 2026-10-14 adds three tasks first, all due before G4b: D-05
 - [x] **P4.4** Write `llm/claude_cli.py` per A§7: isolated env and cwd, exact flags, timeout handling, envelope parsing, one repair retry, artifact persistence, and `llm_calls` rows. Add `llm/budget.py`. Test everything with `scripts/fake_claude.py` scenarios.
 - [x] **P4.5** Turn the `prompts/` drafts into v1. Prompts stay **static**: all dynamic data, including date and playbook, goes in the context pack. Log each prompt's SHA-256 per call; a prompt change starts a new epoch.
 - [x] **P4.6** Write `trader smoke llm`: one real call per role with fixture context packs (no market impact), printing validated outputs, durations, and envelope fields.
-- [ ] 🛑 **HUMAN GATE G4a:** The human runs `uv run trader smoke llm` (it uses the Claude subscription). Then Claude Code records in DECISIONS.md the observed CLI behavior: does `--tools ""` work with `--json-schema`, what the envelope fields are, and the exit codes. If structured output fails, apply the A§7.2 fallback.
-- [ ] **P4.7** Write `books/llm_filtered.py` (Book B): the VerdictStore (pre-market + vet), day-mode multiplier, the pending policy (wait up to 60 s, re-check the chase guard), and the failure and degradation rules (S§5.4).
+- [x] 🛑 **HUMAN GATE G4a:** The human runs `uv run trader smoke llm --canary-control --kill-test` (it uses the Claude subscription; HANDOFF has the runbook). Then Claude Code records in DECISIONS.md the observed CLI behavior: does `--tools ""` work with `--json-schema`, what the envelope fields are, and the exit codes. If structured output fails, apply the A§7.2 fallback. **Passed 2026-11-17 on Claude Code 2.1.296, with no fallback needed (D-067).**
+- [x] **P4.7** Write `books/llm_filtered.py` (Book B): the VerdictStore (pre-market + vet), day-mode multiplier, the pending policy (wait up to 60 s, re-check the chase guard), and the failure and degradation rules (S§5.4).
 - [ ] **P4.8** Integrate with the orchestrator: pre-market scan at 09:00, brief at 09:05 (deadline 09:28), vet at 09:35:05, review at 16:15; the `--books A,B` flag; `--no-llm` to force Book B off.
 - [ ] **P4.9** Write FakeLLMClient end-to-end tests of a full simulated day with A and B, including: a veto, `neutral`, a timeout, invalid output, `no_trade` mode, and an entry delayed by a pending verdict.
 - [ ] **P4.10** Write `memory/reviews.py` (S§6.5–6.6, A§4.8):

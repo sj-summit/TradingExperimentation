@@ -54,7 +54,7 @@ ai-day-trader/
 │   ├── core/       clock.py calendar.py models.py events.py logging.py ids.py
 │   ├── data/       alpaca_rest.py stream.py bars.py indicators.py universe.py news.py edgar.py recorder.py ratelimit.py
 │   ├── strategy/   orb_sip.py triggers.py sizing.py
-│   ├── books/      base.py baseline.py llm_filtered.py
+│   ├── books/      base.py reasons.py entry.py baseline.py llm_filtered.py verdicts.py
 │   ├── risk/       caps.py gate.py ledger.py killswitch.py breakers.py
 │   ├── execution/  broker.py alpaca_broker.py sim_broker.py orders.py service.py reconcile.py
 │   ├── llm/        client.py claude_cli.py roles.py fake.py epoch.py candidates.py context.py schemas.py budget.py sanitize.py smoke.py smoke_packs.py smoke_data.json descendants.py
@@ -201,10 +201,18 @@ def size_position(limit: Decimal, stop: Decimal, equity: Decimal, settled_availa
 ```python
 class Book(Protocol):
     name: Literal["A", "B"]
-    async def on_trigger(self, ev: TriggerEvent, sig: Signal) -> BookDecision: ...  # take/skip + reason_code
-class BaselineBook(Book): ...        # STRATEGY.md §4
+    async def on_trigger(self, ev: TriggerEvent, sig: Signal, *,
+                         waited: bool = False) -> BookDecision | Defer: ...  # take/skip + reason_code
+class BaselineBook(Book): ...        # STRATEGY.md §4; never defers
 class LlmFilteredBook(Book): ...     # STRATEGY.md §5; consults VerdictStore, day_mode, pending policy
 ```
+
+- **`entry.py`:** the entry path both books share (the chase guard, the price, the size, the gate); D-068.
+- **`Defer(until)`:** Book B's answer while a verdict is pending. The worker asks again with `waited=True` at `until`, or sooner once the store's version changes. Nothing is journaled meanwhile.
+- **`verdicts.py` (`VerdictStore`):** the day mode, the verdicts, which vet job covers which symbol, and the day's failed attempts (D-068).
+  - The brief's and the vet's answers are stored by the runner's `persist` callbacks, in the transaction that completes their attempt; memory follows.
+  - `load()` rebuilds it after a restart, holding pending again every armed long that no call judged.
+- **`BookDecision.llm_call_id`:** the attempt a Book B decision rests on, written to `decisions.llm_call_id`.
 
 `BookDecision(take=True)` produces an `OrderIntent`, which goes to `RiskGate`. Every decision is journaled with a reason code from this fixed enum:
 
@@ -516,10 +524,12 @@ CREATE TABLE llm_calls (id TEXT PRIMARY KEY, date TEXT, role TEXT, model_alias T
   failure TEXT, subtype TEXT, session_id TEXT, timed_out INTEGER, effort TEXT,
   purpose TEXT, deadline TEXT, pack_id TEXT, pack_sha256 TEXT, pack_bytes INTEGER,   -- purpose: trading | smoke
   candidates_json TEXT, cli_version TEXT, schema_mode TEXT, clamped INTEGER, eval_epoch INTEGER);
-CREATE TABLE verdicts (id INTEGER PRIMARY KEY, date TEXT, symbol TEXT, source TEXT, verdict TEXT,
+CREATE TABLE verdicts (id INTEGER PRIMARY KEY, date TEXT, symbol TEXT, source TEXT, verdict TEXT,   -- source: premarket | vet
   confidence REAL, catalyst_type TEXT, catalyst_fresh INTEGER, catalyst_confirmed INTEGER,
-  risk_flags_json TEXT, reason TEXT, llm_call_id TEXT REFERENCES llm_calls(id));
+  risk_flags_json TEXT, reason TEXT, llm_call_id TEXT REFERENCES llm_calls(id),
+  signal_id TEXT REFERENCES signals(id), eval_epoch INTEGER);   -- from 0008: the signal a vet verdict judged; the brief's have none (D-068)
 CREATE TABLE day_modes (date TEXT, book TEXT, mode TEXT, reason TEXT, llm_call_id TEXT,
+  source TEXT, multiplier TEXT, eval_epoch INTEGER,   -- from 0008: source premarket | default (normal: no brief), multiplier S§5.1 (D-068)
   PRIMARY KEY (date, book));
 CREATE TABLE news (id TEXT PRIMARY KEY, created_at TEXT, updated_at TEXT, headline TEXT, summary TEXT,
   source TEXT, url TEXT, symbols_json TEXT, received_at TEXT);
@@ -567,6 +577,7 @@ CREATE INDEX ix_trades_book_date ON trades(book, entry_ts);
 CREATE INDEX ix_signal_reviews_date ON signal_reviews(date);
 CREATE INDEX ix_news_created ON news(created_at);
 CREATE INDEX ix_day_runs_date ON day_runs(date, kind);                              -- from 0004
+CREATE INDEX ix_verdicts_day ON verdicts(date, symbol);                              -- from 0008
 CREATE UNIQUE INDEX ux_day_runs_step ON day_runs(date, name) WHERE kind = 'step';  -- each EOD step once
 CREATE INDEX ix_decisions_signal_book ON decisions(signal_id, book, id);
 CREATE INDEX ix_llm_calls_day ON llm_calls(date, purpose, role);                    -- from 0007

@@ -2,8 +2,12 @@
 
 ``prepare`` runs before the book's lock and may wait on the network:
 - **Last price:** the trigger's own price for an arm-check trigger, else the hub's.
-- **Quote age (R-016):** from the exchange timestamps of the hub's latest trade and quote. When
-  that is missing or older than ``symbol_quote_max_age_s``, one REST snapshot refreshes it.
+  - A trigger that waited for Book B's verdict (``waited``) takes the hub's, since its own is up
+    to a minute old (D-068).
+  - When the hub has had no trade for a minute, it takes the latest trade from a REST snapshot.
+- **Quote age (R-016):** from the exchange timestamps of the hub's latest trade and quote, plus an
+  arm check's own unless it waited. When that is missing or older than
+  ``symbol_quote_max_age_s``, one REST snapshot refreshes it; the same snapshot serves both.
 - **Broker equity (R-019):** cached per book, refreshed at most every 10 s.
 - **The asset (R-003):** from the asset list read at boot.
 
@@ -72,18 +76,24 @@ class LiveInputs:
         self._assets, self._kill_file, self._hub_stale = assets, kill_file, hub_stale
         self._equity: dict[BookName, tuple[Decimal, datetime]] = {}
 
-    async def prepare(self, book: BookName, sig: Signal, ev: TriggerEvent) -> PreparedInputs:
+    async def prepare(
+        self, book: BookName, sig: Signal, ev: TriggerEvent, *, waited: bool = False
+    ) -> PreparedInputs:
         symbol = sig.symbol
-        last = ev.price if ev.source == "arm_check" else self._hub.last_price(symbol)
+        own = ev.source == "arm_check" and not waited  # the snapshot's price and time
+        last = ev.price if own else self._hub.last_price(symbol)
         latest = (self._hub.last_trade(symbol), self._hub.last_quote(symbol))
         seen = [x.ts for x in latest if x is not None]
-        if ev.source == "arm_check":
+        if own:
             seen.append(ev.ts)
         age = self._age(seen)
-        if age is None or age > self._risk.symbol_quote_max_age_s:
-            fresher = await self._snapshot_age(symbol)
+        if age is None or age > self._risk.symbol_quote_max_age_s or (waited and last is None):
+            snap = await self._snapshot(symbol)
+            fresher = self._snapshot_age(snap)
             if fresher is not None and (age is None or fresher < age):
                 age = fresher
+            if waited and last is None and snap is not None and snap.latest_trade is not None:
+                last = snap.latest_trade.price
         halts = tuple(h.reason for h in await self._halts.active(book))
         if self._kill_file.exists() and "kill_switch" not in halts:
             halts = (*halts, "kill_switch")
@@ -132,12 +142,14 @@ class LiveInputs:
             return None
         return max((self._clock.now() - max(seen)).total_seconds(), 0.0)
 
-    async def _snapshot_age(self, symbol: str) -> float | None:
+    async def _snapshot(self, symbol: str) -> Snapshot | None:
         try:
-            snap = (await self._market.snapshots([symbol], feed=self._feed)).get(symbol)
+            return (await self._market.snapshots([symbol], feed=self._feed)).get(symbol)
         except Exception as exc:  # fail closed: R-016 rejects without a fresh quote
             log.warning("quote refresh failed", symbol=symbol, error=f"{type(exc).__name__}")
             return None
+
+    def _snapshot_age(self, snap: Snapshot | None) -> float | None:
         if snap is None:
             return None
         return self._age([x.ts for x in (snap.latest_trade, snap.latest_quote) if x is not None])

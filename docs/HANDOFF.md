@@ -1,7 +1,7 @@
-# HANDOFF: Phase 4 under way; P4.0a–P4.0c and P4.1–P4.6 done; next 🛑 G4a (updated 2026-10-18)
+# HANDOFF: Phase 4 under way; P4.0a–P4.0c, P4.1–P4.7 and 🛑 G4a done; next P4.8 (updated 2026-11-18)
 
 **Latest:**
-- **Phase 4's plan is approved** (2026-10-14; `C:\Users\Admin\.claude\plans\squishy-popping-honey.md`). Order: P4.0a, P4.0b, P4.0c, P4.1–P4.6, 🛑 G4a, P4.7–P4.10, 🛑 G4b.
+- **Phase 4's plan is approved** (2026-10-14), now at `docs/PHASE4_PLAN.md`. Its file under `~\.claude\plans` was removed by Claude Code's cleanup of old files; the copy in the repository is its unchanged text (D-068). Order: P4.0a, P4.0b, P4.0c, P4.1–P4.6, 🛑 G4a, P4.7–P4.10, 🛑 G4b.
 - **P4.0a is done (D-055).**
   - Fees are booked from Alpaca's FEE activities, at boot (before E) and at EOD. The EOD cash check is the same in paper and live, and stores its residual.
   - D-054's fixes:
@@ -57,17 +57,57 @@
   - A test checks that every name a prompt quotes exists in its role's real pack or in the answers' schemas.
   - `llm/epoch.py` fingerprints what the calls ask (prompts, instructions, schemas, models, efforts, flags). A change is a P3 `llm_fingerprint_changed` at boot, wired in P4.8; bumping the epoch stays the human's call (S§9).
   - Prompt hashes ignore line endings, since `core.autocrlf` can rewrite the prompts with CRLF on checkout. 1,255 tests pass; 20 mutations caught.
-- **P4.6 is done (D-066), uncommitted: `trader smoke llm`, the code only.** Running it is G4a (the runbook below).
+- **P4.6 is done (D-066): `trader smoke llm`, the code only.** Running it was G4a (the runbook below).
   - **A call per role** on packs of fictional issuers (six-letter symbols; the vet at full size, 25 candidates with 5 news items each), through `LlmCalls` with purpose `smoke`, so nothing counts toward the day's budget. Each prints the envelope's fields, the answer's counts, and what became of the injection headline. The sandbox must stay empty.
   - **The isolation canary** plants every source of configuration a call could pick up: instructions with a code word; settings whose hooks leave a marker and whose `env` block and `apiKeyHelper` would fail the call; an `.mcp.json` server that leaves a marker. It plants them above an empty sandbox and in the working directory. `--canary-control` reruns it with the isolation flags off, to show each detector fires.
   - **`--kill-test`:** the vet with a 3 s timeout, watched for the processes the CLI starts (`llm/descendants.py`), so G4a shows how the real CLI stops and whether anything outlives it (D-064's residual).
   - It holds `run-day.lock`, so a session and a smoke run never share the sandbox. 1,308 tests pass; 50 mutations caught.
-- **Commits:** HEAD is `b42d5fd` ("P4.5 Done", the human's commit of 2026-10-18 18:43 ET): everything through D-065. Uncommitted: P4.6's files and D-066, and these doc updates. Commit only if asked.
+- **🛑 G4a passed (D-067), 2026-11-17, on Claude Code 2.1.296.**
+  - **Q4 is answered:** `structured_output` works under every isolation flag, with the `full` schemas, and no fallback was needed. Every call took 2 turns and exited 0, with nothing repaired, clamped or dropped.
+  - **Timings:**
+
+    | Call | Took | Limit |
+    |---|---|---|
+    | the brief | 59.5 s | 600 s |
+    | the vet, at full size | 16.5 s | 60 s |
+    | the review | 107.6 s | 600 s |
+
+  - **Cost:** about $0.86 a day at list prices, which the subscription covers.
+  - **The injection:** no role followed the headline, and Claude flagged it itself.
+  - **The canary** was clean in both halves, and its control fired every detector.
+  - **The kill test:** CTRL_BREAK stopped the CLI inside the grace, and nothing outlived it.
+  - **D-021:** `.claude.json` lives in `runtime/claude-config`. The subscription is a personal plan, so no admin-managed settings reach the calls.
+  - **Found the same evening:**
+    - The PC clock was 14.49 s off because the Windows Time service was stopped. Fixed at 20:54: the service is running and synced, now 0.005 s off.
+    - The smoke's review pack has P&L totals that don't match its trades. That fix goes in P4.10.
+  - **Settings:** the human set `llm.max_tested_cli_version: "2.1.296"`.
+- **P4.7 is done (D-068): Book B.**
+  - **`books/llm_filtered.py`** decides in decision 8's order:
+    1. a halt;
+    2. degradation, re-read before every decision;
+    3. `no_trade`;
+    4. a veto, before the chase guard;
+    5. `llm_unavailable`;
+    6. pending: chased on the first look only, else `Defer` until the deadline, then `vet_timeout`;
+    7. the shared entry path with the day mode's multiplier (`entered_after_wait` / `chased_after_wait` after a wait).
+
+    Every decision carries the `llm_call_id` it rests on.
+  - **`books/verdicts.py` (`VerdictStore`):**
+    - the brief's and the vet's answers are stored by the runner's `persist`, then memory follows;
+    - vet jobs (`expect_vet` → `vet_started` → `vet_done` / `vet_abandoned`);
+    - deadlines are max(armed_at, the call's start) + 60 s, never past the last entry;
+    - `load()` rebuilds after a restart, holding pending again every armed long no call judged.
+  - **`books/entry.py`:** the entry path both books share. Book A is unchanged: a differential check over 13,824 cases found no difference, and the goldens pass byte-identical.
+  - **Also:**
+    - migration 0008 (the verdicts' and day modes' columns);
+    - a trigger that waited is priced from the feed, or from one REST snapshot if the feed is silent.
+  - **Review:** three adversarial reviewers found no blocker, 2 majors and 13 minors, all fixed. 74 mutations caught; 1,383 tests pass.
+- **Commits:** HEAD is `b2b0697` ("P4.6 done", the human's commit of 2026-10-18 22:13 ET), which holds everything through D-066. D-067, P4.7 and D-068, and these doc updates, are uncommitted. Commit only if asked.
 - **Waiting on the human:**
-  - **G4a:** H0.2 (Claude Code ≥ 2.1.268, `claude setup-token`, the token in `.env`), then the runbook below.
+  - **The PC clock is fixed** (2026-11-17 20:54; D-067). The machine that runs the bot (H0.4) must keep the Windows Time service running. Doctor's `alpaca.clock` and the bot's hourly skew check will catch it if the service stops again.
   - **Before G4b:** the Phase 1 checks (`trader news`, `trader filings`, `trader stream --news`) and the `ALPACA_DATA_*` keys.
   - `run-day` isn't needed between gates: it stays a human gate until Phase 6.
-- **Next (Claude):** after G4a, D-067 from its output; then P4.7 (Book B).
+- **Next (Claude):** P4.8 (orchestrator, live wiring, recording, replay, reports). D-068's "For P4.8" lists how the jobs and the worker must drive the store and Book B.
 - **New since G3, for the G4b runbook:**
   - **Log lines:**
     - `fees booked`, at boot and EOD. The first boot after 10-15 should book 10-12 to 10-14's 6 charges and 3 reversals (net $0.00), leaving E at $996.08 if no day trades before it;
@@ -83,9 +123,11 @@
   - **`--dry-run` prints the ledger's E before the fees are booked,** so it can differ by a few cents from the E boot uses.
   - **A size skip reads `capacity_positions` or `capacity_entries`** when R-006 or R-007 also binds (D-056), where it used to read `insufficient_settled_cash`.
 
-To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, the Phase 4 plan, and D-052 to D-066. The G4a runbook below is the human's next step. The G3 runbook further down served both runs and is the template for G4b. Everything below the line further down is the older G2 handoff, kept for its environment notes and the Phase 2 code map.
+To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, the Phase 4 plan (`docs/PHASE4_PLAN.md`), and D-052 to D-068. The G4a runbook below is done (D-067); keep it for rerunning the smoke test after a Claude Code update. The G3 runbook further down served both runs and is the template for G4b. Everything below the line further down is the older G2 handoff, kept for its environment notes and the Phase 2 code map.
 
 ## 🛑 G4a: `trader smoke llm` (the human)
+
+**Passed 2026-11-17 (D-067).** Rerun it after any Claude Code update: doctor warns once the CLI is newer than `llm.max_tested_cli_version`. When the rerun passes, raise that setting.
 
 **Before, once (H0.2),** in PowerShell at the repo root:
 1. Claude Code 2.1.268 or later, as the native `claude.exe`: `where.exe claude` should print `C:\Users\Admin\.local\bin\claude.exe`, and `claude --version` a version.

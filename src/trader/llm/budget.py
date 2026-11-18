@@ -47,9 +47,15 @@ class Budget:
         return await self.attempts(day) >= self.max_calls_per_day
 
     async def failures(self, day: date) -> int:
-        row = await self._journal.fetch_one(
-            "SELECT COUNT(*) AS n FROM llm_calls WHERE date = ? AND purpose = 'trading' "
-            "AND ok = 0 AND failure != ?",
-            (day.isoformat(), ABANDONED),
-        )
-        return int(row["n"]) if row else 0
+        return await failed_attempts(self._journal, day)
+
+
+async def failed_attempts(journal: Journal, day: date) -> int:
+    """The day's failed trading attempts, toward ``llm_failures_degrade_after`` (the module's
+    docstring). Book B's ``VerdictStore`` reads the same count."""
+    row = await journal.fetch_one(
+        "SELECT COUNT(*) AS n FROM llm_calls WHERE date = ? AND purpose = 'trading' "
+        "AND ok = 0 AND failure != ?",
+        (day.isoformat(), ABANDONED),
+    )
+    return int(row["n"]) if row else 0
