@@ -2628,6 +2628,7 @@ Append-only. Each entry records context, the decision, its consequences, and sou
   - run-day, `--sim` and `DayRun` pass `DailyReviewWork`.
   - Replay passes it only when `boot.json` lists the new capability `review_v1` (D-055). So a day recorded before P4.10 replays without a review, and without SPY in its shadow request.
   - A degraded Book B still gets its review, since the review covers Book A's day too. A Book B whose boot failed doesn't.
+  - The job logs `review done` after the call, as the brief and the vet log theirs, for G4b's supervision. Its `no review today` lines say why: a day recorded without one, or no signals to review.
 - **The smoke's review pack** (D-067):
   - Its books and stats now come from its own trades and shadow outcomes (`running_stats`).
   - Each book uses its two entries on the two traded targets by 09:38. So Book A's decision on the vetoed targets, and both books' on the notable ones, is `capacity_entries`, no longer `taken` or `chased`.

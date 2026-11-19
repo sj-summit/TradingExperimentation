@@ -303,8 +303,8 @@ class BookBJobs:
 
     async def _review(self) -> None:
         work = self._deps.review
-        if work is None:
-            log.info("no review today: memory/reviews.py arrives with P4.10")
+        if work is None:  # a replay of a day recorded before the review (review_v1, D-071)
+            log.info("no review today: the day was recorded without one")
             return
         if self.disabled:
             return
@@ -321,6 +321,7 @@ class BookBJobs:
             return
         pack = await self.packs.review(book_b=await self._book_b(with_mode=True))
         if pack is None:
+            log.info("no review today: no signals to review")
             await mark_step(self._journal, day, REVIEW_STEP, clock.now(), "nothing to review")
             return
 
@@ -336,6 +337,7 @@ class BookBJobs:
 
         result = await self._calls.run("review", pack, deadline=plan.review_cutoff,
                                        persist=persist)  # fmt: skip
+        log.info("review done", ok=result.ok, failure=result.failure, targets=len(pack.kept))
         if not result.ok:
             await work.not_reviewed(why=result.failure or "failed", result=result)
             await mark_step(self._journal, day, REVIEW_STEP, clock.now(),

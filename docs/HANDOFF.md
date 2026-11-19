@@ -151,12 +151,18 @@
   - **Replay** runs the review only for a day recorded with the new capability `review_v1`. The A+B golden day gained its review.
   - **The smoke's review pack** is now self-consistent (D-067): its books and stats come from its own trades, and the capacity codes are right.
   - **Checks:** 30 mutations of the review's rules, all caught. 1,534 tests pass.
-- **Commits:** HEAD is `9865f86` ("P4.9 Done", the human's commit), which holds everything through D-070. P4.10 and D-071, and these doc updates, are uncommitted. Commit only if asked.
+- **Commits:** HEAD is `7461a8a` ("P4.10 Done", the human's commit), which holds everything through D-071 except two things, both uncommitted: the `review done` and `no review today` log lines in `orchestrator/llm_jobs.py` (D-071's last bullet), and this runbook. Commit them before the session, so `boot.json`'s git SHA names the code that ran. Commit only if asked.
 - **Waiting on the human:**
   - **The PC clock is fixed** (2026-11-17 20:54; D-067). The machine that runs the bot (H0.4) must keep the Windows Time service running. Doctor's `alpaca.clock` and the bot's hourly skew check will catch it if the service stops again.
-  - **Before G4b:** the Phase 1 checks (`trader news`, `trader filings`, `trader stream --news`) and the `ALPACA_DATA_*` keys.
+  - **Checks before G4b, done 2026-11-19 at about 10:00. All passed.**
+    - **news:** 2 AAPL articles in 24 h, both from `fiscal.ai`. Alpaca's docs now say articles can come from several feeds, with `source` naming the feed; no code reads `source`. The feed looks thin: the `*` news stream stored none in 2 minutes. Book B's packs may carry little news.
+    - **filings:** 5 flagged AAPL filings in 30 days.
+    - **stream --news:** 4 bars, 315 trades, 1 connection, and `news: stream mode`, so the news socket may run beside the stock socket (part of Q2).
+    - **`ALPACA_DATA_*`:** not set, so market data uses Book B's keys and its 200 requests a minute. The runbook allows this.
+    - **doctor:** 0 FAIL, 1 WARN. The WARN is `events`: nothing is listed in the 14 days before the 12-04 jobs report. The file runs to 2027-01-08, and the WARN clears at 2026-11-20 08:30.
+    - **For the G4b record in DECISIONS:** Q2's partial answer and the news feed's source.
   - `run-day` isn't needed between gates: it stays a human gate until Phase 6.
-- **Next: 🛑 G4b, your gate.** Phase 4's code is complete. G4b is one supervised paper session with both books (`uv run trader run-day --books A,B`), after the pre-G4b checks above. Its runbook, pass criteria and the morning dry run come at the next `/next-task`. Claude doesn't run it.
+- **Next: 🛑 G4b, your gate.** Phase 4's code is complete. G4b is one supervised paper session with both books; its runbook is below ("🛑 G4b"). Claude doesn't run it.
 - **New since G3, for the G4b runbook:**
   - **Book B's milestones** (D-069):
     - `book B ready` at boot, and `news started`;
@@ -183,7 +189,112 @@
   - **`--dry-run` prints the ledger's E before the fees are booked,** so it can differ by a few cents from the E boot uses.
   - **A size skip reads `capacity_positions` or `capacity_entries`** when R-006 or R-007 also binds (D-056), where it used to read `insufficient_settled_cash`.
 
-To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, the Phase 4 plan (`docs/PHASE4_PLAN.md`), and D-052 to D-068. The G4a runbook below is done (D-067); keep it for rerunning the smoke test after a Claude Code update. The G3 runbook further down served both runs and is the template for G4b. Everything below the line further down is the older G2 handoff, kept for its environment notes and the Phase 2 code map.
+To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, the Phase 4 plan (`docs/PHASE4_PLAN.md`), and D-069 to D-071. The G4b runbook below is the current one. The G4a runbook after it is done (D-067); keep it for rerunning the smoke test after a Claude Code update. The G3 runbook further down served both of its runs. Everything below the line further down is the older G2 handoff, kept for its environment notes and the Phase 2 code map.
+
+## 🛑 G4b: the supervised A+B paper session (the human)
+
+**What it proves** (PLAN's Phase 4 "Done when"):
+- a whole session with both books;
+- every LLM call logged with its artifacts;
+- Book B's decisions journaled with their reasons;
+- the 16:15 review in its tables, with a signal review for every target;
+- a replay of the day reproduces the decisions, with the recorded LLM answers served back rather than asked again.
+
+**Pick a full session.** Thanksgiving, 2026-11-26, is closed, and 2026-11-27 closes at 13:00. That works, but makes a short day.
+
+**Before the session day,** in PowerShell at the repo root, with no `run-day` going:
+1. **Phase 1's leftovers.** They answer Q2, so paste all three whatever they show.
+   ```powershell
+   uv run trader news --symbols AAPL --hours 24
+   uv run trader filings --symbol AAPL --days 30
+   uv run trader stream --news --minutes 2
+   ```
+   - **news:** headlines, then `N articles in the last 24 h`. 0 is fine; an error isn't.
+   - **filings:** lines with forms, then `N flagged filings for AAPL in the last 30 days`. 0 is fine.
+   - **stream, during market hours:** bar lines, then `done: … bars, … trades, 1 connection(s)`, and one of:
+     - `news: stream mode, …`: two sockets are allowed;
+     - `news: poll mode, …`: only one. Run-day connects the stock stream first, then polls the news over REST.
+
+     A `stream did not connect` that names a connection limit also means one socket.
+2. **Market-data keys**, printing names only:
+   ```powershell
+   Select-String -Path .env -Pattern '^ALPACA_DATA_(KEY_ID|SECRET_KEY)=\S' | ForEach-Object { $_.Line.Split('=')[0] }
+   ```
+   Two names is right. With none, market data uses Book B's keys and shares its 200 requests a minute. The 09:00 scan adds about 8 requests, so that works, but set them if you can.
+3. **`uv run trader doctor`:** every check PASS, and `alpaca.A` and `alpaca.B` show `0 positions, 0 orders`.
+
+   A WARN on `claude.version` means Claude Code updated itself past 2.1.296. Then rerun G4a's smoke (`uv run trader smoke llm --canary-control --kill-test`, the runbook below), and raise `llm.max_tested_cli_version` once it passes.
+4. **The evening before:** `uv run trader universe build` (it builds for the next session).
+
+**On the session day, before 08:25:**
+1. **Machine:**
+   - Set sleep to Never on AC power, and keep Windows Update paused.
+   - Use a standalone PowerShell 7 window at the repo root (`cd D:\Projects\StockExperiment`), not VS Code's terminal: a VS Code restart would kill run-day.
+   - Put off any Claude Code update until after DONE.
+2. **Pre-flight at about 08:10:** `uv run trader run-day --books A,B --dry-run`. Expect:
+   - `session <date>` and the timeline, with Book B's rows: `09:00:00 pre-market scan (Book B)`, `09:05:00 Claude's pre-market brief (Book B)`, `09:28:00 the brief's deadline`, `16:15:00 Claude's post-close review (Book B)` and `16:29:00 the review's cutoff`;
+   - `Book B's LLM: claude_cli, C:\Users\Admin\.local\bin\claude.exe; credential set`;
+   - `clock skew … (ok)` and `universe: <n> eligible`;
+   - `Book A: cash 996.08, …, 0 positions, 0 open orders; ledger E <within cents of 996.08>; halts none`;
+   - `Book B: cash 1000…, 0 positions, 0 open orders; ledger not seeded (seeds at boot); halts none`. This boot seeds Book B's ledger from its flat account;
+   - no `KILL FILE PRESENT`.
+
+   **Don't start, and paste the dry run instead,** if:
+   - Book B's LLM reads `UNAVAILABLE`;
+   - a book shows positions, orders or a halt. For a halt, `uv run trader resume --book A` (type `RESUME A`), then dry-run again;
+   - the universe isn't built.
+3. **Start by 08:30:** `uv run trader run-day --books A,B`. It prints `run-day <date>: Book A, B; logs in …`. Within a minute you should see:
+   - `book B ready`;
+   - `fees booked` for Book A: 10-12 to 10-14's 6 charges and 3 reversals, net $0.00;
+   - `stream connected … /v2/iex`, then `news started`.
+
+**During the day** (G3's rules hold: never stop run-day before DONE, and run no other `trader` command except the emergency stop):
+- **Milestones:**
+  - **09:00:** `pre-market scan eligible=… printed=… candidates=…` (at most 40), then an `edgar` line.
+  - **09:05:** the brief. Within about a minute, `brief done ok=True … day_mode=…` (G4a's took 60 s; the deadline is 09:28).
+  - **09:29:** `subscribed`.
+  - **09:35:** `scan done` and the armed signals, then `vet expected job=1 symbols=[…]` and `vet done job=1 ok=True …` (G4a's vet took 17 s).
+  - **Through the day:** `trigger parked` when a Book B trigger waits up to 60 s for its verdict, then its decision.
+  - **After the close:** FLATTEN at 15:30, the flatten at 15:55, EOD at 16:05, shadow outcomes at 16:12.
+  - **16:15:** the review. Within a few minutes, `review done ok=True … targets=N` (G4a's took 108 s).
+  - **16:30:** the report, then `run-day <date>: DONE`.
+- **Expected, not a problem:**
+  - everything G3's list had;
+  - a P3 `llm_call_failed`, then its repair `ok`;
+  - Book B decisions `vetoed`, `entered_after_wait`, `chased_after_wait`, `vet_timeout`, and `llm_unavailable` for a symbol an answer left out;
+  - any day mode;
+  - `news stream refused for lack of a connection slot; polling REST`.
+- **Stop and paste, leaving run-day running:**
+  - everything on G3's list;
+  - `Book B is off today: …` (Book A then trades alone);
+  - a P2 `llm_degraded`, `llm_refused`, `llm_job_failed` or `llm_unavailable`;
+  - a P3 `brief_missed`, `premarket_scan_failed`, `news_unavailable`, `llm_cli_untested` or `llm_call_refused`;
+  - `no review today`, or no `review done` by 16:29.
+- **Emergency stop:** from a second PowerShell, `New-Item -ItemType File runtime\KILL`. Run-day halts and flattens both books and still finishes the day; afterwards, `Remove-Item runtime\KILL`. If run-day isn't running, use `uv run trader halt --flatten --book all`.
+- **If run-day exits early:** copy its last lines and start it again at once; it resumes. A restart costs the replay criterion.
+
+**Pass:**
+1. The last line is `run-day <date>: DONE`.
+2. No P1 incidents. The report lists every incident.
+3. Both books flat: after DONE, `uv run trader doctor --quick` shows `0 positions, 0 orders` for `alpaca.A` and `alpaca.B`.
+4. `runtime\reports\<date>.md` has:
+   - `LLM calls: N attempts (…)` and `Book B day mode: …`;
+   - the LLM-calls table;
+   - `- The review (ok): …` and the review's targets table.
+5. With no restart, KILL file or manual halt, `uv run trader replay --date <date>` ends with `the replay matches the recorded day`. It prints nothing until it's done, which takes several minutes.
+
+Then paste:
+- the dry run;
+- run-day's first lines, its DONE line, and any line flagged above;
+- `doctor --quick`;
+- the replay's last lines;
+- `uv run trader followups list`.
+
+**Afterwards (Claude):**
+- **Check, from the journal and `runtime\llm\<date>\`:** every attempt has its row and its artifacts; each of Book B's decisions has its reason and its call; the review has a signal review for every target.
+- **Record G4b in DECISIONS:** Q2's answer, each call's duration against its limit, any repairs, the model's day mode and verdicts, and what the review raised.
+- **Make the day a golden replay fixture,** as G3's run 2 became.
+- Phase 4 is then done, and Phase 5 starts in plan mode.
 
 ## 🛑 G4a: `trader smoke llm` (the human)
 
