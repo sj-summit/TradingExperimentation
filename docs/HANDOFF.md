@@ -1,4 +1,4 @@
-# HANDOFF: Phase 4 under way; P4.0a–P4.0c, P4.1–P4.9 and 🛑 G4a done; next P4.10 (updated 2026-11-19)
+# HANDOFF: Phase 4's code done (P4.0a–P4.0c, P4.1–P4.10, 🛑 G4a); next 🛑 G4b, your gate (updated 2026-11-19)
 
 **Latest:**
 - **Phase 4's plan is approved** (2026-10-14), now at `docs/PHASE4_PLAN.md`. Its file under `~\.claude\plans` was removed by Claude Code's cleanup of old files; the copy in the repository is its unchanged text (D-068). Order: P4.0a, P4.0b, P4.0c, P4.1–P4.6, 🛑 G4a, P4.7–P4.10, 🛑 G4b.
@@ -140,19 +140,32 @@
     - its replay reproduces every row, each call's `pack_id` included;
     - Book A's rows on it equal Book A's own golden day's.
   - **Found:** a waited trigger is priced from its last print, and R-016 allows 15 s. On a thinly traded name, Book B's wait can cost an entry that Book A keeps. That is for the evaluation to watch. 1,517 tests pass.
-- **Commits:** HEAD is `79b8a31` ("P4.8 Done", the human's commit), which holds everything through D-069. P4.9 and D-070, and these doc updates, are uncommitted. Commit only if asked.
+- **P4.10 is done (D-071): the review's content and the follow-ups.**
+  - **`memory/reviews.py`** fills the 16:15 review job.
+    - **Targets:** the day's trades, Book B's vetoes on triggered longs (a long only SIP saw trigger included), and the 5 largest untraded moves.
+    - **Each target's evidence:** its decision time (when the pack behind Book B's verdict was sent), SPY's move over its window, and news stamped before or after the decision.
+    - **Storing the answer:** the pack carries `history` and the epoch's stats. The answer goes to its tables in the call's own transaction. A linked issue or note is bumped and keeps its first text; an unknown or closed id opens a new one. Lesson proposals are stored as `proposed`.
+  - **The shadow job** adds SPY to its SIP request on review days, for `spy_move_pct` (migration 0009). Book A's goldens are byte-identical.
+  - **`trader followups list [--all]` and `followups set issue|note ID --status S --response "…"`:** only you close an issue (`fixed`, `wontfix`) or a note (`accepted`, `rejected`, `done`).
+  - **The report** lists the issues and notes the review raised, new or recurring, and says why when the review didn't come.
+  - **Replay** runs the review only for a day recorded with the new capability `review_v1`. The A+B golden day gained its review.
+  - **The smoke's review pack** is now self-consistent (D-067): its books and stats come from its own trades, and the capacity codes are right.
+  - **Checks:** 30 mutations of the review's rules, all caught. 1,534 tests pass.
+- **Commits:** HEAD is `9865f86` ("P4.9 Done", the human's commit), which holds everything through D-070. P4.10 and D-071, and these doc updates, are uncommitted. Commit only if asked.
 - **Waiting on the human:**
   - **The PC clock is fixed** (2026-11-17 20:54; D-067). The machine that runs the bot (H0.4) must keep the Windows Time service running. Doctor's `alpaca.clock` and the bot's hourly skew check will catch it if the service stops again.
   - **Before G4b:** the Phase 1 checks (`trader news`, `trader filings`, `trader stream --news`) and the `ALPACA_DATA_*` keys.
   - `run-day` isn't needed between gates: it stays a human gate until Phase 6.
-- **Next (Claude):** P4.10, the review's content: `memory/reviews.py` provides `ReviewWork` (D-069), with the `followups` CLI, and a capability so a day recorded before it doesn't replay a review. Once `DayRun` passes it, the A+B golden day gains its 16:15 review, a golden rewrite the plan allows in P4.10. After P4.10 comes 🛑 G4b.
+- **Next: 🛑 G4b, your gate.** Phase 4's code is complete. G4b is one supervised paper session with both books (`uv run trader run-day --books A,B`), after the pre-G4b checks above. Its runbook, pass criteria and the morning dry run come at the next `/next-task`. Claude doesn't run it.
 - **New since G3, for the G4b runbook:**
   - **Book B's milestones** (D-069):
     - `book B ready` at boot, and `news started`;
     - `pre-market scan` at 09:00;
     - `brief done` soon after 09:05, with the day mode;
     - `vet expected` at arming, then `vet done`;
-    - `trigger parked` when a Book B trigger waits for its verdict.
+    - `trigger parked` when a Book B trigger waits for its verdict;
+    - the review at 16:15: an `llm_calls` row with role `review`, then `daily_reviews` for the day (`ok`, or `missing` or `invalid` with why). A `no review today` log line means it didn't come (D-071).
+  - **After the session:** `uv run trader followups list` shows what the review raised; the daily report lists them too.
   - **Book B's incidents:**
     - P2: `llm_degraded` (Book B halted to the next open), `llm_refused` (a human must fix the cause: the sandbox, a prompt, the pack's size), `llm_job_failed`, `llm_unavailable` (Book B off: no CLI or token), `idle_book_not_flat` (a book kept off holds positions or orders: flatten it or run it);
     - P3: `llm_call_failed` (one per failed attempt), `llm_call_refused`, `brief_missed`, `premarket_scan_failed`, `news_unavailable`, `llm_cli_untested` (the CLI updated itself past `max_tested_cli_version`: rerun the smoke), `edgar_unavailable` (no usable EDGAR user agent).

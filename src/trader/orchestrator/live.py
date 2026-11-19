@@ -76,6 +76,7 @@ from trader.llm.replay import LLM_FILE, RecordingTransport
 from trader.llm.smoke import cli_version
 from trader.memory.incidents import record_incident
 from trader.memory.journal import Journal
+from trader.memory.reviews import DailyReviewWork
 from trader.notify import notifier_from_config
 from trader.orchestrator.day import DayDeps, DayOrchestrator, DayPaths
 from trader.orchestrator.evidence import EvidenceDesk
@@ -401,7 +402,9 @@ async def _book_b_llm(
         filings_days=cfg.settings.edgar.lookback_days,
         news_up=lambda: news.mode in ("stream", "poll"),
     )
-    packs: PackFactory = live_packs(desk)
+    review = DailyReviewWork(journal=journal, clock=clock, settings=cfg.settings,
+                             day=clock.now().date())  # fmt: skip
+    packs: PackFactory = live_packs(desk, review=review)
     if sink is not None:
         packs = recording_packs(packs, sink)
     roles = llm.roles
@@ -423,6 +426,7 @@ async def _book_b_llm(
         calls=calls,
         packs=packs,
         news=news,
+        review=review,
         fingerprint=epoch_fingerprint(cfg.settings, cfg.root / "prompts"),
         setup=setup,
     )

@@ -62,12 +62,15 @@ async def test_book_b_trades_beside_book_a_on_a_neutral_day(tmp_path: Path) -> N
     assert a["WIN"] == "taken"
     assert a["CAP"] == "capacity_entries"
     calls = await run.rows("SELECT role, started_at, deadline, ok, candidates_json FROM llm_calls "
-                           "ORDER BY id")  # fmt: skip
+                           "ORDER BY started_at")  # fmt: skip
     assert [tuple(r) for r in calls] == [
         ("premarket", at("09:05:00").isoformat(), at("09:28:00").isoformat(), 1,
          '["GAPPER", "LOSE", "SHORT"]'),  # two gainers, then SHORT for its news
         ("vet", at("09:35:03").isoformat(), at("15:30:00").isoformat(), 1,
          '["WIN", "EXP", "CAP"]'),  # at arming: the armed longs the brief didn't judge
+        ("review", at("16:15:00").isoformat(), at("16:29:00").isoformat(), 1,
+         '["20261013-WIN-orb5", "20261013-LOSE-orb5", "20261013-GAPPER-orb5", '
+         '"20261013-CAP-orb5", "20261013-CHASE-orb5"]'),  # the trades, then by |shadow R|
     ]  # fmt: skip
     vetted = await run.rows("SELECT symbol, source, signal_id, risk_flags_json FROM verdicts "
                             "ORDER BY symbol")  # fmt: skip
@@ -158,6 +161,7 @@ NEUTRAL = {  # Book A's every day here; Book B's too, when the model is neutral 
     "CAP": "capacity_entries",
 }  # fmt: skip
 ALL_ARMED = '["WIN", "LOSE", "GAPPER", "EXP", "CAP"]'  # the armed longs, by rank
+MORNING = "FROM llm_calls WHERE role != 'review' ORDER BY id"  # not the 16:15 review
 
 
 def llm_settings(**changes: Any) -> Settings:
@@ -230,6 +234,8 @@ def invalid_until_degraded(seen: Seen) -> Reply:
     """The brief's first try isn't JSON, and its repair answers well. The vet's try isn't JSON
     and its repair doesn't fit the schema: three failed attempts, ``llm_failures_degrade_after``."""
     pack = seen.pack()
+    if pack["role"] == "review":  # the morning's failures are the point; the review answers
+        return Reply(envelope=envelope(answer_for(pack)), delay_s=30.0)
     if not seen.is_repair:
         return Reply(stdout=b"not json", delay_s=1.0)
     if pack["role"] == "premarket":
@@ -243,7 +249,7 @@ async def test_an_answer_still_invalid_after_its_repair_degrades_book_b_alone(
 ) -> None:
     run = await ab_day(tmp_path, llm_script=invalid_until_degraded)
     await run.run()
-    calls = await run.rows("SELECT id, ok, failure FROM llm_calls ORDER BY id")
+    calls = await run.rows(f"SELECT id, ok, failure {MORNING}")
     assert [tuple(r) for r in calls] == [
         ("20261013-premarket-01-1", 0, "invalid_json"), ("20261013-premarket-01-2", 1, None),
         ("20261013-vet-01-1", 0, "invalid_json"), ("20261013-vet-01-2", 0, "schema_invalid"),
@@ -275,7 +281,7 @@ async def test_a_no_trade_day_keeps_book_b_out_and_still_vets(tmp_path: Path) ->
     }  # fmt: skip
     for symbol in ("WIN", "CAP"):  # each rests on the brief that set the day mode
         assert [r["llm_call_id"] for r in await b_rows(run, symbol)] == ["20261013-premarket-01-1"]
-    calls = await run.rows("SELECT id, ok FROM llm_calls ORDER BY id")
+    calls = await run.rows(f"SELECT id, ok {MORNING}")
     assert [tuple(r) for r in calls] == [("20261013-premarket-01-1", 1), ("20261013-vet-01-1", 1)]
     assert await run.trades("B") == {}
     assert await run.decisions("A") == NEUTRAL
@@ -308,7 +314,7 @@ async def test_a_failed_brief_sends_every_armed_long_to_the_vet(tmp_path: Path) 
     the brief's own candidates among them."""
     run = await ab_day(tmp_path, llm_script=brief_not_json)
     await run.run()
-    calls = await run.rows("SELECT id, ok, candidates_json FROM llm_calls ORDER BY id")
+    calls = await run.rows(f"SELECT id, ok, candidates_json {MORNING}")
     picks = '["GAPPER", "LOSE", "SHORT"]'
     assert [tuple(r) for r in calls] == [
         ("20261013-premarket-01-1", 0, picks), ("20261013-premarket-01-2", 0, picks),
@@ -328,7 +334,7 @@ async def test_a_start_after_the_brief_s_latest_start_skips_the_morning(tmp_path
     mode, and the vet for every armed long."""
     run = await DayRun(tmp_path, standard_day(), start=time(9, 28), books=("A", "B")).open()
     await run.run()
-    calls = await run.rows("SELECT id, candidates_json FROM llm_calls ORDER BY id")
+    calls = await run.rows(f"SELECT id, candidates_json {MORNING}")
     assert [tuple(r) for r in calls] == [("20261013-vet-01-1", ALL_ARMED)]
     modes = await run.rows("SELECT mode, source FROM day_modes")
     assert [tuple(r) for r in modes] == [("normal", "default")]
@@ -367,7 +373,7 @@ async def test_a_restart_after_the_vet_asks_nothing_again(tmp_path: Path) -> Non
     EDGAR nothing, and Book B's day ends as it would have."""
     run = await ab_day(tmp_path)
     assert await run.run(until="09:45:00") is None
-    calls = [r["id"] for r in await run.rows("SELECT id FROM llm_calls ORDER BY id")]
+    calls = [r["id"] for r in await run.rows(f"SELECT id {MORNING}")]
     assert calls == ["20261013-premarket-01-1", "20261013-vet-01-1"]
     asked = list(run.edgar.asked)
     await run.wait_until("09:45:30")
@@ -375,7 +381,7 @@ async def test_a_restart_after_the_vet_asks_nothing_again(tmp_path: Path) -> Non
     outcome = await run.run()
     assert outcome is not None
     assert outcome.state == "DONE"
-    assert [r["id"] for r in await run.rows("SELECT id FROM llm_calls ORDER BY id")] == calls
+    assert [r["id"] for r in await run.rows(f"SELECT id {MORNING}")] == calls
     assert run.edgar.asked == asked
     assert await run.decisions("B") == NEUTRAL
     await run.close()
@@ -387,7 +393,7 @@ async def test_the_day_s_call_cap_fails_closed(tmp_path: Path) -> None:
     rests on the brief's verdict."""
     run = await ab_day(tmp_path)
     await run.run(run.deps(settings=llm_settings(max_calls_per_day=1)))
-    calls = [r["id"] for r in await run.rows("SELECT id FROM llm_calls ORDER BY id")]
+    calls = [r["id"] for r in await run.rows(f"SELECT id {MORNING}")]
     assert calls == ["20261013-premarket-01-1"]
     assert await run.decisions("B") == {**NEUTRAL, "WIN": "llm_unavailable",
                                         "CAP": "llm_unavailable"}  # fmt: skip
@@ -406,6 +412,109 @@ async def test_an_a_only_day_asks_for_nothing_of_book_b_s(tmp_path: Path) -> Non
     assert (run.news.started, run.news.reads, run.edgar.asked) == ([], 0, [])
     assert [m for t, m in run.market.asked if t < at("09:30:00") and m == "snapshots"] == []
     assert await run.decisions("A") == NEUTRAL
+    await run.close()
+
+
+# ---------------------------------------------------------------- the review (P4.10)
+
+
+def reviewed_day(seen: Seen) -> Reply:
+    """The vet vetoes CAP; the review answers with a process issue, a note, a lesson proposal,
+    and a review of EXP, which isn't a target."""
+    pack = seen.pack()
+    if pack["role"] != "review":
+        out = answer_for(pack)
+        out["assessments"] = [{**a, "verdict": "veto" if a["symbol"] == "CAP" else "neutral"}
+                              for a in out["assessments"]]  # fmt: skip
+        return Reply(envelope=envelope(out), delay_s=5.0)
+    out = answer_for(pack)
+    out["summary"] = "CAP was vetoed on its 8-K."
+    out["signal_reviews"].append({**out["signal_reviews"][0], "signal_id": "20261013-EXP-orb5"})
+    out["process_issues"] = [
+        {"existing_issue_id": None, "severity": "warn", "component": "vet",
+         "description": "The vet judged CAP before its 8-K was read."}
+    ]  # fmt: skip
+    out["human_notes"] = [{"existing_note_id": None, "note": "Consider a later vet for CAP."}]
+    out["lesson_proposals"] = [
+        {"statement": "Small gaps fade.", "rationale": "One day of evidence.",
+         "evidence_query": {"filters": [{"field": "gap_pct", "op": "lt", "value": 1.5}],
+                            "compare_to": "complement", "metric": "shadow_r"},
+         "claimed_direction": "subset_worse", "suggested_use": "caution_hint"}
+    ]  # fmt: skip
+    return Reply(envelope=envelope(out), delay_s=40.0)
+
+
+async def test_the_16_15_review_covers_the_targets_and_stores_every_part(tmp_path: Path) -> None:
+    """S§6.1, S§6.5: code picks the targets (the trades, Book B's vetoes, the largest untraded
+    moves), each stamped with its decision; the answer goes to its tables, the review of a
+    non-target dropped."""
+    run = await ab_day(tmp_path, llm_script=reviewed_day)
+    await run.run()
+    assert (await run.decisions("B"))["CAP"] == "vetoed"
+    pack = json.loads((tmp_path / "llm" / "2026-10-13" / "20261013-review-01-1.input.json")
+                      .read_text("utf-8"))  # fmt: skip
+    assert [(t["symbol"], t["selected_for"], t["decision_basis"], t["decision_at"][11:19])
+            for t in pack["review_targets"]] == [
+        ("WIN", "traded", "vet_pack", "09:35:03"), ("LOSE", "traded", "premarket_pack", "09:05:00"),
+        ("CAP", "b_vetoed", "vet_pack", "09:35:03"),
+        ("GAPPER", "notable", "premarket_pack", "09:05:00"),
+        ("CHASE", "notable", "armed", "09:35:03"),
+    ]  # fmt: skip
+    gapper = next(t for t in pack["review_targets"] if t["symbol"] == "GAPPER")
+    assert gapper["suspicious_news"] is True  # its injection headline, before the brief
+    assert [n["published"] for n in gapper["news"]] == ["before_decision"]
+    assert all(t["spy_move_pct"] is not None for t in pack["review_targets"])
+    assert pack["books"]["B"]["trades"] == 2
+    review = await run.rows("SELECT status, summary, targets_json FROM daily_reviews")
+    assert [(r["status"], r["summary"]) for r in review] == [("ok", "CAP was vetoed on its 8-K.")]
+    stored = await run.rows("SELECT signal_id FROM signal_reviews ORDER BY signal_id")
+    symbols = ("CAP", "CHASE", "GAPPER", "LOSE", "WIN")
+    assert [r["signal_id"] for r in stored] == [f"20261013-{s}-orb5" for s in symbols]
+    assert [tuple(r) for r in await run.rows(
+        "SELECT kind, item_id, text FROM review_mentions ORDER BY id")] == [
+        ("issue", 1, "The vet judged CAP before its 8-K was read."),
+        ("note", 1, "Consider a later vet for CAP."),
+    ]  # fmt: skip
+    lessons = await run.rows("SELECT id, status, source_date FROM lessons")
+    assert [tuple(r) for r in lessons] == [("L-001", "proposed", "2026-10-13")]
+    md = (tmp_path / "reports" / "2026-10-13.md").read_text(encoding="utf-8")
+    assert "- The review (ok): `CAP was vetoed on its 8-K.`" in md
+    assert "| issue | 1 | new | warn | `The vet judged CAP before its 8-K was read.` |" in md
+    await run.close()
+
+
+async def test_a_review_that_times_out_is_recorded_missing(tmp_path: Path) -> None:
+    """An answer still out at the review's timeout (600 s, inside its 16:29 cutoff) is recorded
+    as ``missing`` with why, and never degrades Book B: the day's entries are over."""
+    run = await ab_day(tmp_path)
+    run.llm_delay["review"] = 900.0
+    outcome = await run.run()
+    assert outcome is not None
+    assert outcome.state == "DONE"
+    row = await run.rows("SELECT status, failure, llm_call_id FROM daily_reviews")
+    assert [tuple(r) for r in row] == [("missing", "timeout", "20261013-review-01-1")]
+    assert await run.halts("B") == []
+    md = (tmp_path / "reports" / "2026-10-13.md").read_text(encoding="utf-8")
+    assert "- The review (missing): timeout" in md
+    await run.close()
+
+
+async def test_a_restart_after_the_review_never_asks_again(tmp_path: Path) -> None:
+    """Plan decision 11: the answer and the day's review marker commit together, so a restart
+    after the review makes no call."""
+    run = await ab_day(tmp_path)
+    assert await run.run(until="16:20:00") is None
+    assert [r["id"] for r in await run.rows("SELECT id FROM llm_calls WHERE role = 'review'")] == [
+        "20261013-review-01-1"
+    ]
+    await run.wait_until("16:21:00")
+    run.new_hub()
+    outcome = await run.run()
+    assert outcome is not None
+    assert outcome.state == "DONE"
+    calls = await run.rows("SELECT id FROM llm_calls WHERE role = 'review'")
+    assert [r["id"] for r in calls] == ["20261013-review-01-1"]
+    assert [r["status"] for r in await run.rows("SELECT status FROM daily_reviews")] == ["ok"]
     await run.close()
 
 

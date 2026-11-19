@@ -180,13 +180,16 @@ async def test_a_recorded_day_replays_the_same(tmp_path: Path) -> None:
     assert [r for r in recorded if r[0] == "clock"] != []
     assert day_runs(tmp_path / "replay" / "trader.db") == recorded
 
-    def shadows(db: Path) -> list[tuple[Any, ...]]:
+    def shadows(db: Path) -> list[dict[str, Any]]:
         with closing(sqlite3.connect(db)) as conn:
-            return conn.execute("SELECT * FROM shadow_outcomes ORDER BY signal_id").fetchall()
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT * FROM shadow_outcomes ORDER BY signal_id").fetchall()
+            return [dict(r) for r in rows]
 
     # The tape reads replay too: CAP's and GAPPER's ambiguous minutes come from them (D-057).
     live_shadows = shadows(tmp_path / "trader.db")
-    assert [r for r in live_shadows if r[-1] == "tape"] != []
+    assert [r for r in live_shadows if r["trigger_resolution"] == "tape"] != []
+    assert {r["spy_move_pct"] for r in live_shadows} == {None}  # an A-only day doesn't review
     assert shadows(tmp_path / "replay" / "trader.db") == live_shadows
 
 

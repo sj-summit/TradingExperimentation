@@ -116,6 +116,18 @@ class TargetLine:
 
 
 @dataclass(frozen=True)
+class MentionLine:
+    """A process issue or note the day's review raised (A§4.10): new today or recurring."""
+
+    kind: str  # issue | note
+    item_id: int
+    recurring: bool
+    count: int  # how often it has been raised, today included
+    severity: str
+    text: str  # the model's, today's
+
+
+@dataclass(frozen=True)
 class LlmDay:
     """Book B's LLM work for the day."""
 
@@ -129,7 +141,9 @@ class LlmDay:
     day_mode_reason: str = ""  # the model's
     review_status: str | None = None
     review_summary: str = ""  # the model's
+    review_failure: str = ""  # why it is missing or invalid (the engine's words)
     reviews: tuple[TargetLine, ...] = ()
+    raised: tuple[MentionLine, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -350,7 +364,16 @@ async def _llm_day(
         (d,),
     )
     review = await journal.fetch_one(
-        "SELECT status, summary FROM daily_reviews WHERE date = ?", (d,)
+        "SELECT status, summary, failure FROM daily_reviews WHERE date = ?", (d,)
+    )
+    raised = await journal.fetch_all(
+        "SELECT m.kind, m.item_id, m.severity, m.text, "
+        "COALESCE(i.first_seen, n.first_raised) AS first, "
+        "COALESCE(i.occurrences, n.times_raised) AS count FROM review_mentions m "
+        "LEFT JOIN process_issues i ON m.kind = 'issue' AND i.id = m.item_id "
+        "LEFT JOIN review_notes n ON m.kind = 'note' AND n.id = m.item_id "
+        "WHERE m.date = ? ORDER BY m.kind, m.id",
+        (d,),
     )
     targets = await journal.fetch_all(
         "SELECT s.symbol, r.went_well, r.went_badly, r.why, r.b_process FROM signal_reviews r "
@@ -373,6 +396,18 @@ async def _llm_day(
         day_mode_reason=(mode["reason"] or "") if mode is not None else "",
         review_status=review["status"] if review is not None else None,
         review_summary=(review["summary"] or "") if review is not None else "",
+        review_failure=(review["failure"] or "") if review is not None else "",
+        raised=tuple(
+            MentionLine(
+                kind=r["kind"],
+                item_id=int(r["item_id"]),
+                recurring=(r["first"] or d) < d,
+                count=int(r["count"] or 1),
+                severity=r["severity"] or "",
+                text=r["text"] or "",
+            )
+            for r in raised
+        ),
         reviews=tuple(
             TargetLine(
                 symbol=t["symbol"],
@@ -469,6 +504,15 @@ def _tables(report: DailyReport) -> list[tuple[str, list[str], list[list[str]]]]
                   t.b_process] for t in llm.reviews],
             )
         )  # fmt: skip
+    if llm.raised:
+        tables.append(
+            (
+                "Claude's review: process issues and notes (`trader followups list`)",
+                ["kind", "id", "new or recurring", "severity", "today's text"],
+                [[m.kind, str(m.item_id), f"recurring (x{m.count})" if m.recurring else "new",
+                  m.severity, ModelText(m.text)] for m in llm.raised],
+            )
+        )  # fmt: skip
     return tables
 
 
@@ -516,8 +560,10 @@ def _claude_md(report: DailyReport) -> list[str]:
     out = ["", "## Claude", ""]
     if llm.day_mode_reason:
         out.append(f"- The day mode's reason: {_model_md(llm.day_mode_reason)}")
-    if llm.review_status:
-        out.append(f"- The review ({llm.review_status}): {_model_md(llm.review_summary)}")
+    if llm.review_status == "ok":
+        out.append(f"- The review (ok): {_model_md(llm.review_summary)}")
+    elif llm.review_status:  # the engine's words, not the model's
+        out.append(f"- The review ({llm.review_status}): {llm.review_failure or 'no reason given'}")
     return out
 
 
@@ -529,7 +575,8 @@ def _claude_html(report: DailyReport) -> list[str]:
     if llm.day_mode_reason:
         out.append(f"<li>The day mode's reason: {e(llm.day_mode_reason)}</li>")
     if llm.review_status:
-        out.append(f"<li>The review ({e(llm.review_status)}): {e(llm.review_summary)}</li>")
+        said = llm.review_summary if llm.review_status == "ok" else llm.review_failure
+        out.append(f"<li>The review ({e(llm.review_status)}): {e(said or 'no reason given')}</li>")
     out.append("</ul>")
     return out
 

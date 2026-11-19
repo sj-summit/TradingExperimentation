@@ -58,7 +58,9 @@ from trader.llm.replay import LLM_FILE, ReplayTransport
 from trader.llm.roles import role_specs
 from trader.memory.journal import Journal
 from trader.memory.regime import RegimeTags, store_regime
+from trader.memory.reviews import DailyReviewWork
 from trader.notify import NullNotifier
+from trader.orchestrator.capabilities import REVIEW
 from trader.orchestrator.day import Cadence, DayDeps, DayOrchestrator, DayPaths
 from trader.orchestrator.llm_jobs import LlmDeps
 from trader.orchestrator.packs import ReplayPacks
@@ -148,9 +150,15 @@ async def replay_day(
             records = list(read_jsonl(folder / LLM_FILE)) if (folder / LLM_FILE).exists() else []
             transport, packs = ReplayTransport(records, clock), ReplayPacks(records, clock)
             served = packs
+            # The review's pack is served too; its answer is stored as live. A day recorded
+            # before the review existed replays without one (D-055, D-071).
+            reviewed = REVIEW in boot.get("capabilities", ())
             llm = LlmDeps(
                 calls=_replay_calls(journal, clock, transport, settings, out, root),
                 packs=lambda _ctx: served,
+                review=DailyReviewWork(journal=journal, clock=clock, settings=settings, day=day)
+                if reviewed
+                else None,
                 setup={"transport": "replay"},
             )
         deps = DayDeps(

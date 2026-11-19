@@ -181,6 +181,41 @@ async def test_book_b_s_llm_work_is_reported(journal: Journal) -> None:
     assert "&lt;img src=x onerror=alert(1)&gt;" in page
 
 
+async def test_the_issues_and_notes_the_review_raised_are_reported(journal: Journal) -> None:
+    """A§4.10: new or recurring, each with today's text, escaped as the model's."""
+    await llm_day(journal)
+    statements = [
+        "INSERT INTO process_issues (id, first_seen, last_seen, occurrences, severity, component, "
+        "description, status) VALUES (4, '2026-10-01', '2026-10-13', 3, 'warn', 'vet', 'first', "
+        "'open'), (9, '2026-10-13', '2026-10-13', 1, 'error', 'gate', 'brand new', 'open')",
+        "INSERT INTO review_notes (id, first_raised, last_raised, times_raised, note, status) "
+        "VALUES (2, '2026-10-13', '2026-10-13', 1, 'a note', 'open')",
+        "INSERT INTO review_mentions (date, kind, item_id, severity, component, text) VALUES "
+        "('2026-10-13', 'issue', 4, 'warn', 'vet', 'slow again | [x](http://e.x)'), "
+        "('2026-10-13', 'issue', 9, 'error', 'gate', 'brand new'), "
+        "('2026-10-13', 'note', 2, NULL, NULL, 'a note'), "
+        "('2026-10-12', 'issue', 4, 'warn', 'vet', 'yesterday: not today')",
+    ]
+    for sql in statements:
+        await journal.execute(sql)
+    report = await build_daily(journal, DAY, books=("A", "B"), mode="paper", session=None, now=NOW)
+    md = render_markdown(report)
+    assert "process issues and notes (`trader followups list`)" in md
+    assert "| issue | 4 | recurring (x3) | warn | `slow again \\| [x](http://e.x)` |" in md
+    assert "| issue | 9 | new | error | `brand new` |" in md
+    assert "| note | 2 | new |  | `a note` |" in md
+    assert "yesterday" not in md
+
+
+async def test_a_review_that_did_not_come_says_why(journal: Journal) -> None:
+    await llm_day(journal)
+    await journal.execute("UPDATE daily_reviews SET status = 'missing', summary = NULL, "
+                          "failure = 'timeout'")  # fmt: skip
+    report = await build_daily(journal, DAY, books=("A", "B"), mode="paper", session=None, now=NOW)
+    assert "- The review (missing): timeout" in render_markdown(report)
+    assert "<li>The review (missing): timeout</li>" in render_html(report)
+
+
 async def test_a_day_book_b_was_kept_off_says_why(journal: Journal) -> None:
     report = await build_daily(journal, DAY, books=("A",), mode="paper", session=None, now=NOW,
                                book_b_off="--no-llm")  # fmt: skip

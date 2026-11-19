@@ -59,6 +59,7 @@ from trader.llm.context import (
 )
 from trader.llm.schemas import SymbolAssessment, Verdict
 from trader.memory.regime import RegimeTags
+from trader.memory.reviews import running_stats
 from trader.memory.shadow import ShadowOutcome
 from trader.memory.trades import TradeRow
 
@@ -299,20 +300,41 @@ def _review(d: SmokeData, settings: Settings, common: Common) -> Pack:
         signals.append(row)
         targets.append(target)
     earlier = d.issuers[5]
+    # The books and the stats come from the pack's own trades and shadow outcomes (D-067)
+    trades = {book: [t for s in signals for b, t in s.trades.items() if b == book]
+              for book in ("A", "B")}  # fmt: skip
+    books = {
+        book: BookResult(
+            Decimal(1000),
+            Decimal(1000) + sum((t.pnl or Decimal(0) for t in rows), Decimal(0)),
+            sum((t.pnl or Decimal(0) for t in rows), Decimal(0)),
+            len(rows),
+        )
+        for book, rows in trades.items()
+    }
+    shadows = [s.shadow.shadow_r for s in signals if s.shadow and s.shadow.shadow_r is not None]
+    vetoed = [s.shadow.shadow_r for s in signals if s.decisions.get("B") == "vetoed"
+              and s.shadow and s.shadow.shadow_r is not None]  # fmt: skip
+    stats = running_stats(
+        epoch=0,
+        days=1,
+        a_r=[t.r_multiple for t in trades["A"] if t.r_multiple is not None],
+        b_r=[t.r_multiple for t in trades["B"] if t.r_multiple is not None],
+        shadow_r=shadows,
+        vetoed_r=vetoed,
+        b_vetoes=sum(s.decisions.get("B") == "vetoed" for s in signals),
+    )
     return review_pack(
         as_of=_at(day, 16, 15),
         common=common,
-        books={
-            "A": BookResult(Decimal(1000), Decimal("1003.21"), Decimal("3.21"), 4),
-            "B": BookResult(Decimal(1000), Decimal("998.40"), Decimal("-1.60"), 2),
-        },
+        books=books,
         signals=signals,
         targets=targets,
         incidents=[
             IncidentView(et_datetime(day, x.time), x.severity, x.component, x.code, x.message)
             for x in texts.incidents
         ],
-        stats={"a_trades": 4, "b_trades": 2, "b_vetoes": 3, "triggered": 8, "shadow_mean_r": 1.11},
+        stats=stats,
         lessons=[
             LessonView(
                 id="L-001",
@@ -380,17 +402,18 @@ def _target(
     source: Literal["premarket", "vet"]
     basis: Literal["premarket_pack", "vet_pack", "trigger", "armed"]
     trades: dict[str, TradeRow] = {}
+    # The two traded targets trigger first (09:36, 09:38): each book's two entries for the day
+    # (R-007) are then used, so every later target is capacity_entries, or vetoed by Book B.
     if selected == "traded":
         decisions = {"A": "taken", "B": "taken"}
         trades = {"A": _trade("A", signal, r), "B": _trade("B", signal, r)}
         verdict, source, basis, decided = "allow", "vet", "vet_pack", _at(day, 9, 35, 5)
     elif selected == "b_vetoed":
-        decisions = {"A": "taken", "B": "vetoed"}
-        trades = {"A": _trade("A", signal, r)}
+        decisions = {"A": "capacity_entries", "B": "vetoed"}
         verdict, source, basis, decided = "veto", "premarket", "premarket_pack", _at(day, 9, 5)
     else:
-        decisions = {"A": "capacity_positions", "B": "chased"}
-        verdict, source, basis, decided = "neutral", "vet", "trigger", triggered
+        decisions = {"A": "capacity_entries", "B": "capacity_entries"}
+        verdict, source, basis, decided = "neutral", "vet", "vet_pack", _at(day, 9, 35, 5)
     news = [
         ReviewNews(
             _news(3000 + 10 * i + k, issuer, d, i + k, decided + _minutes(m)),

@@ -1148,6 +1148,10 @@ class DayOrchestrator:
             # From the journal, not the scan-time copies: they lack triggered_at (D-051).
             signals=await load_signals(self._journal, self.day),
             tape=SHADOW_TAPE in self._d.capabilities,
+            # a review day: SPY's bars ride along, for the review's market move (D-071)
+            spy=self._d.settings.data.regime_symbols[0]
+            if self._jobs is not None and self._jobs.reviews
+            else None,
         )
         if not run.ok:
             await self._incident("P3", "shadow_unavailable", run.error or "no SIP bars")

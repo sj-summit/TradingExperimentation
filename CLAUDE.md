@@ -67,6 +67,7 @@ This is paper trading only until the human completes the go-live gate in `docs/P
 | The same day with Book B off (no LLM calls) | `uv run trader run-day --books A,B --no-llm` |
 | LLM smoke test (HUMAN GATE G4a; uses the subscription) | `uv run trader smoke llm --canary-control --kill-test` |
 | Replay a recorded day offline | `uv run trader replay --date YYYY-MM-DD` |
+| Claude's open process issues and notes; only the human closes one | `uv run trader followups list` / `uv run trader followups set issue ID --status fixed --response "…"` |
 | Emergency stop | `uv run trader halt --flatten --book all` |
 
 ## Repo map (target; details in ARCHITECTURE.md §2)

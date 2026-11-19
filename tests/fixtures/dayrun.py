@@ -9,6 +9,7 @@ same inputs always give the same journal.
 
 import asyncio
 import contextlib
+import json
 import sqlite3
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime, time, timedelta
@@ -22,7 +23,7 @@ from tests.fixtures.exec_harness import RISK, SETTINGS
 from tests.helpers import REPO
 from trader.config import BookName, RiskConfig, Settings
 from trader.core.calendar import TradingCalendar, sync_calendar
-from trader.core.clock import ET, SimClock
+from trader.core.clock import ET, SimClock, fmt_iso
 from trader.core.models import Filing, NewsItem, Quote, Trade
 from trader.data.recorder import REST_FILE, Recorder, broker_file
 from trader.data.replay import RecordingMarketData, ReplayHub
@@ -38,6 +39,7 @@ from trader.llm.fake import Reply, ScriptedTransport, Seen, answer_for, envelope
 from trader.llm.replay import LLM_FILE, RecordingTransport
 from trader.llm.roles import role_specs
 from trader.memory.journal import Journal
+from trader.memory.reviews import DailyReviewWork
 from trader.notify import Priority
 from trader.orchestrator.day import Cadence, DayDeps, DayOrchestrator, DayOutcome, DayPaths
 from trader.orchestrator.evidence import EvidenceDesk
@@ -191,6 +193,10 @@ class DayRun:
         )
         rows = self.day.universe_rows()
         await self.journal.write(lambda conn: conn.executemany(INSERT_UNIVERSE, rows))
+        # The news table as NewsHub fills it, each item stored as it was published: the review
+        # reads it (Book B's morning packs read FakeNews, which knows the time)
+        news = [_news_row(i) for i in self.day.news]
+        await self.journal.write(lambda conn: conn.executemany(INSERT_NEWS, news))
         self.market.calls.clear()
         if self.recording and self.recorder is not None:
             recorder = self.recorder
@@ -261,13 +267,16 @@ class DayRun:
         """Book B's runner on the scripted model, and packs built from the day, recorded when
         the day records (as run-day does)."""
         transport: Transport = self.transport
+        review = DailyReviewWork(journal=self.journal, clock=self.clock, settings=settings,
+                                 day=self.day.day)  # fmt: skip
         packs: PackFactory = live_packs(
             EvidenceDesk(
                 news=self.news,
                 filings=self.edgar,
                 clock=self.clock,
                 filings_days=settings.edgar.lookback_days,
-            )
+            ),
+            review=review,
         )
         if self.recording and self.recorder is not None:
             recorder = self.recorder
@@ -294,7 +303,8 @@ class DayRun:
             ),
             max_pack_bytes=settings.llm.max_pack_bytes,
         )
-        return LlmDeps(calls=calls, packs=packs, news=self.news, setup={"transport": "scripted"})
+        return LlmDeps(calls=calls, packs=packs, news=self.news, review=review,
+                       setup={"transport": "scripted"})  # fmt: skip
 
     def _llm_reply(self, seen: Seen) -> Reply:
         if self.llm_script is not None:
@@ -421,6 +431,18 @@ class DayRun:
     async def steps(self) -> list[str]:
         rows = await self.rows("SELECT name FROM day_runs WHERE kind = 'step' ORDER BY id")
         return [r["name"] for r in rows]
+
+
+INSERT_NEWS = (
+    "INSERT INTO news (id, created_at, updated_at, headline, summary, source, url, symbols_json, "
+    "received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+
+def _news_row(item: NewsItem) -> tuple[Any, ...]:
+    return (str(item.id), fmt_iso(item.created_at), fmt_iso(item.updated_at), item.headline,
+            item.summary, item.source, item.url, json.dumps(list(item.symbols)),
+            fmt_iso(item.created_at))  # fmt: skip
 
 
 def _sink(recorder: Recorder, name: str) -> Callable[[dict[str, Any]], None]:

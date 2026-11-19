@@ -2589,6 +2589,64 @@ Append-only. Each entry records context, the decision, its consequences, and sou
 
 ---
 
+## D-071 — P4.10: the post-close review's content, its follow-ups, and SPY's move in the shadow job
+- **Date:** 2026-11-19 · **Status:** Accepted (the Phase 4 plan, P4.10 and decision 11; the "For P4.10" notes of D-063 and D-069).
+- **`memory/reviews.py`** fills P4.8's review job (`DailyReviewWork`, the orchestrator's `ReviewWork`). One read of the journal gives the pack; the answer is stored in the transaction that completes the call, with the day's `review` step (decision 11).
+- **The targets** (`select_targets`, S§6.5), from the day's top-20 signals and never a shadow short:
+  1. every signal either book traded. One that Book A traded and Book B vetoed is a trade: the pack's signal list still shows the veto;
+  2. every triggered long Book B vetoed. "Triggered" counts the SIP bars too: a long only SIP saw reach its trigger got no decision from Book B, and its veto is still reviewed;
+  3. up to `notable_untraded` (5) other triggered longs, the largest |shadow R| first.
+
+  At most 20, in that order, so a trim drops the notable ones first.
+- **When a target was decided** (`decision_point`). Decision 11 says it is the `as_of` of the pack behind Book B's verdict. The journal doesn't keep a pack's `as_of`, so the review takes the `started_at` of that call's first attempt. The runner starts the attempt right after it encodes the pack and writes its input, so the two differ by milliseconds. The input artifact holds the exact time, but the journal's value replays the same and needs no file.
+  - Book B's verdict is the one its decision rests on, else the day's latest, as in the report.
+  - Without a verdict, the decision time is the live trigger, else the arming, else the SIP trigger minute.
+- **News** comes from the journal's `news` table, with `received_at`, so an item counts from when the engine could read it (D-063). Each target gets the 3 items nearest before its decision, within 24 h of it (the longer of the brief's and the vet's windows), and the 2 nearest after.
+- **SPY's move** (decision 11). On a review day the shadow job adds SPY to its SIP bars request (`compute_shadow(spy=...)`). Each triggered outcome then gets `shadow_outcomes.spy_move_pct`: SPY from the trigger minute's open to the exit minute's close.
+  - Only on review days, so Book A's days and G3's replay request the same bars as before.
+  - The goldens' `shadow` query now names its columns, so the new column leaves Book A's golden and G3's byte-identical. The A+B golden selects them all.
+- **The rest of the pack:**
+  - each book's result (`daily_stats`) and today's incidents;
+  - the epoch's stats (`running_stats`): each book's trades, mean R and win rate; the triggered longs' shadow R; Book B's vetoes and the mean shadow R they turned down;
+  - lessons, promoted first, then the newest proposals;
+  - `history` (S§6.6): the last `history_days` summaries of reviews that came, that period's `bad_process` reviews, and the epoch's factor tally before today. The tally counts wins and losses by the sign of shadow R; a flat outcome is neither. Open issues and notes come last, newest first.
+
+  A day with no signals has nothing to review, and no call is made.
+- **Storing an answer** (`persist_review`; migration 0009):
+  - `daily_reviews` keeps the targets asked about (`targets_json`, from the attempt's `candidates_json`, so a replay stores the same).
+  - One `signal_reviews` row per target. A review of anything else, or a second one of the same target, is dropped, and repeated factors are kept once. The runner already drops non-targets (A§7.3); this is the store's own guard.
+  - **Issues and notes:** one that links an open item bumps its count and last-seen date, and keeps its first text and severity. One review links an item once. An unknown id, or one that names a closed item, opens a new item. Every raising, new or linked, is a `review_mentions` row with that day's text.
+  - Lesson proposals are `proposed` (amends P5.2), with `source_date` and ids `L-001` on.
+- **A review that didn't come** (`record_missing`) is `invalid` when an answer came but didn't hold up: `invalid_json`, `invalid_envelope`, `no_structured_output`, `schema_invalid`, `wrong_pack_id` or `output_too_large`. Anything else is `missing`: a timeout, no time, a refusal. Either way, the row says why, with the attempt and its targets when there was one.
+- **Follow-ups:**
+  - `trader followups list [--all]` lists the oldest and most recurring first, and prints the model's text without control characters.
+  - `trader followups set issue|note ID --status S [--response T]` takes an issue's `fixed` or `wontfix`, a note's `accepted`, `rejected` or `done`. Only the human closes them.
+- **The report:**
+  - a table of the issues and notes the review raised, new or recurring with its count, in today's words, escaped as the model's text;
+  - a review that didn't come says why.
+- **Wiring:**
+  - run-day, `--sim` and `DayRun` pass `DailyReviewWork`.
+  - Replay passes it only when `boot.json` lists the new capability `review_v1` (D-055). So a day recorded before P4.10 replays without a review, and without SPY in its shadow request.
+  - A degraded Book B still gets its review, since the review covers Book A's day too. A Book B whose boot failed doesn't.
+- **The smoke's review pack** (D-067):
+  - Its books and stats now come from its own trades and shadow outcomes (`running_stats`).
+  - Each book uses its two entries on the two traded targets by 09:38. So Book A's decision on the vetoed targets, and both books' on the notable ones, is `capacity_entries`, no longer `taken` or `chased`.
+  - The smoke's input changes; it next runs at a gate.
+- **The A+B golden day is rewritten,** as the plan allows in P4.10. It gains the review's call, its rows, SPY's moves and the `review` step; nothing else changed. Its replay reproduces them all. Book A's rows on it still equal Book A's own golden day's.
+- **Spec updates:**
+  - ARCHITECTURE §3 (16:12, 16:15), §4.8, §4.10 and §6;
+  - STRATEGY §6.5;
+  - CLAUDE.md's Commands (`followups`, approved with the Phase 4 plan);
+  - PLAN; HANDOFF.
+- **Tests:**
+  - `test_reviews.py`: targets, decision times, news stamps, storing and linking, a missing or invalid review, history, stats, follow-ups and their CLI;
+  - three whole-day review scenarios: an answer stored part by part, a timeout recorded as missing, and a restart that never asks again;
+  - the report's raised items and missing review; the run-day wiring.
+  - **30 mutations of the review's rules,** all caught. Six survived the first run and led to sharper tests: a veto that never triggered, notable signals whose rank and |R| disagree, an item out of the news window, `partly` knowable, the follow-ups' order, and a flat shadow R.
+  - 1,534 tests pass, up from 1,517. Ruff, its formatter and mypy are clean. Book A's golden day and G3's replay pass unchanged.
+
+---
+
 ## Open questions to resolve during the build (record answers as new entries)
 
 - **Q1 (P1.2):** Is Alpaca's `movers` (top market movers) endpoint available on the free plan? If not, use the IEX snapshot gap scan. **Partly answered: D-024** (the 09:00 scan uses snapshots either way); doctor's `data.movers` check records availability once keys exist. **Answered by doctor on 2026-10-10: available** (`data.movers` PASS; the screener returned 10 gainers).

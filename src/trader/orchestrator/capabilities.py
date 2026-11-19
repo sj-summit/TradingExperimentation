@@ -6,5 +6,7 @@ day replays without calls it never made, so it still matches."""
 FEES = "fees_v1"  # books the fees the broker charged, at boot and at EOD
 SKEW_HOURLY = "skew_hourly"  # reads the clock's skew every hour, not only at boot
 SHADOW_TAPE = "shadow_tape"  # reads ambiguous trigger minutes from the SIP tape (D-057)
+# Book B's 16:15 review, and SPY's bars in the shadow request on its days (D-071)
+REVIEW = "review_v1"
 
-CURRENT: frozenset[str] = frozenset({FEES, SKEW_HOURLY, SHADOW_TAPE})
+CURRENT: frozenset[str] = frozenset({FEES, SKEW_HOURLY, SHADOW_TAPE, REVIEW})

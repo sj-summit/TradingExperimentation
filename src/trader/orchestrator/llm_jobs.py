@@ -138,6 +138,11 @@ class BookBJobs:
                  failures=self.store.failures)  # fmt: skip
         return self.rebuilt
 
+    @property
+    def reviews(self) -> bool:
+        """Whether today has a review: its content is wired (P4.10) and Book B is on."""
+        return self._deps.review is not None and not self.disabled
+
     def disable(self, why: str) -> None:
         """No brief, vet or review today (Book B's boot failed; the day halts the book)."""
         self.disabled = why

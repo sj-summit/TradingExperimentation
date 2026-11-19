@@ -30,6 +30,12 @@ report_app = typer.Typer(help="Reports (ARCHITECTURE.md 4.10).", no_args_is_help
 app.add_typer(report_app, name="report")
 notify_app = typer.Typer(help="Push notifications (ntfy or Discord).", no_args_is_help=True)
 app.add_typer(notify_app, name="notify")
+followups_app = typer.Typer(
+    help="Claude's process issues and notes from its reviews; only you close them "
+    "(STRATEGY.md 6.6).",
+    no_args_is_help=True,
+)
+app.add_typer(followups_app, name="followups")
 
 DateOption = Annotated[
     str | None,
@@ -289,6 +295,84 @@ async def _report_daily(root: Path, date: str | None) -> None:
         md, page = write_daily(report, local.cfg.path(local.cfg.settings.storage.reports_dir))
         typer.echo(report.summary())
         typer.echo(f"report: {md}\n        {page}")
+
+
+@followups_app.command("list")
+def followups_list(
+    ctx: typer.Context,
+    include_closed: Annotated[bool, typer.Option("--all", help="Closed ones too.")] = False,
+) -> None:
+    """Claude's open process issues and notes, the oldest and most recurring first. Offline."""
+    _run(_followups_list(ctx.obj, include_closed=include_closed))
+
+
+@followups_app.command("set")
+def followups_set(
+    ctx: typer.Context,
+    kind: Annotated[str, typer.Argument(help="issue or note.")],
+    item_id: Annotated[int, typer.Argument(help="Its id, as `followups list` shows it.")],
+    status: Annotated[
+        str,
+        typer.Option(
+            "--status", help="An issue: fixed or wontfix. A note: accepted, rejected or done."
+        ),
+    ],
+    response: Annotated[
+        str, typer.Option("--response", help="Why, for the record: 'fixed in abc123'.")
+    ] = "",
+) -> None:
+    """Close or answer one of Claude's process issues or notes. Offline."""
+    _run(_followups_set(ctx.obj, kind, item_id, status, response))
+
+
+async def _followups_list(root: Path, *, include_closed: bool) -> None:
+    from trader.memory.reviews import followups
+    from trader.runtime import open_local
+
+    async with open_local(root) as local:
+        items = await local.journal.read(
+            lambda conn: followups(conn, include_closed=include_closed)
+        )
+    if not items:
+        typer.echo("No open process issues or notes." if not include_closed else "None yet.")
+        return
+    for f in items:
+        about = f"{_printable(f.component)}: " if f.component else ""
+        line = (
+            f"{f.kind:<5} {f.id:>4}  {f.status:<8} {f.severity:<5}  {f.first}..{f.last}  "
+            f"x{f.count}  {about}{_printable(f.text)}"
+        )
+        typer.echo(line + (f"  [{_printable(f.response)}]" if f.response else ""))
+
+
+async def _followups_set(root: Path, kind: str, item_id: int, status: str, response: str) -> None:
+    from trader.memory.reviews import FollowupError, FollowupKind, set_followup
+    from trader.runtime import open_local
+
+    picked: FollowupKind
+    if kind.strip().lower() == "issue":
+        picked = "issue"
+    elif kind.strip().lower() == "note":
+        picked = "note"
+    else:
+        typer.echo(f"the kind is issue or note, not {kind!r}")
+        raise typer.Exit(1)
+    wanted = status.strip().lower()
+    async with open_local(root) as local:
+        now = local.clock.now()
+        try:
+            await local.journal.write(
+                lambda conn: set_followup(conn, picked, item_id, wanted, response, now)
+            )
+        except FollowupError as exc:
+            typer.echo(str(exc))
+            raise typer.Exit(1) from exc
+    typer.echo(f"{picked} {item_id}: {wanted}")
+
+
+def _printable(text: str) -> str:
+    """A model's text for the terminal: no control characters or escape sequences."""
+    return "".join(ch if ch.isprintable() else " " for ch in text)
 
 
 @notify_app.command("test")

@@ -24,6 +24,7 @@ from trader.execution.sim_broker import SimBroker
 from trader.llm.claude_cli import ClaudeBinaryError, ClaudeCliTransport
 from trader.llm.replay import LLM_FILE, RecordingTransport
 from trader.memory.journal import Journal
+from trader.memory.reviews import DailyReviewWork
 from trader.orchestrator import live
 from trader.orchestrator import replay as replay_module
 from trader.orchestrator.day import DayOutcome
@@ -244,6 +245,7 @@ async def test_paper_wires_the_real_cli_recorded_with_its_news_and_edgar(
                           previous_session=date(2026, 11, 2), times=TIMES, events=(), regime=None,
                           encode=calls.encode)  # fmt: skip
         assert isinstance(deps.packs(ctx), RecordingPacks)  # every pack it builds recorded
+        assert isinstance(deps.review, DailyReviewWork)  # the 16:15 review's content (P4.10)
         transport._sink({"kind": "probe"})  # each LLM record is readable at once
         assert list(read_jsonl(where.recordings / "2026-10-13" / LLM_FILE)) == [{"kind": "probe"}]
     rows = await journal.fetch_all("SELECT severity, code FROM incidents")

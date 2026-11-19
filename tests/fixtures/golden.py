@@ -53,7 +53,10 @@ TABLES = {
     "ledger": "SELECT book, kind, symbol, amount, trade_date, settle_date FROM ledger_entries "
     "ORDER BY trade_date, kind, symbol, amount",
     "daily_stats": "SELECT * FROM daily_stats ORDER BY date, book",
-    "shadow": "SELECT * FROM shadow_outcomes ORDER BY signal_id",
+    # its columns before P4.10's spy_move_pct, by name, so Book A's golden days stay the same
+    "shadow": "SELECT signal_id, entry_price, exit_price, exit_reason, shadow_r, mfe_r, mae_r, "
+    "minutes_held, path_source, computed_at, trigger_ts, sip_only_trigger, trigger_resolution "
+    "FROM shadow_outcomes ORDER BY signal_id",
     "incidents": "SELECT ts, severity, component, code, message FROM incidents ORDER BY ts, code",
     "day_runs": "SELECT kind, name, at FROM day_runs ORDER BY at, kind, name",
 }
@@ -77,6 +80,15 @@ TABLES_AB = {
     "FROM day_modes ORDER BY date, book",
     "halts": "SELECT book, reason, scope, detail, created_at, expires_at, cleared_at FROM halts "
     "ORDER BY created_at, book, reason",
+    # P4.10: SPY's move with each shadow outcome, and the review with its parts
+    "shadow": "SELECT * FROM shadow_outcomes ORDER BY signal_id",
+    "daily_reviews": "SELECT * FROM daily_reviews ORDER BY date",
+    "signal_reviews": "SELECT * FROM signal_reviews ORDER BY signal_id",
+    "process_issues": "SELECT * FROM process_issues ORDER BY id",
+    "review_notes": "SELECT * FROM review_notes ORDER BY id",
+    "review_mentions": "SELECT date, kind, item_id, severity, component, text, llm_call_id "
+    "FROM review_mentions ORDER BY id",
+    "lessons": "SELECT * FROM lessons ORDER BY id",
 }
 
 

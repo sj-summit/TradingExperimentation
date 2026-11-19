@@ -226,6 +226,29 @@ def upsert_trades(conn: sqlite3.Connection, trades: Sequence[TradeRow]) -> None:
     )  # fmt: skip
 
 
+def trade_from_row(r: sqlite3.Row) -> TradeRow:
+    """A ``trades`` row as ``upsert_trades`` wrote it."""
+    return TradeRow(
+        id=r["id"],
+        book=r["book"],
+        signal_id=r["signal_id"],
+        symbol=r["symbol"],
+        qty=int(r["qty"]),
+        entry_ts=parse_et_iso(r["entry_ts"]),
+        entry_price=Decimal(r["entry_price"]),
+        stop_price=db_to_dec(r["stop_price"]),
+        exit_ts=parse_et_iso(r["exit_ts"]) if r["exit_ts"] else None,
+        exit_price=db_to_dec(r["exit_price"]),
+        exit_reason=r["exit_reason"],
+        pnl=db_to_dec(r["pnl"]),
+        r_multiple=r["r_multiple"],
+        fees_est=db_to_dec(r["fees_est"]) or Decimal(0),
+        entry_slippage=db_to_dec(r["entry_slippage"]),
+        entry_delay_ms=r["entry_delay_ms"],
+        eval_epoch=r["eval_epoch"],
+    )
+
+
 async def write_trades(journal: Journal, book: BookName, day: date) -> list[TradeRow]:
     """Rebuild the day's trades for ``book``; running it again changes nothing."""
 

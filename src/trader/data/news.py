@@ -127,7 +127,7 @@ class NewsHub:
             "SELECT * FROM news WHERE created_at >= ? ORDER BY created_at",
             (fmt_iso(since - _QUERY_MARGIN),),
         )
-        items = [_from_row(row) for row in rows]
+        items = [news_from_row(row) for row in rows]
         return [i for i in items if i.created_at >= since and wanted.intersection(i.symbols)]
 
     # ---------------------------------------------------------------- internals
@@ -194,7 +194,8 @@ class NewsHub:
                 self._on_item(item)
 
 
-def _from_row(row: sqlite3.Row) -> NewsItem:
+def news_from_row(row: sqlite3.Row) -> NewsItem:
+    """A ``news`` row as the hub stored it (its ``received_at`` is the caller's to read)."""
     return NewsItem(
         id=int(row["id"]),
         headline=row["headline"] or "",

@@ -92,8 +92,8 @@ Times are config defaults. On **early-close days**:
 | last_entry (15:30) | Stop arming new entries; cancel unfilled entries | A, B | |
 | flatten (15:55) | Cancel all orders; close all positions; verify flat by close − 2 min | A, B | |
 | 16:05 | EOD per book: reconcile; final decisions; trades; fees (`fees_v1`, D-055); daily stats; breakers (cash check, with its residual stored and a P3 `cash_drift` past half the tolerance; drawdown; losing streak) | A, B | each step marked in `day_runs`, so a restart skips it (D-048) |
-| 16:12 | Shadow outcomes (SIP 1-min bars; the 15:55 bar is > 15 min old from about 16:11; retry for up to 5 min); each ambiguous trigger minute read from the SIP trade tape, one request each (capability `shadow_tape`, D-057); a minute the tape can't settle is counted as stopped, with a P3 `shadow_tape_unresolved` | — | STRATEGY.md §7.2 |
-| 16:15 | Claude post-close review → signal reviews, process issues, notes, lesson proposals (each to its own table) | B | after the shadow job; the cutoff is the report − 1 min (16:29), and no attempt starts after the cutoff − 120 s; once a day (a `review` step in `day_runs`); else `daily_reviews.status = missing` and the report says so. P4.8 runs the job; its content (`memory/reviews.py`) arrives in P4.10 (D-069) |
+| 16:12 | Shadow outcomes (SIP 1-min bars; the 15:55 bar is > 15 min old from about 16:11; retry for up to 5 min); each ambiguous trigger minute read from the SIP trade tape, one request each (capability `shadow_tape`, D-057); a minute the tape can't settle is counted as stopped, with a P3 `shadow_tape_unresolved`. On a review day SPY's bars come in the same request, for each outcome's `spy_move_pct` (capability `review_v1`, D-071) | — | STRATEGY.md §7.2 |
+| 16:15 | Claude post-close review → signal reviews, process issues, notes, lesson proposals (each to its own table) | B | after the shadow job; the cutoff is the report − 1 min (16:29), and no attempt starts after the cutoff − 120 s; once a day (a `review` step in `day_runs`); else `daily_reviews.status = missing` (or `invalid`) with why, and the report says so. The content is `memory/reviews.py`'s (D-071); a day recorded before it replays without a review (capability `review_v1`) |
 | 16:30 | Reports (MD and HTML), notifications, recordings finalized; DONE, then the DB backup (D-055) | — | then exit |
 
 ### Late start and partial days
@@ -319,10 +319,10 @@ class LLMResult(Generic[T]):
   - `event_day`.
 - **`stats.py`:** the metrics in STRATEGY.md §7.3, plus the bootstrap (seeded) and epoch handling.
 - **`lessons.py`:** evaluates the evidence-query DSL, plus promotion and demotion (STRATEGY.md §6). **`playbook.py`** renders `runtime/playbook.md`.
-- **`reviews.py`:** STRATEGY.md §6.5–6.6.
-  - Picks the day's review targets and gathers their evidence for the pack.
-  - Builds the review pack's `history` section, including the factor tally.
-  - Persists a `DailyReview` into `daily_reviews`, `signal_reviews`, `process_issues`, and `review_notes`. A linked issue or note gets its count and last-seen date bumped; it is never duplicated.
+- **`reviews.py`:** STRATEGY.md §6.5–6.6 (D-071). `DailyReviewWork` is the orchestrator's `ReviewWork`.
+  - Picks the day's review targets (`select_targets`) and gathers their evidence for the pack: each target's decision time (`decision_point`), its shadow path with SPY's move over the same window, and its news stamped against the decision (`target_news`).
+  - Builds the review pack's `history` section, including the factor tally, and the `stats` of the epoch.
+  - Persists a `DailyReview` into `daily_reviews`, `signal_reviews`, `process_issues`, `review_notes`, `review_mentions` and `lessons` (proposals, `proposed`), in the transaction that completes the call. A linked issue or note gets its count and last-seen date bumped and keeps its first text; it is never duplicated. A review that didn't come is `missing` or `invalid`, with why.
   - Backs the `followups` CLI.
 
 ### 4.9 orchestrator
@@ -350,6 +350,7 @@ class LLMResult(Generic[T]):
 
 - **Daily report:** the signals table (symbol, rel_vol, rank, trigger, triggered?, shadow R, A action/result, B verdict/reason/action/result), book P&L, incidents, LLM calls, Claude's review (summary, then what went well, what went badly, and why for each target), new or recurring process issues and notes, and the limitations footer.
   - **Book B's part** (D-069): the header's attempts (ok, failed, abandoned), the budget used, the failed attempts toward `llm_degraded`, and the day mode; Book B's verdict per signal (the one its decision rests on); a table of the day's attempts; Claude's words (the day mode's reason, the review's summary and target reviews). A day Book B was kept off says why.
+  - **The review's follow-ups** (D-071): each process issue and note the review raised, new or recurring (with its count), in today's words. A review that didn't come says why.
   - **The model's text** is escaped: in HTML like every cell. In Markdown it sits in a code span whose fence is longer than any run of backticks in it, so it opens no link (a bare URL included), image, HTML or emphasis; in a table its pipes are escaped too.
 - **Weekly report:**
   - equity curves A vs B vs SPY;
@@ -524,7 +525,8 @@ CREATE TABLE shadow_outcomes (signal_id TEXT PRIMARY KEY REFERENCES signals(id),
   exit_price TEXT, exit_reason TEXT, shadow_r REAL, mfe_r REAL, mae_r REAL, minutes_held INTEGER,
   path_source TEXT, computed_at TEXT,
   trigger_ts TEXT, sip_only_trigger INTEGER,   -- from 0004: the SIP trigger minute; live feed never triggered
-  trigger_resolution TEXT);   -- from 0006: bars | tape | fallback, how the trigger minute was judged (D-057)
+  trigger_resolution TEXT,   -- from 0006: bars | tape | fallback, how the trigger minute was judged (D-057)
+  spy_move_pct REAL);   -- from 0009: SPY over the trade's window, on review days (D-071)
 CREATE TABLE llm_calls (id TEXT PRIMARY KEY, date TEXT, role TEXT, model_alias TEXT, model_resolved TEXT,
   prompt_sha256 TEXT, schema_sha256 TEXT, started_at TEXT, ended_at TEXT, duration_ms INTEGER,
   exit_code INTEGER, is_error INTEGER, num_turns INTEGER, cost_estimate_usd REAL, schema_valid INTEGER,
@@ -552,9 +554,11 @@ CREATE TABLE daily_stats (date TEXT, book TEXT, start_equity TEXT, end_equity TE
 CREATE TABLE lessons (id TEXT PRIMARY KEY, created_at TEXT, source_call_id TEXT, statement TEXT,
   rationale TEXT, evidence_query_json TEXT, claimed_direction TEXT, suggested_use TEXT, status TEXT,
   n_subset INTEGER, n_complement INTEGER, effect_r REAL, ci_low REAL, ci_high REAL,
-  evaluated_at TEXT, promoted_at TEXT, demoted_at TEXT);
+  evaluated_at TEXT, promoted_at TEXT, demoted_at TEXT,
+  source_date TEXT);   -- from 0009: the review day that proposed it (D-071)
 CREATE TABLE daily_reviews (date TEXT PRIMARY KEY, status TEXT, summary TEXT,   -- status: ok | missing | invalid
-  llm_call_id TEXT REFERENCES llm_calls(id), eval_epoch INTEGER, created_at TEXT);
+  llm_call_id TEXT REFERENCES llm_calls(id), eval_epoch INTEGER, created_at TEXT,
+  failure TEXT, targets_json TEXT);   -- from 0009: why it's missing or invalid; the targets asked about (D-071)
 CREATE TABLE signal_reviews (signal_id TEXT PRIMARY KEY REFERENCES signals(id), date TEXT, went_well TEXT,
   went_badly TEXT, why TEXT, factors_json TEXT, knowable_at_decision TEXT, b_process TEXT, b_note TEXT,
   llm_call_id TEXT REFERENCES llm_calls(id), eval_epoch INTEGER);
@@ -564,6 +568,9 @@ CREATE TABLE process_issues (id INTEGER PRIMARY KEY, first_seen TEXT, last_seen 
 CREATE TABLE review_notes (id INTEGER PRIMARY KEY, first_raised TEXT, last_raised TEXT, times_raised INTEGER,
   note TEXT, status TEXT, human_response TEXT, decided_at TEXT,
   last_llm_call_id TEXT);                                          -- status: open | accepted | rejected | done
+CREATE TABLE review_mentions (id INTEGER PRIMARY KEY, date TEXT NOT NULL, kind TEXT NOT NULL,   -- from 0009 (D-071)
+  item_id INTEGER NOT NULL, severity TEXT, component TEXT, text TEXT,   -- kind: issue | note; each raising, with that day's text
+  llm_call_id TEXT REFERENCES llm_calls(id));
 CREATE TABLE incidents (id INTEGER PRIMARY KEY, ts TEXT, severity TEXT, component TEXT, code TEXT,
   message TEXT, detail_json TEXT, resolved_at TEXT, acknowledged_by TEXT,
   alerted_at TEXT);   -- alerted_at: from 0004, set once a P1/P2 has been pushed (D-040)
@@ -591,6 +598,9 @@ CREATE UNIQUE INDEX ux_day_runs_step ON day_runs(date, name) WHERE kind = 'step'
 CREATE INDEX ix_decisions_signal_book ON decisions(signal_id, book, id);
 CREATE INDEX ix_llm_calls_day ON llm_calls(date, purpose, role);                    -- from 0007
 CREATE UNIQUE INDEX ux_llm_calls_attempt ON llm_calls(logical_id, attempt);
+CREATE INDEX ix_review_mentions_item ON review_mentions(kind, item_id);             -- from 0009
+CREATE INDEX ix_process_issues_status ON process_issues(status);
+CREATE INDEX ix_review_notes_status ON review_notes(status);
 CREATE VIEW final_decisions AS          -- decisions are append-only; this is the latest per (signal, book)
   SELECT d.* FROM decisions d
   WHERE d.id = (SELECT MAX(d2.id) FROM decisions d2

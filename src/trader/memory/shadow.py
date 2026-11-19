@@ -29,7 +29,7 @@ The simulation is pure and shared with the backtest:
 
 import sqlite3
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Literal, Protocol
@@ -78,6 +78,7 @@ class ShadowOutcome:
     minutes_held: int | None = None
     trigger_resolution: Resolution | None = None  # how the trigger minute's stop was judged
     tape_entry: Decimal | None = None  # the tape's first print at or past the trigger (D-057)
+    spy_move_pct: float | None = None  # SPY over the trade's window, on review days (D-071)
 
     @property
     def triggered(self) -> bool:
@@ -320,6 +321,7 @@ async def compute_shadow(
     params: ShadowParams,
     signals: Sequence[Signal],
     tape: bool = False,
+    spy: str | None = None,
 ) -> ShadowRun:
     """Shadow outcomes for the day's priced signals (longs and shadow shorts) from SIP 1-minute
     bars, written to ``shadow_outcomes`` (idempotent).
@@ -328,7 +330,11 @@ async def compute_shadow(
     retries every 30 s, for up to 5 min, while Alpaca still refuses the data as too recent.
     Every wait runs on the injected clock. With ``tape``, each ambiguous trigger minute is read
     from the SIP trade tape, one request each (D-057); one that can't be read, or reads no
-    print at the trigger, falls back to the pessimistic rule and is listed in the result."""
+    print at the trigger, falls back to the pessimistic rule and is listed in the result.
+
+    With ``spy`` (a review day: Claude's review compares each trade with the market, D-071),
+    that symbol's bars come in the same request, and each triggered outcome gets its move over
+    the trade's window."""
     priced = [s for s in signals if s.trigger_price is not None and s.stop_price is not None]
     if not priced:
         return ShadowRun(ok=True, outcomes={})
@@ -336,7 +342,7 @@ async def compute_shadow(
     if clock.now() < ready:
         await clock.sleep_until(ready)
     session = calendar.session(day)
-    symbols = sorted({s.symbol for s in priced})
+    symbols = sorted({s.symbol for s in priced} | ({spy} if spy else set()))
     give_up = clock.now() + GIVE_UP_AFTER
     while True:
         try:
@@ -379,6 +385,9 @@ async def compute_shadow(
         )
         if prints is not None and outcome.trigger_resolution == "fallback":
             unresolved.append(f"{sig.symbol}: no print at the trigger in its minute")
+        if spy is not None:
+            moved = spy_move(bars.get(spy, []), outcome.trigger_ts, outcome.exit_ts)
+            outcome = replace(outcome, spy_move_pct=moved)
         outcomes[sig.id] = outcome
     now = clock.now()
     rows = [(sig, outcomes[sig.id]) for sig in priced]
@@ -400,8 +409,8 @@ def _store(
     conn.executemany(
         "INSERT OR REPLACE INTO shadow_outcomes (signal_id, entry_price, exit_price, exit_reason, "
         "shadow_r, mfe_r, mae_r, minutes_held, path_source, computed_at, trigger_ts, "
-        "sip_only_trigger, trigger_resolution) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sip_1min', ?, ?, ?, ?)",
+        "sip_only_trigger, trigger_resolution, spy_move_pct) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sip_1min', ?, ?, ?, ?, ?)",
         [
             (
                 sig.id,
@@ -416,10 +425,22 @@ def _store(
                 fmt_iso(o.trigger_ts) if o.trigger_ts else None,
                 _sip_only(sig, o),
                 o.trigger_resolution,
+                o.spy_move_pct,
             )
             for sig, o in rows
         ],
     )
+
+
+def spy_move(bars: Sequence[Bar], start: datetime | None, end: datetime | None) -> float | None:
+    """The move in percent from the open of the minute starting at ``start`` to the close of
+    the minute starting at ``end``; None without both bars (D-071)."""
+    by_start = {b.ts: b for b in bars}
+    first = by_start.get(start) if start is not None else None
+    last = by_start.get(end) if end is not None else None
+    if first is None or last is None or first.open <= 0:
+        return None
+    return round(float((last.close - first.open) / first.open * HUNDRED), 4)
 
 
 def _sip_only(sig: Signal, outcome: ShadowOutcome) -> int | None:

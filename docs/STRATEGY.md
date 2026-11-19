@@ -305,7 +305,12 @@ Code picks the review targets, so coverage doesn't depend on what Claude chooses
 - every triggered signal Book B vetoed;
 - up to `notable_untraded` (default 5) other triggered signals with the largest |`shadow_r`|: big winners neither book took, and big losers both books avoided.
 
-All targets come from the day's top-20 signals, so there are at most 20. For each target the pack carries the evidence: `mfe_r`, `mae_r`, `minutes_held` and `exit_reason` from the shadow path (§7.2), SPY's move over the same window, and news with `published: before_decision | after_decision`.
+All targets come from the day's top-20 signals, so there are at most 20, and none is a shadow short. They are listed in that order, so a trim drops the notable ones first. A signal both traded and vetoed is a trade. "Triggered" counts the SIP bars too: a long only SIP saw reach its trigger got no decision from Book B, and its veto is still reviewed (D-071).
+
+For each target the pack carries the evidence: `mfe_r`, `mae_r`, `minutes_held` and `exit_reason` from the shadow path (§7.2), SPY's move over the same window, and news with `published: before_decision | after_decision`.
+
+- **The decision time** is when the pack behind Book B's verdict was sent, else the live trigger, else the arming. Book B's verdict is the one its decision rests on, else the day's latest.
+- **News:** at most 3 items from before the decision (within 24 h of it) and 2 from after, nearest first. An item counts from when the engine could read it.
 
 Each `signal_review` holds:
 
