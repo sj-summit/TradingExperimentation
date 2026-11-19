@@ -1,15 +1,17 @@
-"""Book B in the day (P4.8; D-068, D-069): its jobs at their times, its worker parking a trigger
-whose verdict is pending, the boot record, and Book A untouched.
+"""Book B in the day (P4.8, P4.9; D-068, D-069, D-070): its jobs at their times, its worker
+parking a trigger whose verdict is pending, the boot record, and Book A untouched.
 
-Whole synthetic days on a SimClock (``DayRun``), the model scripted. P4.9 adds the full set of
-A+B scenarios and their golden day.
+Whole synthetic days on a SimClock (``DayRun``), the model scripted, on the standard day with
+its pre-market prints, news and filings (``days.standard_day``). P4.9's end-to-end scenarios:
+a neutral day, a brief's veto, waits that enter, chase or time out, invalid answers and
+degradation, ``no_trade`` and reduced days, a failed or missed brief, restarts, the call cap,
+and an A-only day that asks for none of it. The A+B golden day is in ``test_golden.py``.
 """
 
 import asyncio
 import contextlib
 import json
 import sqlite3
-from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, time, timedelta
 from decimal import Decimal
@@ -19,10 +21,11 @@ from typing import Any
 import pytest
 
 from tests.fixtures.dayrun import DayRun
-from tests.fixtures.days import DAY, standard_day
+from tests.fixtures.days import DAY, SyntheticDay, path, standard_day
 from tests.fixtures.exec_harness import RISK, SETTINGS
 from trader.books.base import BookDecision, Defer
 from trader.books.verdicts import VerdictStore
+from trader.config import Settings
 from trader.core.clock import ET
 from trader.core.models import Signal, TriggerEvent
 from trader.data.recorder import Recorder, read_jsonl
@@ -31,7 +34,7 @@ from trader.llm.fake import Reply, Seen, answer_for, envelope
 from trader.llm.replay import LLM_FILE
 from trader.orchestrator.day import DayOrchestrator, _Book
 from trader.orchestrator.llm_jobs import BookBJobs
-from trader.orchestrator.replay import comparable, replay_day
+from trader.orchestrator.replay import replay_day
 from trader.orchestrator.simdrive import drive
 from trader.reports.daily import build_daily
 
@@ -58,17 +61,27 @@ async def test_book_b_trades_beside_book_a_on_a_neutral_day(tmp_path: Path) -> N
     assert b == a  # every verdict neutral: Book B decides as Book A does
     assert a["WIN"] == "taken"
     assert a["CAP"] == "capacity_entries"
-    calls = await run.rows("SELECT role, started_at, deadline, ok FROM llm_calls ORDER BY id")
-    assert [(r["role"], r["started_at"][11:19], r["deadline"][11:19], r["ok"]) for r in calls] == [
-        ("premarket", "09:05:00", "09:28:00", 1),
-        ("vet", calls[1]["started_at"][11:19], "15:30:00", 1),
-    ]
-    assert "09:35:03" <= calls[1]["started_at"][11:19] < "09:35:30"  # at arming
-    vetted = await run.rows("SELECT symbol, source, signal_id FROM verdicts ORDER BY symbol")
-    assert [(r["symbol"], r["source"]) for r in vetted] == [
-        ("CAP", "vet"), ("EXP", "vet"), ("GAPPER", "vet"), ("LOSE", "vet"), ("WIN", "vet"),
+    calls = await run.rows("SELECT role, started_at, deadline, ok, candidates_json FROM llm_calls "
+                           "ORDER BY id")  # fmt: skip
+    assert [tuple(r) for r in calls] == [
+        ("premarket", at("09:05:00").isoformat(), at("09:28:00").isoformat(), 1,
+         '["GAPPER", "LOSE", "SHORT"]'),  # two gainers, then SHORT for its news
+        ("vet", at("09:35:03").isoformat(), at("15:30:00").isoformat(), 1,
+         '["WIN", "EXP", "CAP"]'),  # at arming: the armed longs the brief didn't judge
     ]  # fmt: skip
-    assert all(r["signal_id"] == f"20261013-{r['symbol']}-orb5" for r in vetted)
+    vetted = await run.rows("SELECT symbol, source, signal_id, risk_flags_json FROM verdicts "
+                            "ORDER BY symbol")  # fmt: skip
+    assert [(r["symbol"], r["source"]) for r in vetted] == [
+        ("CAP", "vet"), ("EXP", "vet"), ("GAPPER", "premarket"), ("LOSE", "premarket"),
+        ("SHORT", "premarket"), ("WIN", "vet"),
+    ]  # fmt: skip
+    assert all(r["signal_id"] == (f"20261013-{r['symbol']}-orb5" if r["source"] == "vet" else None)
+               for r in vetted)  # fmt: skip
+    # GAPPER's news tried an injection: flagged in the pack, so code marks the verdict
+    assert {r["symbol"] for r in vetted if "suspicious_content" in r["risk_flags_json"]} == {
+        "GAPPER"
+    }
+    assert run.edgar.asked == ["GAPPER", "LOSE", "SHORT", "WIN", "EXP", "CAP"]  # rank order
     modes = await run.rows("SELECT book, mode, source, multiplier FROM day_modes")
     assert [tuple(r) for r in modes] == [("B", "normal", "premarket", "1")]
     taken = await run.rows(
@@ -76,7 +89,7 @@ async def test_book_b_trades_beside_book_a_on_a_neutral_day(tmp_path: Path) -> N
         "d.signal_id WHERE d.book = 'B' AND d.reason_code = 'taken'"
     )
     assert {r["symbol"]: r["llm_call_id"] for r in taken} == {
-        "WIN": "20261013-vet-01-1", "LOSE": "20261013-vet-01-1",
+        "WIN": "20261013-vet-01-1", "LOSE": "20261013-premarket-01-1",
     }  # fmt: skip
     assert (await run.trades("B")).keys() == (await run.trades("A")).keys() == {"WIN", "LOSE"}
     assert [i for i in await run.incidents() if i[0] in ("P1", "P2")] == []
@@ -114,61 +127,289 @@ def slow_repair(seen: Seen) -> Reply:
 
 async def test_a_trigger_still_pending_at_its_deadline_is_vet_timeout(tmp_path: Path) -> None:
     """WIN triggers at 09:35:50 while the repair runs: at the call's start + 60 s it is
-    ``vet_timeout``. The repair then times out, so LOSE (09:41:50) has no verdict to be had."""
+    ``vet_timeout``. The repair then times out, so CAP (11:00:50) has no verdict to be had.
+    LOSE, which the brief judged, never waited on the vet."""
     run = await ab_day(tmp_path, llm_script=slow_repair)
     await run.run()
     b = await run.decisions("B")
-    assert (b["WIN"], b["LOSE"]) == ("vet_timeout", "llm_unavailable")
+    assert (b["WIN"], b["LOSE"], b["CAP"]) == ("vet_timeout", "taken", "llm_unavailable")
     assert (await run.decisions("A"))["WIN"] == "taken"
     vet = await run.rows("SELECT started_at, failure FROM llm_calls WHERE role = 'vet' "
                          "ORDER BY id")  # fmt: skip
     assert [r["failure"] for r in vet] == ["invalid_json", "timeout"]
     deadline = datetime.fromisoformat(vet[0]["started_at"]) + timedelta(seconds=60)
-    win = await run.rows(
+    cap, won = await run.rows(
         "SELECT d.decided_at, d.detail, d.llm_call_id FROM decisions d JOIN signals s "
-        "ON s.id = d.signal_id WHERE d.book = 'B' AND s.symbol IN ('WIN', 'LOSE') ORDER BY s.symbol"
+        "ON s.id = d.signal_id WHERE d.book = 'B' AND s.symbol IN ('WIN', 'CAP') ORDER BY s.symbol"
     )
-    lose, won = win
     assert datetime.fromisoformat(won["decided_at"]) == deadline
     assert f"no verdict by {deadline:%H:%M:%S}" in won["detail"]
     assert won["llm_call_id"] is None
-    assert "the vet failed: timeout" in lose["detail"]
-    assert lose["llm_call_id"] == "20261013-vet-01-2"
+    assert "the vet failed: timeout" in cap["detail"]
+    assert cap["llm_call_id"] == "20261013-vet-01-2"
     assert [i for i in await run.incidents() if i[1].startswith("llm")] == [
         ("P3", "llm_call_failed"), ("P3", "llm_call_failed"),
     ]  # fmt: skip
     await run.close()
 
 
-async def test_a_recorded_ab_day_replays_the_same(tmp_path: Path) -> None:
-    """Decision 10: the replay serves the recorded packs and answers, each at its recorded
-    time, so a trigger that waited for the vet waits as long, with no news, EDGAR or claude."""
-    run = await ab_day(tmp_path, recording=True)
-    run.verdicts = {"LOSE": "veto"}
-    run.llm_delay["vet"] = 55.0  # WIN waits for its verdict
-    await run.run()
-    b = await run.decisions("B")
-    assert (b["WIN"], b["LOSE"]) == ("entered_after_wait", "vetoed")
-    await run.close()
-    report = await replay_day(
-        recordings=tmp_path / "recordings",
-        day=DAY,
-        out=tmp_path / "replay",
-        settings=SETTINGS,
-        risk=RISK,
-        recorded_db=tmp_path / "trader.db",
+NEUTRAL = {  # Book A's every day here; Book B's too, when the model is neutral throughout
+    "WIN": "taken", "LOSE": "taken", "CHASE": "missed_at_arm", "GAPPER": "chased",
+    "CAP": "capacity_entries",
+}  # fmt: skip
+ALL_ARMED = '["WIN", "LOSE", "GAPPER", "EXP", "CAP"]'  # the armed longs, by rank
+
+
+def llm_settings(**changes: Any) -> Settings:
+    return SETTINGS.model_copy(update={"llm": SETTINGS.llm.model_copy(update=changes)})
+
+
+def vet_settings(**changes: Any) -> Settings:
+    roles = SETTINGS.llm.roles
+    vet = roles.vet.model_copy(update=changes)
+    return llm_settings(roles=roles.model_copy(update={"vet": vet}))
+
+
+async def b_rows(run: DayRun, symbol: str) -> list[sqlite3.Row]:
+    return await run.rows(
+        "SELECT d.reason_code, d.detail, d.llm_call_id, d.decided_at FROM decisions d "
+        "JOIN signals s ON s.id = d.signal_id WHERE d.book = 'B' AND s.symbol = ? ORDER BY d.id",
+        (symbol,),
     )
-    assert (report.state, report.divergences, report.differences) == ("DONE", [], [])
-    assert report.notes == []
 
-    def compared(db: Path) -> dict[str, list[str]]:
-        with closing(sqlite3.connect(db)) as conn:
-            return comparable(conn, DAY)
 
-    live = compared(tmp_path / "trader.db")
-    assert {"day_mode", "verdict", "llm_call"} <= set(live)  # Book B's rows were compared
-    assert compared(tmp_path / "replay" / "trader.db") == live
-    assert (tmp_path / "replay" / "llm" / "2026-10-13" / "20261013-vet-01-1.output.json").exists()
+async def test_a_premarket_veto_frees_book_b_s_cash_for_cap(tmp_path: Path) -> None:
+    """S§5.2: the brief vetoes LOSE, so Book B never takes it. With one entry and $509.68 of
+    settled cash left after WIN, Book B takes CAP at 11:00:50, which Book A, two entries in,
+    can't (R-007)."""
+    run = await ab_day(tmp_path)
+    run.verdicts = {"LOSE": "veto"}
+    await run.run()
+    assert await run.decisions("A") == NEUTRAL
+    b = await run.decisions("B")
+    assert (b["WIN"], b["LOSE"], b["CAP"]) == ("taken", "vetoed", "taken")
+    (lose,) = await b_rows(run, "LOSE")
+    assert lose["llm_call_id"] == "20261013-premarket-01-1"
+    assert "premarket veto" in lose["detail"]
+    trades = await run.trades("B")
+    assert set(trades) == {"WIN", "CAP"}
+    assert trades["CAP"][:2] == (14, "35.43")
+    await run.close()
+
+
+def win_jumps_at_0936() -> SyntheticDay:
+    """The standard day, but WIN's 09:36 minute opens at 20.70, past its 20.47 chase cap."""
+    day = standard_day()
+    win = path("WIN", open_="20.00", prev_close="19.80", or_volume_per_min=16_000,
+               keys=[("09:30", "20.10"), ("09:34", "20.40"), ("09:35", "20.41"),
+                     ("12:00", "22.00")],
+               gaps={"09:36": "20.70"})  # fmt: skip
+    day.symbols = [win if s.symbol == "WIN" else s for s in day.symbols]
+    return day
+
+
+async def test_a_trigger_past_its_cap_when_its_verdict_comes_is_chased_after_wait(
+    tmp_path: Path,
+) -> None:
+    """WIN triggers at 09:35:50 and waits for the vet; by its answer, at 09:36:01.5, WIN trades
+    at 20.70. The chase guard runs once the verdict is in (S§5.4): ``chased_after_wait``."""
+    run = await DayRun(tmp_path, win_jumps_at_0936(), start=time(8, 55), books=("A", "B")).open()
+    run.llm_delay["vet"] = 58.5  # from 09:35:03: after the jump, before the 09:36:03 deadline
+    await run.run()
+    assert (await run.decisions("A"))["WIN"] == "taken"  # at 09:35:50, before the jump
+    (win,) = await b_rows(run, "WIN")
+    assert win["reason_code"] == "chased_after_wait"
+    assert win["decided_at"] == at("09:36:01.500000").isoformat()  # at the answer
+    assert "last 20.70 > max_chase 20.47" in win["detail"]
+    assert win["llm_call_id"] == "20261013-vet-01-1"
+    assert "WIN" not in await run.trades("B")
+    await run.close()
+
+
+def invalid_until_degraded(seen: Seen) -> Reply:
+    """The brief's first try isn't JSON, and its repair answers well. The vet's try isn't JSON
+    and its repair doesn't fit the schema: three failed attempts, ``llm_failures_degrade_after``."""
+    pack = seen.pack()
+    if not seen.is_repair:
+        return Reply(stdout=b"not json", delay_s=1.0)
+    if pack["role"] == "premarket":
+        return Reply(envelope=envelope(answer_for(pack)), delay_s=10.0)
+    return Reply(envelope=envelope({"pack_id": pack["pack_id"], "assessments": "none"}),
+                 delay_s=1.0)  # fmt: skip
+
+
+async def test_an_answer_still_invalid_after_its_repair_degrades_book_b_alone(
+    tmp_path: Path,
+) -> None:
+    run = await ab_day(tmp_path, llm_script=invalid_until_degraded)
+    await run.run()
+    calls = await run.rows("SELECT id, ok, failure FROM llm_calls ORDER BY id")
+    assert [tuple(r) for r in calls] == [
+        ("20261013-premarket-01-1", 0, "invalid_json"), ("20261013-premarket-01-2", 1, None),
+        ("20261013-vet-01-1", 0, "invalid_json"), ("20261013-vet-01-2", 0, "schema_invalid"),
+    ]  # fmt: skip
+    assert await run.decisions("B") == {
+        "WIN": "llm_degraded", "LOSE": "llm_degraded", "CHASE": "missed_at_arm",
+        "GAPPER": "llm_degraded", "CAP": "llm_degraded",
+    }  # fmt: skip
+    assert await run.halts("B") == ["llm_degraded"]
+    assert await run.trades("B") == {}
+    assert [i for i in await run.incidents() if i[1].startswith("llm")] == [
+        ("P3", "llm_call_failed"), ("P3", "llm_call_failed"), ("P3", "llm_call_failed"),
+        ("P2", "llm_degraded"),
+    ]  # fmt: skip
+    assert await run.decisions("A") == NEUTRAL  # Book A's day, untouched
+    assert set(await run.trades("A")) == {"WIN", "LOSE"}
+    assert await run.halts("A") == []
+    await run.close()
+
+
+async def test_a_no_trade_day_keeps_book_b_out_and_still_vets(tmp_path: Path) -> None:
+    """S§5.2-5.3: ``no_trade`` comes before any verdict; the vet still runs, for the record."""
+    run = await ab_day(tmp_path)
+    run.day_mode = "no_trade"
+    await run.run()
+    assert await run.decisions("B") == {
+        "WIN": "day_mode_no_trade", "LOSE": "day_mode_no_trade", "CHASE": "missed_at_arm",
+        "GAPPER": "day_mode_no_trade", "CAP": "day_mode_no_trade",
+    }  # fmt: skip
+    for symbol in ("WIN", "CAP"):  # each rests on the brief that set the day mode
+        assert [r["llm_call_id"] for r in await b_rows(run, symbol)] == ["20261013-premarket-01-1"]
+    calls = await run.rows("SELECT id, ok FROM llm_calls ORDER BY id")
+    assert [tuple(r) for r in calls] == [("20261013-premarket-01-1", 1), ("20261013-vet-01-1", 1)]
+    assert await run.trades("B") == {}
+    assert await run.decisions("A") == NEUTRAL
+    await run.close()
+
+
+async def test_a_reduced_day_halves_book_b_s_entries(tmp_path: Path) -> None:
+    """S§3.5, S§5.1: the multiplier 0.5 halves the notional cap that sizes both entries."""
+    run = await ab_day(tmp_path)
+    run.day_mode = "reduced"
+    await run.run()
+    assert await run.decisions("B") == NEUTRAL
+    a, b = await run.trades("A"), await run.trades("B")
+    assert {s: t[0] for s, t in a.items()} == {"WIN": 24, "LOSE": 16}
+    assert {s: t[0] for s, t in b.items()} == {"WIN": 12, "LOSE": 8}
+    (win,) = await b_rows(run, "WIN")
+    assert "day mode reduced x0.5" in win["detail"]
+    await run.close()
+
+
+def brief_not_json(seen: Seen) -> Reply:
+    pack = seen.pack()
+    if pack["role"] == "premarket":
+        return Reply(stdout=b"not json", delay_s=1.0)
+    return Reply(envelope=envelope(answer_for(pack)), delay_s=5.0)
+
+
+async def test_a_failed_brief_sends_every_armed_long_to_the_vet(tmp_path: Path) -> None:
+    """S§5.2: no brief by its deadline: the day mode is normal, and the vet judges every signal,
+    the brief's own candidates among them."""
+    run = await ab_day(tmp_path, llm_script=brief_not_json)
+    await run.run()
+    calls = await run.rows("SELECT id, ok, candidates_json FROM llm_calls ORDER BY id")
+    picks = '["GAPPER", "LOSE", "SHORT"]'
+    assert [tuple(r) for r in calls] == [
+        ("20261013-premarket-01-1", 0, picks), ("20261013-premarket-01-2", 0, picks),
+        ("20261013-vet-01-1", 1, ALL_ARMED),
+    ]  # fmt: skip
+    modes = await run.rows("SELECT mode, source FROM day_modes")
+    assert [tuple(r) for r in modes] == [("normal", "default")]
+    assert await run.decisions("B") == NEUTRAL
+    assert [i for i in await run.incidents() if i[1].startswith(("llm", "brief"))] == [
+        ("P3", "llm_call_failed"), ("P3", "llm_call_failed"),
+    ]  # fmt: skip
+    await run.close()
+
+
+async def test_a_start_after_the_brief_s_latest_start_skips_the_morning(tmp_path: Path) -> None:
+    """Started at 09:28, past 09:27: no scan, no brief (a P3 ``brief_missed``), the default day
+    mode, and the vet for every armed long."""
+    run = await DayRun(tmp_path, standard_day(), start=time(9, 28), books=("A", "B")).open()
+    await run.run()
+    calls = await run.rows("SELECT id, candidates_json FROM llm_calls ORDER BY id")
+    assert [tuple(r) for r in calls] == [("20261013-vet-01-1", ALL_ARMED)]
+    modes = await run.rows("SELECT mode, source FROM day_modes")
+    assert [tuple(r) for r in modes] == [("normal", "default")]
+    assert ("P3", "brief_missed") in await run.incidents()
+    assert run.edgar.asked == ["WIN", "LOSE", "GAPPER", "EXP", "CAP"]  # the vet's only
+    assert [m for t, m in run.market.asked if t < at("09:30:00") and m == "snapshots"] == []
+    assert await run.decisions("B") == NEUTRAL
+    await run.close()
+
+
+async def test_a_restart_mid_vet_never_vets_again_what_book_b_decided(tmp_path: Path) -> None:
+    """With a 30 s wait, WIN (09:35:50) is ``vet_timeout`` while the vet is still out. The
+    engine dies at 09:35:55, abandoning that call. The restart vets EXP and CAP again, never
+    WIN: Book B decided it (D-069)."""
+    run = await ab_day(tmp_path)
+    settings = vet_settings(max_wait_s=30)
+    run.llm_delay["vet"] = 55.0
+    assert await run.run(run.deps(settings=settings), until="09:35:55") is None
+    assert await run.decisions("B") == {"WIN": "vet_timeout", "CHASE": "missed_at_arm"}
+    await run.wait_until("09:36:30")
+    run.new_hub()
+    run.llm_delay["vet"] = 5.0
+    await run.run(run.deps(settings=settings))
+    calls = await run.rows("SELECT id, failure, candidates_json FROM llm_calls WHERE role = 'vet' "
+                           "ORDER BY id")  # fmt: skip
+    assert [tuple(r) for r in calls] == [
+        ("20261013-vet-01-1", "abandoned", '["WIN", "EXP", "CAP"]'),
+        ("20261013-vet-02-1", None, '["EXP", "CAP"]'),
+    ]
+    assert [r["reason_code"] for r in await b_rows(run, "WIN")] == ["vet_timeout"]
+    await run.close()
+
+
+async def test_a_restart_after_the_vet_asks_nothing_again(tmp_path: Path) -> None:
+    """The brief ended and the vet answered: a restart at 09:45:30 makes no call and asks
+    EDGAR nothing, and Book B's day ends as it would have."""
+    run = await ab_day(tmp_path)
+    assert await run.run(until="09:45:00") is None
+    calls = [r["id"] for r in await run.rows("SELECT id FROM llm_calls ORDER BY id")]
+    assert calls == ["20261013-premarket-01-1", "20261013-vet-01-1"]
+    asked = list(run.edgar.asked)
+    await run.wait_until("09:45:30")
+    run.new_hub()
+    outcome = await run.run()
+    assert outcome is not None
+    assert outcome.state == "DONE"
+    assert [r["id"] for r in await run.rows("SELECT id FROM llm_calls ORDER BY id")] == calls
+    assert run.edgar.asked == asked
+    assert await run.decisions("B") == NEUTRAL
+    await run.close()
+
+
+async def test_the_day_s_call_cap_fails_closed(tmp_path: Path) -> None:
+    """``max_calls_per_day`` 1: the brief spends it, and the vet is refused before any attempt
+    (a P3). Its signals then have no verdict: ``llm_unavailable``, never an unvetted entry. LOSE
+    rests on the brief's verdict."""
+    run = await ab_day(tmp_path)
+    await run.run(run.deps(settings=llm_settings(max_calls_per_day=1)))
+    calls = [r["id"] for r in await run.rows("SELECT id FROM llm_calls ORDER BY id")]
+    assert calls == ["20261013-premarket-01-1"]
+    assert await run.decisions("B") == {**NEUTRAL, "WIN": "llm_unavailable",
+                                        "CAP": "llm_unavailable"}  # fmt: skip
+    assert ("P3", "llm_call_refused") in await run.incidents()
+    assert set(await run.trades("B")) == {"LOSE"}
+    await run.close()
+
+
+async def test_an_a_only_day_asks_for_nothing_of_book_b_s(tmp_path: Path) -> None:
+    """The standard day's pre-market prints, news and filings are Book B's: an A-only day,
+    even one booted at 08:55, makes no LLM call and no pre-market read. So Book A's golden day
+    stays byte-identical (test_golden.py)."""
+    run = await DayRun(tmp_path, standard_day(), start=time(8, 55)).open()
+    await run.run()
+    assert await run.rows("SELECT * FROM llm_calls") == []
+    assert (run.news.started, run.news.reads, run.edgar.asked) == ([], 0, [])
+    assert [m for t, m in run.market.asked if t < at("09:30:00") and m == "snapshots"] == []
+    assert await run.decisions("A") == NEUTRAL
+    await run.close()
+
+
+# A recorded A+B day that replays the same is the A+B golden day's (test_golden.py).
 
 
 async def test_a_replay_names_an_llm_answer_it_lacks(tmp_path: Path) -> None:
@@ -264,16 +505,22 @@ async def test_the_news_starts_after_the_stock_stream_and_stops_with_the_day(
 
 async def test_a_restart_owes_book_b_the_trigger_it_was_waiting_on(tmp_path: Path) -> None:
     """D-069: Book A entered WIN while Book B waited for the vet, journaling nothing; then a
-    crash. The restart re-serves WIN to Book B alone, which decides it, never restart_lost."""
+    crash. The restart re-serves WIN to Book B alone, pending again from 09:36:30; the re-vet
+    answers at 09:37:03, two seconds after WIN's 09:37:01 print, and Book B enters."""
     run = await ab_day(tmp_path)
     run.llm_delay["vet"] = 55.0
     assert await run.run(until="09:35:55") is None  # WIN triggered at 09:35:50: B waits
     assert await run.decisions("B") == {"CHASE": "missed_at_arm"}
     await run.wait_until("09:36:30")
     run.new_hub()
+    run.llm_delay["vet"] = 33.0  # a fresh print to price it by (R-016's 15 s)
     await run.run()
-    b = await run.decisions("B")
-    assert b["WIN"] != "restart_lost"
+    (win,) = await b_rows(run, "WIN")
+    assert (win["reason_code"], win["decided_at"]) == (
+        "entered_after_wait", at("09:37:03").isoformat()
+    )  # fmt: skip
+    assert win["llm_call_id"] == "20261013-vet-02-1"
+    assert "WIN" in await run.trades("B")
     revet = await run.rows("SELECT id FROM llm_calls WHERE role = 'vet' ORDER BY id")
     assert [r["id"] for r in revet] == ["20261013-vet-01-1", "20261013-vet-02-1"]  # re-vetted
     a_win = await run.rows(

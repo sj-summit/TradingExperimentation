@@ -828,7 +828,7 @@ Per-role contents:
 |---|---|---|
 | Unit | indicators (ATR Wilder vs hand-computed fixtures), OR features, rel_vol, ranking, sizing, rounding, IDs, calendar (DST, early close), ledger (T+1 across weekends and holidays), every RiskGate rule, breakers, reason codes, schema validation, sanitizer, DSL evaluator, bootstrap determinism | pytest, hypothesis |
 | Component | MarketDataHub reconnect and backfill (fake WS), ExecutionService with SimBroker (fills, partials, rejects, timeouts, unprotected-position path), `LlmCalls` and `ClaudeCliTransport` with `fake_claude.py`, and under simdrive with `ScriptedTransport` | pytest-asyncio |
-| Integration | Full simulated day: synthetic fixture day plus one recorded real day (G3 run 2, `tests/golden/recordings/2026-10-14/`, D-054), through `replay` with SimClock, SimBroker or the recorded broker answers, compared against a golden journal snapshot | pytest |
+| Integration | Full simulated day: synthetic fixture day plus one recorded real day (G3 run 2, `tests/golden/recordings/2026-10-14/`, D-054), through `replay` with SimClock, SimBroker or the recorded broker answers, compared against a golden journal snapshot. The A+B golden day (`standard_day_ab.json`, D-070) adds Book B on a scripted model, with the synthetic day's pre-market prints, news and filings; it is checked under two hash seeds and by record-then-replay, and Book A's rows on it must equal its own golden day's | pytest |
 | Manual (gated) | `smoke paper`, `smoke llm`, a supervised `run-day` | CLI |
 
 Default `pytest` options: `-m "not paper and not llm and not network"`. The network is blocked in tests (pytest-socket or equivalent).

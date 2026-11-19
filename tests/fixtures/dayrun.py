@@ -10,7 +10,7 @@ same inputs always give the same journal.
 import asyncio
 import contextlib
 import sqlite3
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -82,13 +82,16 @@ class FakeNotifier:
 
 
 class FakeNews:
-    """The news feed and the ``news`` table as Book B reads them (``NewsFeed``). ``on_start``
-    runs when the day starts the feed (tests check what had happened by then)."""
+    """The news feed and the ``news`` table as Book B reads them (``NewsFeed``): an item is
+    there once its ``created_at`` has come. ``on_start`` runs when the day starts the feed
+    (tests check what had happened by then); ``reads`` counts the table's reads."""
 
-    def __init__(self) -> None:
-        self.items: list[NewsItem] = []
+    def __init__(self, clock: SimClock, items: Iterable[NewsItem] = ()) -> None:
+        self._clock = clock
+        self.items: list[NewsItem] = list(items)
         self.started: list[timedelta] = []
         self.stopped = 0
+        self.reads = 0
         self.on_start: Callable[[], object] | None = None
 
     async def start(self, lookback: timedelta) -> int:
@@ -101,20 +104,27 @@ class FakeNews:
         self.stopped += 1
 
     async def recent(self, symbols: Iterable[str], since: datetime) -> list[NewsItem]:
-        wanted = set(symbols)
-        return [i for i in self.items if i.created_at >= since and wanted & set(i.symbols)]
+        self.reads += 1
+        wanted, now = set(symbols), self._clock.now()
+        return [i for i in self.items
+                if since <= i.created_at <= now and wanted & set(i.symbols)]  # fmt: skip
 
 
 class FakeEdgar:
-    """EDGAR's answers (``FilingsPort``): each symbol's filings, none by default."""
+    """EDGAR's answers (``FilingsPort``): each symbol's filings accepted by now, none by
+    default."""
 
-    def __init__(self) -> None:
-        self.filings: dict[str, list[Filing]] = {}
+    def __init__(
+        self, clock: SimClock, filings: Mapping[str, Sequence[Filing]] | None = None
+    ) -> None:
+        self._clock = clock
+        self.filings: dict[str, list[Filing]] = {s: list(f) for s, f in (filings or {}).items()}
         self.asked: list[str] = []
 
     async def recent_filings(self, symbol: str, days: int) -> list[Filing]:
         self.asked.append(symbol)
-        return list(self.filings.get(symbol, []))
+        now = self._clock.now()
+        return [f for f in self.filings.get(symbol, []) if f.filed_at is None or f.filed_at <= now]
 
 
 LLM_DELAY_S = {"premarket": 20.0, "vet": 5.0, "review": 30.0}  # how long each answer takes
@@ -143,8 +153,8 @@ class DayRun:
         self.verdicts: dict[str, str] = {}
         self.day_mode = "normal"
         self.llm_delay = dict(LLM_DELAY_S)
-        self.news = FakeNews()
-        self.edgar = FakeEdgar()
+        self.news = FakeNews(self.clock, day.news)
+        self.edgar = FakeEdgar(self.clock, day.filings)
         self.transport = ScriptedTransport(self._llm_reply, sleep=self._llm_sleep)
         self.market = SyntheticMarket(day, self.clock, skew=skew)
         self.events = day.events()

@@ -1,4 +1,5 @@
-"""The golden day, determinism across processes, and record-then-replay (P3.8b; D-049)."""
+"""The golden days, determinism across processes, and record-then-replay (P3.8b, P4.9; D-049,
+D-070)."""
 
 import json
 import os
@@ -18,7 +19,18 @@ from tests.fixtures import g3_day
 from tests.fixtures.dayrun import DayRun
 from tests.fixtures.days import DAY, standard_day
 from tests.fixtures.exec_harness import RISK, SETTINGS
-from tests.fixtures.golden import GOLDEN, dumps, golden_run, golden_snapshot, snapshot
+from tests.fixtures.golden import (
+    GOLDEN,
+    GOLDEN_AB,
+    TABLES,
+    dumps,
+    golden_ab_run,
+    golden_ab_snapshot,
+    golden_run,
+    golden_snapshot,
+    snapshot,
+    snapshot_ab,
+)
 from tests.helpers import REPO
 from trader.cli import app
 from trader.core.clock import ET, SimClock, fmt_iso
@@ -41,6 +53,15 @@ async def test_the_golden_day(tmp_path: Path) -> None:
     assert got + "\n" == GOLDEN.read_text(encoding="utf-8"), "run UPDATE_GOLDEN=1 if intended"
 
 
+async def test_the_ab_golden_day(tmp_path: Path) -> None:
+    """P4.9: Book A and Book B on the same day (``golden.py``'s docstring)."""
+    got = dumps(await golden_ab_snapshot(tmp_path))
+    if os.environ.get("UPDATE_GOLDEN") == "1":
+        GOLDEN_AB.write_text(got + "\n", encoding="utf-8")
+    assert got + "\n" == GOLDEN_AB.read_text(encoding="utf-8"), "run UPDATE_GOLDEN=1 if intended"
+
+
+@pytest.mark.timeout(300)
 def test_two_processes_with_different_hash_seeds_agree(tmp_path: Path) -> None:
     outputs = []
     for seed in ("1", "2"):
@@ -55,9 +76,79 @@ def test_two_processes_with_different_hash_seeds_agree(tmp_path: Path) -> None:
             capture_output=True,
             timeout=300,
         )
-        outputs.append((folder / "snapshot.json").read_text(encoding="utf-8"))
+        outputs.append(tuple((folder / f"{name}.json").read_text(encoding="utf-8")
+                             for name in ("snapshot", "snapshot_ab")))  # fmt: skip
     assert outputs[0] == outputs[1]
-    assert outputs[0] + "\n" == GOLDEN.read_text(encoding="utf-8")
+    assert outputs[0][0] + "\n" == GOLDEN.read_text(encoding="utf-8")
+    assert outputs[0][1] + "\n" == GOLDEN_AB.read_text(encoding="utf-8")
+
+
+# Book A's own rows, and the rows both books share
+BOOK_A_ROWS = {
+    "signals": TABLES["signals"],
+    "shadow": TABLES["shadow"],
+    "decisions": "SELECT signal_id, take, reason_code, detail, llm_call_id, decided_at "
+    "FROM decisions WHERE book = 'A' ORDER BY signal_id, decided_at, reason_code",
+    "risk_checks": "SELECT signal_id, approved, violations_json, state_json, checked_at "
+    "FROM risk_checks WHERE book = 'A' ORDER BY checked_at, signal_id",
+    "orders": "SELECT client_order_id, broker_order_id, signal_id, symbol, side, type, "
+    "order_class, qty, limit_price, stop_price, status, purpose, submitted_at, updated_at "
+    "FROM orders WHERE book = 'A' ORDER BY submitted_at, client_order_id",
+    "fills": "SELECT id, symbol, side, qty, price, filled_at FROM fills WHERE book = 'A' "
+    "ORDER BY filled_at, id",
+    "trades": "SELECT * FROM trades WHERE book = 'A' ORDER BY id",
+    "ledger": "SELECT kind, symbol, amount, trade_date, settle_date, ref FROM ledger_entries "
+    "WHERE book = 'A' ORDER BY ref, kind",
+    "daily_stats": "SELECT * FROM daily_stats WHERE book = 'A'",
+}
+
+
+async def test_book_a_trades_the_same_beside_book_b(tmp_path: Path) -> None:
+    """S§5.4: Book A never depends on the LLM. Its every row on the A+B golden day is the row
+    its own golden day writes, though Book B boots first, waits, vetoes and trades beside it."""
+    alone = await golden_run(tmp_path / "a")
+    beside = await golden_ab_run(tmp_path / "ab")
+    try:
+        got = await beside.journal.read(lambda conn: snapshot(conn, BOOK_A_ROWS))
+        want = await alone.journal.read(lambda conn: snapshot(conn, BOOK_A_ROWS))
+    finally:
+        await alone.close()
+        await beside.close()
+    assert all(want[name] for name in ("decisions", "orders", "fills", "trades", "ledger"))
+    assert got == want
+
+
+@pytest.mark.timeout(300)  # the day, then its replay: about 40 s
+async def test_a_recorded_ab_golden_day_replays_the_same(tmp_path: Path) -> None:
+    """Decision 10: the replay serves the recorded packs and answers, each at its recorded
+    time, so WIN waits for the vet as long, with no news, EDGAR or claude; every Book B row,
+    each call's ``pack_id`` among them, comes back the same."""
+    run = await golden_ab_run(tmp_path, recording=True)
+    live = await run.journal.read(snapshot_ab)
+    await run.close()
+    report = await replay_day(
+        recordings=tmp_path / "recordings",
+        day=DAY,
+        out=tmp_path / "replay",
+        settings=SETTINGS,
+        risk=RISK,
+        recorded_db=tmp_path / "trader.db",
+    )
+    assert (report.state, report.divergences, report.differences, report.notes) == (
+        "DONE", [], [], []
+    )  # fmt: skip
+    with closing(sqlite3.connect(tmp_path / "replay" / "trader.db")) as conn:
+        replayed = snapshot_ab(conn)
+    assert {"day_mode", "verdict", "llm_call", "b_call"} <= set(
+        comparable_at(tmp_path / "trader.db")
+    )  # Book B's rows were compared
+    assert replayed == live
+    assert (tmp_path / "replay" / "llm" / "2026-10-13" / "20261013-vet-01-1.output.json").exists()
+
+
+def comparable_at(db: Path) -> dict[str, list[str]]:
+    with closing(sqlite3.connect(db)) as conn:
+        return comparable(conn, DAY)
 
 
 async def test_a_recorded_day_replays_the_same(tmp_path: Path) -> None:

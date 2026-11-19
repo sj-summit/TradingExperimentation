@@ -2557,6 +2557,38 @@ Append-only. Each entry records context, the decision, its consequences, and sou
 
 ---
 
+## D-070 — P4.9: end-to-end A+B days: the synthetic day's morning for Book B, the scenarios, and the A+B golden day
+- **Date:** 2026-11-19 · **Status:** Accepted (the Phase 4 plan, P4.9; D-069's "For P4.9").
+- **The synthetic day gains Book B's morning** (`tests/fixtures/days.py`):
+  - **Pre-market prints,** marked extended-hours (`T`, which counts for price): GAPPER and LOSE gap up, SHORT down, SPY slightly up, and DOJI's only print is at 03:50, before the scan's 04:00.
+  - **News and filings,** each known only from its own time. `FakeNews` and `FakeEdgar` now filter by the clock; before, they returned items from the future. GAPPER's headline tries an injection, GAPPER has a 424B5 from the evening before, and CAP has an 8-K at 07:00. EXP's news is out of every window.
+  - **Snapshots carry daily bars as D-024 describes them.** Before the open, `dailyBar` is the previous session's and `prevDailyBar` the one before; from the open, today's bar so far and the previous session's. The session two back closes 2% lower, so picking the wrong bar would show.
+  - **So the brief has candidates:** GAPPER and LOSE as gainers, SHORT for its news. GAPPER's verdict carries `suspicious_content`. The vet judges the armed longs the brief didn't: WIN, EXP and CAP.
+  - **Book A sees none of it.** Every pre-market print comes before 09:20, so neither an A-only engine (subscribed at 09:29) nor its brokers (fed from its 09:20 start) receive one. Book A's golden day is byte-identical, and a test shows an A-only day, even booted at 08:55, makes no LLM call, no news read, no EDGAR request and no snapshot before the open (`SyntheticMarket.asked` records each call's time).
+- **The scenarios** (`test_orchestrator_b.py`), each a whole day on a SimClock with the model scripted:
+  - a neutral day, on which Book B decides as Book A does;
+  - the brief's veto of LOSE, which frees Book B's cash and its second entry for CAP (14 shares), which Book A can't take;
+  - a trigger that waits and enters (`entered_after_wait`); one past its chase cap when the answer comes (`chased_after_wait`, on a day where WIN jumps at 09:36); one still pending at its deadline (`vet_timeout`), with `llm_unavailable` after the vet fails;
+  - answers still invalid after their repair: three failed attempts, the `llm_degraded` halt with its P2, and Book A's day unchanged;
+  - a `no_trade` day, whose decisions rest on the brief while the vet still runs, and a reduced day, which halves both of Book B's entries;
+  - a failed brief and a late start (09:28), each sending every armed long to the vet with the default day mode;
+  - two restarts: one mid-vet that vets again only what Book B hasn't decided, and one after the vet that asks for nothing again;
+  - the call cap: the vet is refused, and its signals are `llm_unavailable`, never entered unvetted.
+- **The A+B golden day** (`tests/golden/standard_day_ab.json`; `golden.py`'s `golden_ab_run` and `TABLES_AB`):
+  - **Its day:** Book A's golden day, with Book B beside it from 08:55. The brief vetoes LOSE, WIN waits 8 s for the vet and enters, GAPPER is `chased`, and Book B takes CAP.
+  - **`TABLES_AB`** adds each decision's call, fills by book, the LLM calls, the verdicts, the day modes and the halts. A call's `pack_id` hashes the pack it sent, so any change in what Book B sends shows as a golden diff. That is deliberate: such a change alters the model's input, and a reviewed diff is the place to see it.
+  - **Checks:**
+    - two processes with different hash seeds write both golden days byte for byte;
+    - record-then-replay reproduces every `TABLES_AB` table, pack ids included, with no divergence, difference or note. It replaces P4.8's A+B replay test, which ran the same day and compared less;
+    - Book A's rows on the A+B day equal its own golden day's: its decisions, risk checks with their state, orders, fills, trades, ledger and stats, and the signals and shadow outcomes both books share.
+- **Found while building it:**
+  - **A waited trigger is priced from the feed, and R-016 allows 15 s.** The synthetic tape prints WIN at :01 and :50 of each minute, so a verdict that lands between those prints leaves WIN's price too old. That is why D-069 found the restart's re-served trigger could end as `risk_gate:R-016`. The test now times the re-vet to land 2 s after a print, and Book B enters. Real ORB names print far more often. A thinly traded name, though, would cost Book B entries that Book A, deciding on the trigger's own print, keeps. That is worth watching in the evaluation, not a change.
+  - **No code changes.** P4.9 added tests and fixtures only. The mutant D-069 left for it (a restart re-vetting a signal Book B already decided) is now caught.
+- **Spec updates:** ARCHITECTURE §12; PLAN; HANDOFF.
+- **Tests:** 1,517 pass, up from 1,504: 14 new, and P4.8's A+B replay test folded into the golden's. Ruff, its formatter and mypy are clean. Book A's golden day and G3's replay pass unchanged.
+
+---
+
 ## Open questions to resolve during the build (record answers as new entries)
 
 - **Q1 (P1.2):** Is Alpaca's `movers` (top market movers) endpoint available on the free plan? If not, use the IEX snapshot gap scan. **Partly answered: D-024** (the 09:00 scan uses snapshots either way); doctor's `data.movers` check records availability once keys exist. **Answered by doctor on 2026-10-10: available** (`data.movers` PASS; the screener returned 10 gainers).

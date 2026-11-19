@@ -1,4 +1,4 @@
-# HANDOFF: Phase 4 under way; P4.0a–P4.0c, P4.1–P4.8 and 🛑 G4a done; next P4.9 (updated 2026-11-19)
+# HANDOFF: Phase 4 under way; P4.0a–P4.0c, P4.1–P4.9 and 🛑 G4a done; next P4.10 (updated 2026-11-19)
 
 **Latest:**
 - **Phase 4's plan is approved** (2026-10-14), now at `docs/PHASE4_PLAN.md`. Its file under `~\.claude\plans` was removed by Claude Code's cleanup of old files; the copy in the repository is its unchanged text (D-068). Order: P4.0a, P4.0b, P4.0c, P4.1–P4.6, 🛑 G4a, P4.7–P4.10, 🛑 G4b.
@@ -124,12 +124,28 @@
       - a cut stderr kept most of the credential in the recording;
       - a Book B boot failure stopped Book A's day.
     - **Then 210 mutants:** 204 caught, 5 equivalent, and 1 left for P4.9's restart tests. 1,504 tests pass.
-- **Commits:** HEAD is `b8875f1` ("P4.7 Done", the human's commit), which holds everything through D-068. P4.8 and D-069, and these doc updates, are uncommitted. Commit only if asked.
+- **P4.9 is done (D-070): end-to-end A+B days.** Tests and fixtures only; no engine code changed.
+  - **The synthetic day gained Book B's morning:** pre-market prints, news and filings, and snapshots with daily bars as D-024 describes. The brief now has candidates (GAPPER, LOSE, SHORT), and GAPPER's injection headline gets flagged. Book A sees none of it: its golden day is byte-identical.
+  - **Fourteen new tests,** each a whole simulated day:
+    - a brief's veto that frees Book B's cash for CAP;
+    - a trigger past its chase cap when its verdict arrives;
+    - answers still invalid after their repair, which degrade Book B and leave Book A's day as it was;
+    - `no_trade` and reduced days;
+    - a failed brief and a late start;
+    - a restart mid-vet, and one after the vet;
+    - the call cap, which fails closed;
+    - an A-only day that asks for none of Book B's data.
+  - **The A+B golden day** (`tests/golden/standard_day_ab.json`):
+    - it is the same under two hash seeds;
+    - its replay reproduces every row, each call's `pack_id` included;
+    - Book A's rows on it equal Book A's own golden day's.
+  - **Found:** a waited trigger is priced from its last print, and R-016 allows 15 s. On a thinly traded name, Book B's wait can cost an entry that Book A keeps. That is for the evaluation to watch. 1,517 tests pass.
+- **Commits:** HEAD is `79b8a31` ("P4.8 Done", the human's commit), which holds everything through D-069. P4.9 and D-070, and these doc updates, are uncommitted. Commit only if asked.
 - **Waiting on the human:**
   - **The PC clock is fixed** (2026-11-17 20:54; D-067). The machine that runs the bot (H0.4) must keep the Windows Time service running. Doctor's `alpaca.clock` and the bot's hourly skew check will catch it if the service stops again.
   - **Before G4b:** the Phase 1 checks (`trader news`, `trader filings`, `trader stream --news`) and the `ALPACA_DATA_*` keys.
   - `run-day` isn't needed between gates: it stays a human gate until Phase 6.
-- **Next (Claude):** P4.9, end-to-end A+B days. D-069's "For P4.9" says what `DayRun` already does and what the synthetic day still lacks (pre-market prints, news, filings). Then P4.10, the review's content (`ReviewWork`, D-069).
+- **Next (Claude):** P4.10, the review's content: `memory/reviews.py` provides `ReviewWork` (D-069), with the `followups` CLI, and a capability so a day recorded before it doesn't replay a review. Once `DayRun` passes it, the A+B golden day gains its 16:15 review, a golden rewrite the plan allows in P4.10. After P4.10 comes 🛑 G4b.
 - **New since G3, for the G4b runbook:**
   - **Book B's milestones** (D-069):
     - `book B ready` at boot, and `news started`;
