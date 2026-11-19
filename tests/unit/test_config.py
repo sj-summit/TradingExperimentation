@@ -201,6 +201,15 @@ def test_an_attempt_must_fit_its_own_timeout(repo: Path) -> None:
     load_config(repo)  # equal is fine
 
 
+@pytest.mark.parametrize("role", ["premarket", "vet", "review"])
+def test_a_structured_answer_needs_two_turns(repo: Path, role: str) -> None:
+    """G4a: the answer arrives as a tool call, so every call takes 2 turns (D-067)."""
+    set_yaml(repo / SETTINGS, f"llm.roles.{role}.max_turns", 1)
+    assert has(problems_of(repo), f"llm.roles.{role}.max_turns", "greater than or equal to 2")
+    set_yaml(repo / SETTINGS, f"llm.roles.{role}.max_turns", 2)
+    load_config(repo)
+
+
 def test_the_briefs_web_tools_stay_off_until_built(repo: Path) -> None:
     """E5 isn't built: allow_web true would run the brief without web tools, unnoticed."""
     set_yaml(repo / SETTINGS, "llm.roles.premarket.allow_web", True)

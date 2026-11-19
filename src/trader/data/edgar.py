@@ -12,6 +12,7 @@ submissions JSON ``acceptanceDateTime`` is off by the UTC offset for many filing
 
 import asyncio
 import json
+import os
 import re
 import sqlite3
 from collections.abc import Awaitable, Callable, Iterable
@@ -152,14 +153,20 @@ class EdgarClient:
         cache = self._cache_dir / "company_tickers.json"
         raw: dict[str, Any] | None = None
         if cache.is_file():
-            stored = json.loads(cache.read_text(encoding="utf-8"))
-            if stored.get("fetched") == today.isoformat():
-                raw = stored["tickers"]
+            try:  # a file torn by a crash, or by two runs at once, is fetched again
+                stored = json.loads(cache.read_text(encoding="utf-8"))
+                if stored.get("fetched") == today.isoformat():
+                    raw = stored["tickers"]
+            except (OSError, ValueError, AttributeError, KeyError):
+                log.warning("EDGAR ticker cache unreadable: fetching it again")
+                raw = None
         if raw is None:
             raw = await self._json(TICKERS_URL)
             self._cache_dir.mkdir(parents=True, exist_ok=True)
             payload = {"fetched": today.isoformat(), "tickers": raw}
-            cache.write_text(json.dumps(payload), encoding="utf-8")
+            partial = cache.with_name(cache.name + f".{os.getpid()}.partial")
+            partial.write_text(json.dumps(payload), encoding="utf-8")
+            os.replace(partial, cache)  # readers never see half a file
         mapping: dict[str, list[str]] = {}
         for row in raw.values():
             ciks = mapping.setdefault(str(row["ticker"]).upper(), [])

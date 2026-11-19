@@ -148,7 +148,7 @@ class PremarketRoleConfig(_Model):
     model: ModelAlias
     effort: Effort
     timeout_s: StrictInt = Field(gt=0)
-    max_turns: StrictInt = Field(gt=0)
+    max_turns: StrictInt = Field(ge=2)  # the answer is a tool call: 2 turns (D-067)
     allow_web: StrictBool
     max_candidates: StrictInt = Field(gt=0)
     max_news_per_symbol: StrictInt = Field(ge=0)
@@ -159,7 +159,7 @@ class VetRoleConfig(_Model):
     model: ModelAlias
     effort: Effort
     timeout_s: StrictInt = Field(gt=0)
-    max_turns: StrictInt = Field(gt=0)
+    max_turns: StrictInt = Field(ge=2)  # the answer is a tool call: 2 turns (D-067)
     max_wait_s: StrictInt = Field(ge=0)
     revet_premarket: StrictBool
     anonymize_entities: StrictBool
@@ -171,7 +171,7 @@ class ReviewRoleConfig(_Model):
     model: ModelAlias
     effort: Effort
     timeout_s: StrictInt = Field(gt=0)
-    max_turns: StrictInt = Field(gt=0)
+    max_turns: StrictInt = Field(ge=2)  # the answer is a tool call: 2 turns (D-067)
     # past daily summaries in the pack (STRATEGY.md §6.6); at most 30, so the review pack's
     # history, which no trim reaches, leaves room for every target (D-063)
     history_days: StrictInt = Field(ge=0, le=30)

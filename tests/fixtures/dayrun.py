@@ -19,10 +19,11 @@ from typing import Any
 from tests.fixtures import nyse
 from tests.fixtures.days import SyntheticDay, SyntheticMarket
 from tests.fixtures.exec_harness import RISK, SETTINGS
+from tests.helpers import REPO
 from trader.config import BookName, RiskConfig, Settings
 from trader.core.calendar import TradingCalendar, sync_calendar
 from trader.core.clock import ET, SimClock
-from trader.core.models import Quote, Trade
+from trader.core.models import Filing, NewsItem, Quote, Trade
 from trader.data.recorder import REST_FILE, Recorder, broker_file
 from trader.data.replay import RecordingMarketData, ReplayHub
 from trader.data.stream import Channel, MarketEvent
@@ -30,9 +31,18 @@ from trader.data.universe import UniverseRow
 from trader.execution.broker import BrokerAdapter
 from trader.execution.recording import RecordingBroker
 from trader.execution.sim_broker import SimBroker
+from trader.llm.budget import Budget
+from trader.llm.claude_cli import Transport
+from trader.llm.client import LlmCalls
+from trader.llm.fake import Reply, ScriptedTransport, Seen, answer_for, envelope
+from trader.llm.replay import LLM_FILE, RecordingTransport
+from trader.llm.roles import role_specs
 from trader.memory.journal import Journal
 from trader.notify import Priority
 from trader.orchestrator.day import Cadence, DayDeps, DayOrchestrator, DayOutcome, DayPaths
+from trader.orchestrator.evidence import EvidenceDesk
+from trader.orchestrator.llm_jobs import LlmDeps
+from trader.orchestrator.packs import PackFactory, live_packs, recording_packs
 from trader.orchestrator.simdrive import drive
 
 D = Decimal
@@ -71,6 +81,45 @@ class FakeNotifier:
         return True
 
 
+class FakeNews:
+    """The news feed and the ``news`` table as Book B reads them (``NewsFeed``). ``on_start``
+    runs when the day starts the feed (tests check what had happened by then)."""
+
+    def __init__(self) -> None:
+        self.items: list[NewsItem] = []
+        self.started: list[timedelta] = []
+        self.stopped = 0
+        self.on_start: Callable[[], object] | None = None
+
+    async def start(self, lookback: timedelta) -> int:
+        self.started.append(lookback)
+        if self.on_start is not None:
+            self.on_start()
+        return len(self.items)
+
+    async def stop(self) -> None:
+        self.stopped += 1
+
+    async def recent(self, symbols: Iterable[str], since: datetime) -> list[NewsItem]:
+        wanted = set(symbols)
+        return [i for i in self.items if i.created_at >= since and wanted & set(i.symbols)]
+
+
+class FakeEdgar:
+    """EDGAR's answers (``FilingsPort``): each symbol's filings, none by default."""
+
+    def __init__(self) -> None:
+        self.filings: dict[str, list[Filing]] = {}
+        self.asked: list[str] = []
+
+    async def recent_filings(self, symbol: str, days: int) -> list[Filing]:
+        self.asked.append(symbol)
+        return list(self.filings.get(symbol, []))
+
+
+LLM_DELAY_S = {"premarket": 20.0, "vet": 5.0, "review": 30.0}  # how long each answer takes
+
+
 class DayRun:
     def __init__(
         self,
@@ -84,9 +133,19 @@ class DayRun:
         sim_class: type[SimBroker] = SimBroker,
         record: bool = True,
         recording: bool = False,
+        llm_script: Callable[[Seen], Reply] | None = None,
     ) -> None:
         self.root, self.day = root, day
         self.clock = SimClock(datetime.combine(day.day, start, ET))
+        # Book B's model, news and EDGAR: neutral on everything unless ``verdicts`` says
+        # otherwise, or ``llm_script`` answers instead
+        self.llm_script = llm_script
+        self.verdicts: dict[str, str] = {}
+        self.day_mode = "normal"
+        self.llm_delay = dict(LLM_DELAY_S)
+        self.news = FakeNews()
+        self.edgar = FakeEdgar()
+        self.transport = ScriptedTransport(self._llm_reply, sleep=self._llm_sleep)
         self.market = SyntheticMarket(day, self.clock, skew=skew)
         self.events = day.events()
         self.hub = self.new_hub()
@@ -184,8 +243,63 @@ class DayRun:
             at_close=tuple(sim.expire_day_orders for sim in self.sims.values()),
             boot_info={"test": True},
             cadence=cadence,
+            llm=self.llm_deps(settings) if "B" in self.sims else None,
         )
         return DayDeps(**{**deps.__dict__, **changes})
+
+    def llm_deps(self, settings: Settings = SETTINGS) -> LlmDeps:
+        """Book B's runner on the scripted model, and packs built from the day, recorded when
+        the day records (as run-day does)."""
+        transport: Transport = self.transport
+        packs: PackFactory = live_packs(
+            EvidenceDesk(
+                news=self.news,
+                filings=self.edgar,
+                clock=self.clock,
+                filings_days=settings.edgar.lookback_days,
+            )
+        )
+        if self.recording and self.recorder is not None:
+            recorder = self.recorder
+
+            def sink(record: dict[str, Any]) -> None:
+                recorder.append(LLM_FILE, record, flush=True)
+
+            transport = RecordingTransport(transport, self.clock, sink)
+            packs = recording_packs(packs, sink)
+        calls = LlmCalls(
+            journal=self.journal,
+            clock=self.clock,
+            transport=transport,
+            command=("fake",),
+            roles=role_specs(settings),
+            env={},
+            prompts_dir=REPO / "prompts",
+            sandbox_dir=self.root / "llm_sandbox",
+            artifacts_dir=self.root / "llm",
+            budget=Budget(
+                self.journal,
+                max_calls_per_day=settings.llm.max_calls_per_day,
+                max_concurrent=settings.llm.max_concurrent,
+            ),
+            max_pack_bytes=settings.llm.max_pack_bytes,
+        )
+        return LlmDeps(calls=calls, packs=packs, news=self.news, setup={"transport": "scripted"})
+
+    def _llm_reply(self, seen: Seen) -> Reply:
+        if self.llm_script is not None:
+            return self.llm_script(seen)
+        pack = seen.pack()
+        out = answer_for(pack)
+        if "assessments" in out:
+            out["assessments"] = [{**a, "verdict": self.verdicts.get(a["symbol"], "neutral")}
+                                  for a in out["assessments"]]  # fmt: skip
+        if "day_mode" in out:
+            out["day_mode"] = self.day_mode
+        return Reply(envelope=envelope(out), delay_s=self.llm_delay[str(pack["role"])])
+
+    async def _llm_sleep(self, seconds: float) -> None:
+        await self.clock.sleep_until(self.clock.now() + timedelta(seconds=seconds))
 
     def _market(self) -> Any:
         if not (self.recording and self.recorder is not None):

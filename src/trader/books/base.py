@@ -183,13 +183,18 @@ async def decided(journal: Journal, day: date) -> dict[str, frozenset[BookName]]
     return {k: frozenset(v) for k, v in out.items()}
 
 
-async def signals_with_orders(journal: Journal, day: date) -> frozenset[str]:
+async def signals_with_orders(journal: Journal, day: date) -> dict[BookName, frozenset[str]]:
+    """Each book's signals with an entry order today (a restart never re-triggers one for the
+    book that ordered it; the other book's own decision is still owed, D-069)."""
     rows = await journal.fetch_all(
-        "SELECT DISTINCT o.signal_id FROM orders o JOIN signals s ON s.id = o.signal_id "
+        "SELECT DISTINCT o.book, o.signal_id FROM orders o JOIN signals s ON s.id = o.signal_id "
         "WHERE s.date = ? AND o.side = 'buy'",
         (day.isoformat(),),
     )
-    return frozenset(r["signal_id"] for r in rows)
+    out: dict[BookName, set[str]] = {}
+    for r in rows:
+        out.setdefault(r["book"], set()).add(r["signal_id"])
+    return {book: frozenset(ids) for book, ids in out.items()}
 
 
 async def finalize_decisions(

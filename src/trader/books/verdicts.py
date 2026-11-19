@@ -187,6 +187,12 @@ class VerdictStore:
         """The brief's day mode; normal by default, until or unless the brief sets one."""
         return self._mode or DEFAULT_MODE
 
+    @property
+    def mode_known(self) -> bool:
+        """Whether today's day mode is settled: the brief's, or the default stored for a brief
+        that failed or never ran (D-069: a restart doesn't ask again)."""
+        return self._mode is not None
+
     def standing(self, sig: Signal) -> Standing:
         symbol = sig.symbol
         pre, vet = self._pre.get(symbol), self._vet.get(symbol)

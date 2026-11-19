@@ -57,9 +57,9 @@ ai-day-trader/
 │   ├── books/      base.py reasons.py entry.py baseline.py llm_filtered.py verdicts.py
 │   ├── risk/       caps.py gate.py ledger.py killswitch.py breakers.py
 │   ├── execution/  broker.py alpaca_broker.py sim_broker.py orders.py service.py reconcile.py
-│   ├── llm/        client.py claude_cli.py roles.py fake.py epoch.py candidates.py context.py schemas.py budget.py sanitize.py smoke.py smoke_packs.py smoke_data.json descendants.py
+│   ├── llm/        client.py claude_cli.py roles.py fake.py replay.py epoch.py candidates.py context.py schemas.py budget.py sanitize.py smoke.py smoke_packs.py smoke_data.json descendants.py
 │   ├── memory/     journal.py migrations/0001_init.sql stats.py shadow.py lessons.py regime.py playbook.py reviews.py
-│   ├── orchestrator/ day.py tasks.py watchdog.py
+│   ├── orchestrator/ day.py plan.py tasks.py eod.py inputs.py llm_jobs.py evidence.py packs.py ports.py live.py replay.py watchdog.py
 │   ├── reports/    daily.py weekly.py evaluation.py templates/
 │   └── notify.py
 ├── tests/       unit/ integration/ fixtures/ (calendars, bars, news, llm envelopes, recorded day)
@@ -80,20 +80,20 @@ Times are config defaults. On **early-close days**:
 |---|---|---|---|
 | 07:30 | Universe refresh (if not done the night before) | — | assets, SIP daily bars → ATR14/ADV14, corporate actions, OR baselines, EDGAR ticker map |
 | 08:25 | Process start (OS scheduler) | — | Exit cleanly if not a trading day |
-| 08:30 | Boot | A, B | boot's own checks (not `doctor --quick`); clock skew; the universe if missing; the t−1 regime tags; reconcile each account: today's journal explains a restart, anything else is a P1 and a flatten at max(now, 09:30:05); seed (first use, flat account only) or load the ledgers; book the fees the broker charged (capability `fees_v1`, D-055); set E; start the kill switch, heartbeat, alert pump and stream; write `boot.json` (DECISIONS D-048). The news stream joins in Phase 4 |
-| 09:00 | Pre-market scan | — | eligible symbols with a price-setting print since 04:00 ET (snapshots, live feed), gapping against the universe's SIP previous close: the top 30 gainers, then up to 10 more with news in the last 18 h, up to 40 in all (`llm/candidates.py`, D-063); news; EDGAR flags for each |
-| 09:05 | Claude pre-market brief | B | deadline 09:28 (STRATEGY.md §5.2) |
+| 08:30 | Boot | A, B | boot's own checks (not `doctor --quick`); clock skew; the universe if missing; the t−1 regime tags; reconcile each account: today's journal explains a restart, anything else is a P1 and a flatten at max(now, 09:30:05); seed (first use, flat account only) or load the ledgers; book the fees the broker charged (capability `fees_v1`, D-055); set E; start the kill switch, heartbeat, alert pump and stream; write `boot.json` (DECISIONS D-048). **Book B** (D-069): close the LLM attempts a crash left open, note the LLM setup's fingerprint, rebuild its `VerdictStore`; once the stock stream is connected, start `NewsHub` in the background (a day of backfill, then the stream; retried each minute) |
+| 09:00 | Pre-market scan | B | eligible symbols with a price-setting print since 04:00 ET (snapshots, live feed), gapping against the universe's SIP previous close: the top 30 gainers, then up to 10 more with news in the last 18 h, up to 40 in all (`llm/candidates.py`, D-063); news; EDGAR prefetched for each until 09:05 (D-069) |
+| 09:05 | Claude pre-market brief | B | deadline 09:28 (STRATEGY.md §5.2); not asked again after a restart; no attempt starts after 09:27, and then the day mode is normal and the vet judges every signal (D-069) |
 | 09:29 | Subscribe the stream to regime symbols (SPY, QQQ, IWM) | — | |
 | 09:35:03 | OR scan (REST, multi-symbol 5-min bars, batches of ≤ 200 symbols in parallel) | — | must finish by 09:36:30 |
 | 09:35:05 | Arm signals; subscribe the stream (≤ 30 symbols total) | A, B | |
-| 09:35:05 | Claude catalyst vet (batched) | B | 60 s budget |
-| 09:35–last_entry | Triggers → book policy → risk gate → OTO entries | A, B | |
+| 09:35:05 | Claude catalyst vet (batched) | B | at arming, before any trigger reaches Book B: its signals pend from then; EDGAR for up to 10 s for symbols the prefetch missed; the call's deadline is the last entry (D-069) |
+| 09:35–last_entry | Triggers → book policy → risk gate → OTO entries | A, B | Book B parks a trigger whose verdict is pending and asks it again when the verdicts change or at its deadline; at the last entry each parked one is settled (D-068, D-069) |
 | continuous | Reconciliation every 60 s; R-020 stop-leg checks every 5 s (every 1 s while shares are bare or a stop is pending, every 2 s while entries are open; D-056); heartbeat every 10 s; the clock skew read every hour after boot (`skew_hourly`; journaled in `day_runs`; a P2 alert only, D-055) | A, B | |
 | last_entry (15:30) | Stop arming new entries; cancel unfilled entries | A, B | |
 | flatten (15:55) | Cancel all orders; close all positions; verify flat by close − 2 min | A, B | |
 | 16:05 | EOD per book: reconcile; final decisions; trades; fees (`fees_v1`, D-055); daily stats; breakers (cash check, with its residual stored and a P3 `cash_drift` past half the tolerance; drawdown; losing streak) | A, B | each step marked in `day_runs`, so a restart skips it (D-048) |
 | 16:12 | Shadow outcomes (SIP 1-min bars; the 15:55 bar is > 15 min old from about 16:11; retry for up to 5 min); each ambiguous trigger minute read from the SIP trade tape, one request each (capability `shadow_tape`, D-057); a minute the tape can't settle is counted as stopped, with a P3 `shadow_tape_unresolved` | — | STRATEGY.md §7.2 |
-| 16:15 | Claude post-close review → signal reviews, process issues, notes, lesson proposals (each to its own table) | B | 10 min first attempt; repair only if it can finish by 16:29, else `daily_reviews.status = missing` and the report says so |
+| 16:15 | Claude post-close review → signal reviews, process issues, notes, lesson proposals (each to its own table) | B | after the shadow job; the cutoff is the report − 1 min (16:29), and no attempt starts after the cutoff − 120 s; once a day (a `review` step in `day_runs`); else `daily_reviews.status = missing` and the report says so. P4.8 runs the job; its content (`memory/reviews.py`) arrives in P4.10 (D-069) |
 | 16:30 | Reports (MD and HTML), notifications, recordings finalized; DONE, then the DB backup (D-055) | — | then exit |
 
 ### Late start and partial days
@@ -161,7 +161,7 @@ class MarketDataHub:                          # the single WebSocket
 - **`UniverseBuilder`:** implements STRATEGY.md §3.1.
   - Writes `universe_daily(date, symbol, …)` and keeps `or_bars` current: it backfills the 14 prior sessions per symbol and appends today's OR bar after the scan.
   - **ADV14/ATR14 come from SIP daily bars.** Using IEX volume here would make the ADV filter wrong.
-- **`NewsHub`:** Alpaca news WebSocket (`*`) from boot, plus REST backfill → `news`.
+- **`NewsHub`:** Alpaca news WebSocket (`*`) from boot, once the stock stream is connected (D-069), plus REST backfill → `news`.
   - Headlines and summaries are stored raw.
   - Sanitization happens only when building context packs (`llm/sanitize.py`).
 - **`EdgarClient`:**
@@ -173,13 +173,14 @@ class MarketDataHub:                          # the single WebSocket
   - stream events, each with its receive time `rx` → `stream.jsonl.gz`
   - every market-data REST call after boot (arguments, result or error, start and end `rx`) → `rest.jsonl.gz`
   - each book's broker calls and trade updates (parsed models, no raw payloads) → `broker-A.jsonl.gz`, `broker-B.jsonl.gz`
+  - Book B's packs, every one a job built, and each LLM attempt's answer (redacted), each flushed at once → `llm.jsonl.gz` (D-069)
   - each book's ledger, halts and state at boot, a calendar slice, the config hashes, the git SHA, a hash of the source (`source_sha256`, so an uncommitted tree has a name) and the engine's capabilities → `boot.json` (`boot-2.json` after a restart). A replay grants only the recorded capabilities, so a day recorded before one existed makes none of its calls (D-055)
   - OR scan response → `or_scan.parquet`
   - universe snapshot → `universe.parquet`
   - news → `news.jsonl.gz`
-  - LLM context packs and envelopes are referenced by path from `llm_calls`
+  - LLM artifacts (each attempt's stdin and output) are also referenced by path from `llm_calls`
 
-  This is enough for `trader replay` to reproduce the day deterministically.
+  This is enough for `trader replay` to reproduce the day deterministically. A replay serves Book B's recorded packs at the time each was ready and each attempt's recorded answer at max(now, its recorded end), so it needs no news, EDGAR or `claude` (D-063, D-069).
 - **Replay** (`data/replay.py`, DECISIONS D-047): `RecordingMarketData` wraps the REST client while live and `ReplayMarketData` serves the recording back (matched by call and occurrence, after the recorded duration); `RecordingBroker` (`execution/recording.py`) records a book's broker traffic; `ReplayHub` plays the stream by `rx` through the live hub's own `HubState`. Hub taps run synchronously at publish time.
 
 ### 4.3 strategy
@@ -295,7 +296,7 @@ class LLMResult(Generic[T]):
 ```
 
 - **`client.py`: `LlmCalls`** is the one runner (D-064). It owns the call ids, the budget, the `llm_calls` rows (one per attempt), the artifacts, the classification, the clamp and validation, and the one repair. `run()` never raises for a failure; only a cancellation goes on. `persist` runs in the transaction that completes a good answer, so what the caller stores from it commits with its row.
-- **Transports** (`claude_cli.Transport`): `ClaudeCliTransport` runs the CLI (§7.2); `fake.ScriptedTransport` answers from a script for tests and `--sim`. P4.8 adds the recording and replaying ones.
+- **Transports** (`claude_cli.Transport`): `ClaudeCliTransport` runs the CLI (§7.2); `fake.ScriptedTransport` answers from a script for tests and `--sim`; `replay.RecordingTransport` records each attempt's answer into `llm.jsonl.gz`, and `replay.ReplayTransport` answers from it (D-069).
 - **`llm.provider: anthropic_api`** runs the same CLI with `ANTHROPIC_API_KEY` in place of the subscription token, billed per token (plan decision 3; no direct API client).
 - `roles.py` holds each role's spec: its output model, prompt file, instruction and limits.
 - `epoch.py`: `epoch_fingerprint()` hashes what the calls ask (the prompts' bytes, the instructions and the repair's note, the schemas sent, the models and efforts, the flags), and `note_fingerprint()` stores it at boot, raising a P3 `llm_fingerprint_changed` that names what changed (S§9, D-065).
@@ -336,12 +337,20 @@ class LLMResult(Generic[T]):
   - Each task has a deadline. A missed deadline follows the fallback in STRATEGY.md and RISK.md.
   - A state that fails before the flatten is a P2 and falls through to FLATTEN and EOD: closed for entries, open for exits.
   - The modules: `plan.py` (the timeline), `day.py` (the machine), `eod.py`, `tasks.py` (heartbeat, staleness, subscriptions), `inputs.py` (the gate's network inputs), `lock.py`, `live.py` (the `run-day` wiring), `simdrive.py` (drives a SimClock), `ports.py`, `capabilities.py` (what a day's engine does, recorded in `boot.json` so a replay of an older day makes no newer call) and `provenance.py` (the source hash). Details in DECISIONS D-048 and D-055.
-- **`run-day` modes:** paper (records everything for replay; `runtime/run-day.lock` keeps a second engine away); `--sim` (live data, a SimBroker per book, everything under `runtime/sim/<date>/`, alerts prefixed `[SIM]`); `--dry-run` (boot's checks, read-only, and the timeline).
+  - **Book B** (D-069): `llm_jobs.py` (`BookBJobs`: boot, the 09:00 scan and 09:05 brief, the vet at arming, the review after the shadow job, the incidents after each call, and the `llm_degraded` halt), `evidence.py` (news, and EDGAR within a time budget), `packs.py` (`LivePacks`, `RecordingPacks`, `ReplayPacks`). The day's worker parks a Book B trigger that `Defer`s and asks it again when the store changes or at its deadline; `_stop_trading` settles every one still parked. No job raises into the day: Book A never depends on the LLM.
+    - The news feed starts once the market stream is connected and, if it fails, tries again each minute (one P3 `news_unavailable`). While it is down, or its last read failed, every pack says `news_unavailable: true` (§8).
+    - A Book B boot that fails (the attempts a crash left, the fingerprint, the store) is a P2 `llm_job_failed`: Book B is halted `llm_degraded` until the next open and its jobs are off, while its account is still reconciled, protected and flattened.
+- **`run-day` modes:** paper (records everything for replay; `runtime/run-day.lock` keeps a second engine away); `--sim` (live data, a SimBroker per book, a scripted model that finds every candidate neutral, everything under `runtime/sim/<date>/`, alerts prefixed `[SIM]`); `--dry-run` (boot's checks, read-only, and the timeline, Book B's rows included, with whether its LLM is ready).
+- **Book B off** for the day (`--no-llm`, `llm.enabled: false`, `books.B.enabled: false`, or, with a P2, a missing CLI or credential): Book A runs alone, and `boot.json` and the report say why (plan decision 9, D-069).
+  - A paper day first reads the account of a book it won't run, read-only: nothing reconciles, protects or flattens it, so anything held or working there is a P2 `idle_book_not_flat` naming `trader flatten --book X`.
+  - A CLI newer than `max_tested_cli_version` is a P3 `llm_cli_untested`; an EDGAR client that can't be built (no user agent) is a P3 `edgar_unavailable`, and the packs then mark every candidate's filings unavailable.
 - **`watchdog.py`:** RISK.md §6.
 
 ### 4.10 reports and notify
 
 - **Daily report:** the signals table (symbol, rel_vol, rank, trigger, triggered?, shadow R, A action/result, B verdict/reason/action/result), book P&L, incidents, LLM calls, Claude's review (summary, then what went well, what went badly, and why for each target), new or recurring process issues and notes, and the limitations footer.
+  - **Book B's part** (D-069): the header's attempts (ok, failed, abandoned), the budget used, the failed attempts toward `llm_degraded`, and the day mode; Book B's verdict per signal (the one its decision rests on); a table of the day's attempts; Claude's words (the day mode's reason, the review's summary and target reviews). A day Book B was kept off says why.
+  - **The model's text** is escaped: in HTML like every cell. In Markdown it sits in a code span whose fence is longer than any run of backticks in it, so it opens no link (a bare URL included), image, HTML or emphasis; in a table its pipes are escaped too.
 - **Weekly report:**
   - equity curves A vs B vs SPY;
   - veto value V with CI;
@@ -359,7 +368,7 @@ class LLMResult(Generic[T]):
 | `doctor [--quick]` | Environment, config, auth (Alpaca A/B, `claude auth status`), clock, CLI version, disk, token age | — |
 | `universe build [--date]` / `universe or-baseline` | Daily features, OR baselines | — |
 | `stream --symbols … --minutes N` | Dev: print live bars | — |
-| `run-day [--books A,B] [--sim] [--dry-run]` | The full day | HUMAN GATE until Phase 6 |
+| `run-day [--books A\|B\|A,B] [--sim] [--dry-run] [--no-llm]` | The full day; `--no-llm` keeps Book B off for the day | HUMAN GATE until Phase 6 |
 | `replay --date D [--speed N]` | Recorded day through the real engine on SimClock, with recorded market data and broker answers; compares with the journal (D-049). `--speed` is deferred | — |
 | `backtest --start --end [--tape]` | Rules-only ORB on historical SIP; `--tape` fetches the SIP tape of each ambiguous trigger minute not yet cached (D-057) | — |
 | `report daily\|weekly\|evaluation` | Reports | — |
@@ -709,10 +718,11 @@ The JSON is built by `llm/context.py` (D-063). Every free-text field a third par
 - A news item carries `suspicious: true` when it matches injection heuristics.
 - A candidate (in the review, a target) carries `suspicious_news: true` when one of its items does, or its items read together do. Code then puts `suspicious_content` in its risk flags after validation.
 - Names, sources, forms and event names are cleaned the same way and stay outside `untrusted`.
+- `news_unavailable: true` says the news feed was down or its last read failed, so every candidate's empty `news` list means unknown, not quiet. Version 2 of the pack added it (D-069).
 
 ```json
 {
-  "pack_version": 1,
+  "pack_version": 2,
   "pack_id": "vet-20261103-3f9c2a7d41b0e6c5",
   "role": "vet",
   "as_of": "2026-11-03T09:35:05-05:00",
@@ -725,6 +735,7 @@ The JSON is built by `llm/context.py` (D-063). Every free-text field a third par
              "headline_chars": 300, "summary_chars": 600, "filings_lookback_days": 5,
              "filing_forms": ["S-1", "…"]},
   "events_today": [{"time": "14:00", "name": "FOMC decision", "impact": "high"}],
+  "news_unavailable": false,
   "market": {"iwm_gap_pct": 0.1, "qqq_gap_pct": -0.6, "spy_gap_pct": -0.4,
              "regime_as_of": "2026-11-02", "regime_spy_trend": "up", "regime_vol_bucket": "mid"},
   "book_b": {"equity_usd": 996.08, "day_mode": "normal", "day_mode_source": "premarket",

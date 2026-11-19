@@ -171,11 +171,11 @@ Verdicts for symbols that are not among that call's candidates are ignored and l
   - up to 40 candidates, each with gap %, ATR, ADV, recent news, and EDGAR filing flags (D-063). They are drawn from eligible symbols with a price-setting print since 04:00 ET that are above the $5 floor and not gapping at a split ratio: the top 30 gainers, then up to 10 more with news in the last 18 h;
   - the playbook (promoted lessons) and recent performance.
 - **Output:** `PremarketBrief` (`day_mode`, plus assessments with verdicts for the candidates).
-- **If the brief is missing or invalid by the deadline:** `day_mode = normal`, and every 09:35 signal goes through the vet (§5.3).
+- **If the brief is missing or invalid by the deadline:** `day_mode = normal`, and every 09:35 signal goes through the vet (§5.3). No attempt starts with less than the brief's `min_attempt_s` left (from 09:27), and a restart never asks for a brief that already ended (D-069).
 
 ### 5.3 Catalyst vet (09:35:05)
 
-- One batched call covers **every armed long signal that has no pre-market verdict**.
+- One batched call covers **every armed long signal that has no pre-market verdict**. It is made at arming: its signals are pending from then, before any of their triggers can reach Book B. EDGAR gets up to 10 s, so the call starts promptly: first the symbols the 09:00 prefetch didn't cover, then the others again, for any filing since (D-069).
 - **Model:** fast (default `sonnet`, effort `low`). **Timeout:** 60 s.
 - **Input:** OR features (rel_vol, rank, OR range ÷ ATR, OR return), gap, news (last 24 h), filings, and the promoted lessons that match each candidate's features (code pre-computes the matches).
 - **Output:** `VetBatch` (one assessment per candidate).
@@ -200,6 +200,7 @@ Signals that haven't triggered yet keep waiting for their verdict; a late verdic
 - Nothing is journaled; its decision is, once made.
 - It isn't checked against the chase cap again: whether Book B trades mustn't depend on when it happens to be asked.
 - Once its verdict is in, it is priced from the live feed, not from the trigger's own print.
+- At the last entry, every trigger still waiting gets its decision: no deadline is later (D-069).
 **Precedence,** when more than one row applies (the Phase 4 plan's decision 8):
 1. a halt other than `llm_degraded` (`book_halted`);
 2. degradation;

@@ -219,7 +219,9 @@ async def test_restart_rearms_reserves_and_loses(journal: Journal) -> None:
     plan = await eng.rearm(
         await load_signals(journal, DAY),
         {"ARMD": snap(trade("ARMD", "12.73", ts=clock.now()))},
-        with_orders=frozenset({"20261013-ORDR-orb5", "20261013-DONE-orb5"}),
+        with_orders={
+            book: frozenset({"20261013-ORDR-orb5", "20261013-DONE-orb5"}) for book in ("A", "B")
+        },
         decided={"20261013-UNDC-orb5": frozenset({"A"})},
     )
     assert [ev.symbol for ev in plan.rearmed.triggered] == ["ARMD"]
@@ -234,9 +236,33 @@ async def test_restart_rearms_reserves_and_loses(journal: Journal) -> None:
     assert rows["ORDR"].status == "armed"
     late = engine(journal, SimClock(LAST + timedelta(minutes=5)))
     after = await late.rearm(
-        await load_signals(journal, DAY), {}, with_orders=frozenset(),
+        await load_signals(journal, DAY), {}, with_orders={},
         decided={"20261013-UNDC-orb5": frozenset({"A"})},
     )  # fmt: skip
     lost = [(book, s.symbol) for book, s in after.lost]
     assert ("B", "UNDC") in lost
     assert after.reserved == ()
+
+
+async def test_a_restart_owes_a_book_its_decision_when_only_the_other_ordered(
+    journal: Journal,
+) -> None:
+    """D-069: Book B journals nothing while its trigger waits for the vet. If Book A entered
+    the same signal before a crash, Book B's decision is still owed: the restart re-serves the
+    trigger to Book B alone, and never to Book A, which has its order."""
+    clock = SimClock(datetime.combine(DAY, time(9, 37), ET))
+    first = datetime.combine(DAY, time(9, 35, 50), ET)
+    await save_signals(journal, [sig("BOTH", 1, status="triggered", triggered_at=first)])
+    eng = engine(journal, clock)
+    plan = await eng.rearm(
+        await load_signals(journal, DAY), {},
+        with_orders={"A": frozenset({"20261013-BOTH-orb5"})},
+        decided={"20261013-BOTH-orb5": frozenset({"A"})},
+    )  # fmt: skip
+    assert [(book, ev.symbol) for book, ev in plan.reserved] == [("B", "BOTH")]
+    assert drain(eng.queues["A"]) == []
+    undecided = await eng.rearm(
+        await load_signals(journal, DAY), {},
+        with_orders={"A": frozenset({"20261013-BOTH-orb5"})}, decided={},
+    )  # fmt: skip
+    assert [book for book, _ in undecided.reserved] == ["B"]  # A's order stands: never again

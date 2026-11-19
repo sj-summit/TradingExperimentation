@@ -105,21 +105,26 @@ class TriggerEngine:
         signals: Sequence[Signal],
         snapshots: Mapping[str, Snapshot],
         *,
-        with_orders: frozenset[str],
+        with_orders: Mapping[BookName, frozenset[str]],
         decided: Mapping[str, frozenset[BookName]],
     ) -> RestartPlan:
         """After a crash: re-arm what never triggered (and has no orders), and re-serve or close
-        out triggers a book never decided. Never re-triggers a signal that has orders."""
+        out triggers a book never decided. Never re-triggers a signal for a book that has an
+        order for it; a book without one still gets its own decision (D-069: Book B, waiting
+        for its verdict, journals nothing before the crash, while Book A may have entered)."""
         now = self.clock.now()
-        waiting = [s for s in signals if s.status == "armed" and s.id not in with_orders]
+        ordered = frozenset().union(*with_orders.values())
+        waiting = [s for s in signals if s.status == "armed" and s.id not in ordered]
         result = await self.arm(waiting, snapshots)
         reserved: list[tuple[BookName, TriggerEvent]] = []
         lost: list[tuple[BookName, Signal]] = []
         for sig in sorted(signals, key=lambda s: s.rel_vol_rank):
-            if sig.status != "triggered" or sig.id in with_orders:
+            if sig.status != "triggered":
                 continue
             for book in self.books:
                 if book in decided.get(sig.id, frozenset()):
+                    continue
+                if sig.id in with_orders.get(book, frozenset()):
                     continue
                 if now < self.last_entry and sig.trigger_price is not None:
                     ev = TriggerEvent(

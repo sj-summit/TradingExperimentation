@@ -10,6 +10,11 @@
 - **Restartable:** a restart runs the machine again. The scan is loaded, not refetched; armed
   signals are re-armed; positions today's journal explains are adopted; finished EOD steps are
   skipped (A§3, resolution 11).
+- **Book B** (D-068, D-069), when it runs: its jobs (``llm_jobs.BookBJobs``) boot with the day,
+  brief at 09:05 in PREMARKET, vet at arming in OR_SCAN, and review after the shadow job. Its
+  worker parks a trigger whose verdict is pending (``Defer``) and asks it again when the store
+  changes or at its deadline; at the last entry every parked trigger is settled. Nothing of it
+  runs on a Book-A-only day, which stays exactly as it was.
 """
 
 import asyncio
@@ -26,8 +31,10 @@ from typing import Any, Literal
 
 import structlog
 
-from trader.books.base import decided, record_skips, signals_with_orders
+from trader.books.base import Book, Defer, decided, record_skips, signals_with_orders
 from trader.books.baseline import BaselineBook
+from trader.books.llm_filtered import LlmFilteredBook
+from trader.books.verdicts import VerdictStore
 from trader.config import BookName, RiskConfig, Settings
 from trader.core.calendar import TradingCalendar
 from trader.core.clock import ET, Clock, fmt_iso
@@ -55,6 +62,8 @@ from trader.orchestrator.eod import (
     step_done,
 )
 from trader.orchestrator.inputs import LiveInputs
+from trader.orchestrator.llm_jobs import BookBJobs, LlmDeps
+from trader.orchestrator.packs import PackContext
 from trader.orchestrator.plan import DayPlan, day_plan
 from trader.orchestrator.ports import DayMarket, Hub
 from trader.orchestrator.tasks import Heartbeat, StaleWatch, Subscriptions, every
@@ -128,6 +137,8 @@ class DayDeps:
     boot_info: Mapping[str, Any] = field(default_factory=dict)  # config hashes, git SHA
     cadence: Cadence = Cadence()
     capabilities: frozenset[str] = CURRENT  # a replay grants only its recording's (D-055)
+    llm: LlmDeps | None = None  # Book B's runner and packs: required when B is among the brokers
+    book_b_off: str | None = None  # why Book B isn't running today (--no-llm, ...), for the report
 
 
 @dataclass(frozen=True)
@@ -143,11 +154,14 @@ class _Book:
     broker: BrokerAdapter
     records: Records
     service: ExecutionService
-    policy: BaselineBook
+    policy: Book
     equity_sod: Decimal
+    store: VerdictStore | None = None  # Book B's
     worker: "asyncio.Task[None] | None" = None
     busy: bool = False
     not_flat_alerted: bool = False
+    # Book B: triggers waiting for their verdict, by signal id, with their deadlines (D-068)
+    parked: dict[str, tuple[TriggerEvent, datetime]] = field(default_factory=dict)
 
 
 class DayOrchestrator:
@@ -172,6 +186,7 @@ class DayOrchestrator:
         self._skew_alerted = False
         self._failed: list[State] = []  # states after the flatten that raised (D-051)
         self._inputs: LiveInputs | None = None
+        self._jobs: BookBJobs | None = None  # Book B's LLM work, when it runs
         self._heartbeat: Heartbeat | None = None
         self._stale: StaleWatch | None = None
         self._subs = Subscriptions(
@@ -280,6 +295,14 @@ class DayOrchestrator:
             kill_file=d.paths.kill_file,
             hub_stale=lambda: stale.stale,
         )
+        if "B" in d.brokers:
+            await self._boot_book_b()
+        elif d.book_b_off:  # the report, even one regenerated later, says why (D-069)
+            await self._journal.execute(
+                "INSERT INTO day_runs (date, kind, name, at, detail) "
+                "VALUES (?, 'note', 'book_b_off', ?, ?)",
+                (self.day.isoformat(), fmt_iso(self._clock.now()), d.book_b_off),
+            )
         for name in sorted(d.brokers):
             await self._start_book(name)
         self._heartbeat = Heartbeat(
@@ -308,6 +331,8 @@ class DayOrchestrator:
         await d.hub.start()
         if not await d.hub.wait_connected(cadence.connect_timeout_s):
             await self._incident("P2", "stream_unavailable", "market data stream not connected")
+        if self._jobs is not None:  # after the stock stream: it takes the first connection
+            self._jobs.start_news()
         await self._write_boot_record()
 
     async def _clock_skewed(self, *, final: bool) -> bool:
@@ -434,15 +459,31 @@ class DayOrchestrator:
         )
         await service.start()
         assert self._inputs is not None
-        policy = BaselineBook(
-            service=service,
-            inputs=self._inputs,
-            journal=self._journal,
-            clock=self._clock,
-            strategy=d.settings.strategy,
-            risk=d.risk,
-            name=name,
-        )
+        store = self._jobs.store if name == "B" and self._jobs is not None else None
+        if name == "B" and store is None:  # never Book B trading as Book A does
+            raise RuntimeError("Book B has no verdict store")
+        policy: Book
+        if store is not None:  # settings.books.B.policy is llm_filtered (config enforces it)
+            policy = LlmFilteredBook(
+                service=service,
+                inputs=self._inputs,
+                journal=self._journal,
+                clock=self._clock,
+                strategy=d.settings.strategy,
+                risk=d.risk,
+                store=store,
+                name=name,
+            )
+        else:
+            policy = BaselineBook(
+                service=service,
+                inputs=self._inputs,
+                journal=self._journal,
+                clock=self._clock,
+                strategy=d.settings.strategy,
+                risk=d.risk,
+                name=name,
+            )
         self._books[name] = _Book(
             name=name,
             broker=broker,
@@ -450,9 +491,54 @@ class DayOrchestrator:
             service=service,
             policy=policy,
             equity_sod=equity_sod,
+            store=store,
         )
         if unexplained:
             self._spawn(self._flatten_unexplained(self._books[name]))
+
+    async def _boot_book_b(self) -> None:
+        """Book B's jobs, before its book starts: the attempts a crash left open, the LLM
+        setup's fingerprint and the store rebuilt from the journal (D-068, D-069).
+
+        A wiring error (no ``DayDeps.llm``) raises: Book B never trades without its verdicts.
+        A failure while booting doesn't stop Book A's day: it is a P2, Book B is halted until
+        the next open and its jobs are off, while its account is still reconciled, protected
+        and flattened like any book's."""
+        d, plan = self._d, self.plan
+        if d.llm is None:
+            raise ValueError("Book B needs its LLM runner and packs (DayDeps.llm)")
+        jobs = self._jobs = BookBJobs(
+            deps=d.llm,
+            journal=self._journal,
+            clock=self._clock,
+            halts=self._halts,
+            plan=plan,
+            settings=d.settings,
+            risk=d.risk,
+            equity=lambda: self._books["B"].equity_sod if "B" in self._books else None,
+        )
+        try:
+            await jobs.boot(
+                PackContext(
+                    journal=self._journal,
+                    clock=self._clock,
+                    market=d.market,
+                    settings=d.settings,
+                    risk=d.risk,
+                    session=d.calendar.session(self.day),
+                    previous_session=d.calendar.previous_session(self.day),
+                    times=plan.times,
+                    events=d.events,
+                    regime=self._regime,
+                    encode=d.llm.calls.encode,
+                )
+            )
+        except Exception as exc:
+            log.exception("Book B's boot failed")
+            why = f"Book B's boot failed ({type(exc).__name__})"
+            jobs.disable(why)
+            await self._halts.halt("B", "llm_degraded", detail=why, expires_at=plan.next_open)
+            await self._incident("P2", "llm_job_failed", f"{why}: no Book B entries today")
 
     async def _book_fees(
         self, name: BookName, ledger: SettlementLedger, broker: BrokerAdapter
@@ -573,6 +659,7 @@ class DayOrchestrator:
             "books": books,
             "calendar": [s.model_dump(mode="json") for s in sessions],
             "capabilities": sorted(self._d.capabilities),
+            **self._llm_record(),
             **self._d.boot_info,
         }
         path = recorder.dir / BOOT_FILE
@@ -582,10 +669,29 @@ class DayOrchestrator:
         recorder.dir.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(record, indent=1, sort_keys=True, default=str), encoding="utf-8")
 
+    def _llm_record(self) -> dict[str, Any]:
+        """``boot.json``'s LLM setup (D-069): what Book B ran with, or why it didn't run. A
+        Book-A-only day without a reason has none, as before."""
+        d = self._d
+        if self._jobs is not None and d.llm is not None:
+            fingerprint = d.llm.fingerprint
+            return {
+                "llm": {
+                    **d.llm.setup,
+                    "book_b": "on",
+                    "fingerprint": None if fingerprint is None else fingerprint.sha256,
+                }
+            }
+        if d.book_b_off:
+            return {"llm": {"book_b": f"off: {d.book_b_off}"}}
+        return {}
+
     # ---------------------------------------------------------------- PREMARKET
 
     async def _premarket(self) -> None:
         await self._enter("PREMARKET")
+        if self._jobs is not None:  # Book B: the 09:00 scan and the 09:05 brief (never raises)
+            await self._jobs.morning()
         if self._clock.now() >= self.plan.times.flatten:
             return
         await self._clock.sleep_until(self.plan.subscribe_at)
@@ -636,12 +742,14 @@ class DayOrchestrator:
         await self._subscribe()
         snapshots = await self._snapshots(self._subs.armed)
         now = self._clock.now()
+        already: Mapping[str, frozenset[BookName]] = {}
         if result.resumed:
+            already = await decided(self._journal, self.day)
             restart = await self._engine.rearm(
                 list(result.signals),
                 snapshots,
                 with_orders=await signals_with_orders(self._journal, self.day),
-                decided=await decided(self._journal, self.day),
+                decided=already,
             )
             missed = restart.rearmed.missed
             for book, sig in restart.lost:
@@ -656,6 +764,17 @@ class DayOrchestrator:
         else:
             missed = (await self._engine.arm(list(result.signals), snapshots)).missed
         await record_skips(self._journal, sorted(self._books), missed, "missed_at_arm", at=now)
+        if self._jobs is not None:  # before Book B's worker can see a trigger (D-068)
+            gone = {s.id for s in missed}
+            self._jobs.start_vet(
+                [
+                    s
+                    for s in longs
+                    if s.status in ("armed", "triggered")
+                    and s.id not in gone
+                    and "B" not in already.get(s.id, frozenset())
+                ]
+            )
         self._engine_task = self._watch(
             asyncio.create_task(self._engine.run(self._events), name="triggers"),
             "the trigger engine",
@@ -743,31 +862,80 @@ class DayOrchestrator:
         )
 
     async def _work(self, b: _Book, queue: "asyncio.Queue[TriggerEvent]") -> None:
-        """One book's triggers, served in rank order among those waiting (D-043)."""
+        """One book's triggers, served in rank order among those waiting (D-043), one decision
+        at a time. Book B may park a trigger whose verdict is pending (``Defer``, D-068): it is
+        asked again, with ``waited``, once the store changes or at its deadline, in rank order
+        with any new trigger. Book A never parks, so its loop is the one it always was."""
+        seen = b.store.version if b.store is not None else 0
         while True:
-            batch = await next_batch(queue)
+            fresh = await self._next_triggers(b, queue, seen)
+            changed = b.store is not None and b.store.version != seen
+            if b.store is not None:
+                seen = b.store.version  # a change during the decisions wakes the next round
+            now = self._clock.now()
+            again = [ev for ev, until in b.parked.values() if changed or now >= until]
+            batch = [(ev, False) for ev in fresh if ev.signal_id not in b.parked]
+            batch += [(ev, True) for ev in again]
+            batch.sort(key=lambda pair: (pair[0].rank, pair[0].signal_id))
             b.busy = True
             try:
-                for ev in batch:
-                    sig = self._signals.get(ev.signal_id)
-                    if sig is None:
-                        continue
-                    try:
-                        await b.policy.on_trigger(ev, sig)
-                    except Exception as exc:
-                        log.exception("trigger failed", book=b.name, signal=ev.signal_id)
-                        await self._incident(
-                            "P2",
-                            "trigger_failed",
-                            f"Book {b.name} {ev.signal_id}: {type(exc).__name__}",
-                        )
+                for ev, waited in batch:
+                    await self._decide(b, ev, waited=waited)
             finally:
                 b.busy = False
+
+    async def _next_triggers(
+        self, b: _Book, queue: "asyncio.Queue[TriggerEvent]", seen: int
+    ) -> list[TriggerEvent]:
+        """The next triggers to serve. With triggers parked, also wake at the earliest
+        deadline, or once the store's version moves past ``seen``; then possibly with none."""
+        if not b.parked:
+            return await next_batch(queue)
+        wake = min(until for _, until in b.parked.values())
+        waits: list[asyncio.Future[Any]] = [
+            asyncio.ensure_future(next_batch(queue)),
+            asyncio.ensure_future(self._clock.sleep_until(wake)),
+        ]
+        if b.store is not None:
+            waits.append(asyncio.ensure_future(b.store.wait_for_change(seen)))
+        try:
+            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for w in waits:
+                w.cancel()  # a queue.get() cancelled before it took an item loses none
+            await asyncio.gather(*waits, return_exceptions=True)
+        got = waits[0]
+        return list(got.result()) if got.done() and not got.cancelled() else []
+
+    async def _decide(self, b: _Book, ev: TriggerEvent, *, waited: bool) -> None:
+        """Ask the book about one trigger; park it if it defers, forget it once decided."""
+        sig = self._signals.get(ev.signal_id)
+        if sig is None:
+            b.parked.pop(ev.signal_id, None)
+            return
+        try:
+            outcome = await b.policy.on_trigger(ev, sig, waited=waited)
+        except Exception as exc:
+            b.parked.pop(ev.signal_id, None)
+            log.exception("trigger failed", book=b.name, signal=ev.signal_id)
+            await self._incident(
+                "P2", "trigger_failed", f"Book {b.name} {ev.signal_id}: {type(exc).__name__}"
+            )
+            return
+        if isinstance(outcome, Defer):
+            b.parked[ev.signal_id] = (ev, outcome.until)
+        else:
+            b.parked.pop(ev.signal_id, None)
 
     async def _stop_trading(self) -> None:
         """Stop the trigger engine and the book workers, never in the middle of a decision.
         One that already died was reported by ``_watch``; its error isn't raised again here,
-        so the day still falls through to FLATTEN (resolution 12)."""
+        so the day still falls through to FLATTEN (resolution 12).
+
+        Then every trigger Book B still has parked is asked once more. At the last entry
+        each one's deadline has passed (none is later, D-068), so each gets its decision. On
+        an earlier stop (the day failed) one still pending stays undecided: EOD gives it
+        ``restart_lost``."""
         if self._engine_task is not None:
             self._engine_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -783,6 +951,12 @@ class DayOrchestrator:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await b.worker
             b.worker = None
+            for ev, _ in sorted(b.parked.values(), key=lambda p: (p[0].rank, p[0].signal_id)):
+                await self._decide(b, ev, waited=True)
+            if b.parked:
+                log.warning("triggers left waiting at the stop", book=b.name,
+                            signals=sorted(b.parked))  # fmt: skip
+                b.parked.clear()
 
     def _drop_trigger_feed(self) -> None:
         """Detach the trigger engine's queue from the hub, which would otherwise keep filling
@@ -941,9 +1115,21 @@ class DayOrchestrator:
             await self._clock.sleep_until(self._clock.now() + EOD_RETRY)
 
     async def _review(self) -> None:
-        """Shadow outcomes at close + 12 min (S§7.2). Claude's review joins here in Phase 5."""
+        """Shadow outcomes at close + 12 min (S§7.2), then, when Book B runs, Claude's review at
+        close + 15 min (S§6.1; D-069). The review runs even if the shadow job failed."""
         await self._enter("REVIEW")
         await self._clock.sleep_until(self.plan.shadow_at)
+        failed: Exception | None = None
+        try:
+            await self._shadow()
+        except Exception as exc:  # not a cancellation: a shutdown never waits for the review
+            failed = exc
+        if self._jobs is not None:
+            await self._jobs.review()  # never raises
+        if failed is not None:
+            raise failed
+
+    async def _shadow(self) -> None:
         if await step_done(self._journal, self.day, "shadow"):
             return
         strategy = self._d.settings.strategy
@@ -991,6 +1177,9 @@ class DayOrchestrator:
             mode=d.settings.mode,
             session=d.calendar.session(self.day),
             now=self._clock.now(),
+            book_b_off=d.book_b_off,
+            max_calls=d.settings.llm.max_calls_per_day,
+            degrade_after=d.risk.llm_failures_degrade_after,
         )
         md, _ = write_daily(report, d.paths.reports_dir)
         if d.settings.notify.daily_summary:
@@ -1059,6 +1248,11 @@ class DayOrchestrator:
         )
 
     async def _shutdown(self) -> None:
+        if self._jobs is not None:
+            try:
+                await self._jobs.close()  # a vet still out is abandoned; the news stops
+            except Exception:
+                log.exception("Book B's jobs did not close cleanly")
         for task in self._tasks:
             task.cancel()
         for task in self._tasks:
@@ -1083,7 +1277,7 @@ class DayOrchestrator:
         if not d.calendar.is_trading_day(self.day):
             return [f"{self.day} is not a trading day: run-day would exit"]
         plan = day_plan(d.calendar, self.day, d.settings, d.risk)
-        lines = plan.lines()
+        lines = plan.lines(book_b="B" in d.brokers)
         skew = await self._measure_skew()
         verdict = "ok" if abs(skew) <= MAX_CLOCK_SKEW_S else "TOO FAR: nothing would be armed"
         lines.append(f"clock skew {skew:+.2f} s ({verdict})")

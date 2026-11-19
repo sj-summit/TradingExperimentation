@@ -139,6 +139,9 @@ class SimBroker:
         self._pending: list[_Pending] = []
         self._ids = 0
         self._executions = 0
+        # Ids are unique across books, as Alpaca's are: two books' orders and fills share
+        # one journal. Book A keeps the plain prefix its golden days were recorded with (D-069).
+        self._prefix = "sim" if book == "A" else f"sim-{book.lower()}"
         # Faults, each consumed by the next matching call.
         self._submit_fault: tuple[SubmitFault, str, timedelta] | None = None
         self._partial_next: int | None = None
@@ -625,7 +628,7 @@ class SimBroker:
         self._emit(
             "fill" if order.remaining == 0 else "partial_fill",
             order,
-            execution_id=f"sim-exec-{self._executions}",
+            execution_id=f"{self._prefix}-exec-{self._executions}",
             qty=qty,
             price=price,
             position_qty=held,
@@ -723,7 +726,7 @@ class SimBroker:
 
     def _new_id(self, prefix: str) -> str:
         self._ids += 1
-        return f"sim-{prefix}-{self._ids}"
+        return f"{self._prefix}-{prefix}-{self._ids}"
 
     def _snapshot(self, order: _SimOrder) -> Order:
         return Order(

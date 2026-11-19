@@ -83,7 +83,7 @@ from trader.memory.trades import TradeRow
 Role = Literal["premarket", "vet", "review"]
 Json = dict[str, Any]
 
-PACK_VERSION = 1
+PACK_VERSION = 2  # 2: news_unavailable (D-069)
 MAX_PACK_BYTES = 300_000  # A§7.2; LlmCalls.encode passes llm.max_pack_bytes (D-064)
 ID_HEX = 16  # hex digits of the pack's SHA-256 in its id: 64 bits no answer can guess
 # Characters read per news field. Alpaca's summaries run a few hundred; a longer field is
@@ -163,7 +163,9 @@ class BookB:
 
 @dataclass(frozen=True)
 class Common:
-    """What every pack carries. ``experiment`` comes from ``experiment_section``."""
+    """What every pack carries. ``experiment`` comes from ``experiment_section``.
+    ``news_available`` False: the engine couldn't read the news, so an empty list is unknown
+    (``news_unavailable`` in the pack, D-069), as ``filings_unavailable`` is for EDGAR."""
 
     session: Session
     times: DayTimes
@@ -171,6 +173,7 @@ class Common:
     market: Market
     book_b: BookB
     experiment: Mapping[str, Any]
+    news_available: bool = True
 
 
 @dataclass(frozen=True)
@@ -571,6 +574,7 @@ def _pack(
             for e in sorted(common.events, key=lambda e: (e.at(), e.name))
             if e.date == session.date
         ],
+        "news_unavailable": not common.news_available,
         "market": _market(common.market),
         "book_b": _book_b(common.book_b, with_mode=role != "premarket"),
         "playbook": [],
@@ -974,6 +978,23 @@ def encode(pack: Pack, *, max_bytes: int = MAX_PACK_BYTES) -> EncodedPack:
         kept=tuple(str(item[pack.key]) for item in items),
         flagged=frozenset(str(item[pack.key]) for item in items if item.get("suspicious_news")),
         trimmed=trimmed,
+    )
+
+
+def decode(data: bytes, trimmed: Trimmed | None = None) -> EncodedPack:
+    """An encoded pack read back from its bytes, as a replay serves a recorded one (D-069): its
+    id, the members it sent and the flagged ones, exactly as ``encode`` set them."""
+    body = json.loads(data)
+    review = body["role"] == "review"
+    ranked, key = ("review_targets", "signal_id") if review else ("candidates", "symbol")
+    items = body[ranked]
+    return EncodedPack(
+        pack_id=str(body["pack_id"]),
+        data=data,
+        sha256=hashlib.sha256(data).hexdigest(),
+        kept=tuple(str(item[key]) for item in items),
+        flagged=frozenset(str(item[key]) for item in items if item.get("suspicious_news")),
+        trimmed=trimmed or Trimmed(),
     )
 
 

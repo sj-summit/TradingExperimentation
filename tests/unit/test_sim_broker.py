@@ -94,6 +94,23 @@ async def test_marketable_entry_fills_at_ask_plus_slippage_and_arms_its_leg(
     assert kinds(await drain(sim)) == [("new", "limit"), ("fill", "limit"), ("new", "stop")]
 
 
+async def test_each_book_s_broker_has_its_own_ids(clock: SimClock) -> None:
+    """D-069: the fills table keys on the execution id, so two books' fills must not share one.
+    Book A keeps the plain ``sim`` prefix its golden days were recorded with."""
+    seen: dict[str, tuple[str, list[str]]] = {}
+    for book in ("A", "B"):
+        sim = SimBroker(clock=clock, book=book)
+        sim.feed(quote("12.30", "12.32"))
+        accepted = await sim.submit_entry_oto(intent())
+        fills = [e.execution_id or "" for e in await drain(sim)
+                 if isinstance(e, TradeUpdate) and e.event == "fill"]  # fmt: skip
+        seen[book] = (accepted.id, fills)
+    (a_order, a_fills), (b_order, b_fills) = seen["A"], seen["B"]
+    assert (a_fills, b_fills) == (["sim-exec-1"], ["sim-b-exec-1"])
+    assert a_order.startswith("sim-ord-")
+    assert b_order == a_order.replace("sim-", "sim-b-", 1)
+
+
 async def test_leg_can_stay_held_after_the_fill(clock: SimClock) -> None:
     sim = SimBroker(clock=clock, leg_status_after_fill="held")
     sim.feed(quote("12.30", "12.32"))

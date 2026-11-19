@@ -1,6 +1,7 @@
 """Recording and replaying a day (P3.8a; DECISIONS D-047)."""
 
 import asyncio
+from contextlib import closing
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -25,7 +26,8 @@ from trader.execution.broker import OrderRejected
 from trader.execution.recording import RecordingBroker
 from trader.execution.replay import ReplayBroker
 from trader.execution.sim_broker import SimBroker
-from trader.memory.journal import Journal
+from trader.memory.journal import Journal, open_database
+from trader.orchestrator.replay import comparable
 from trader.orchestrator.simdrive import StuckError, drive
 
 D = Decimal
@@ -324,6 +326,39 @@ def test_broker_recordings_are_one_file_per_book(tmp_path: Path) -> None:
     rec.close()
     assert broker_file("A") == "broker-A.jsonl.gz"
     assert list(read_jsonl(rec.dir / broker_file("A"))) == [{"method": "positions", "result": []}]
+
+
+def test_a_replay_compares_book_b_s_rows_whole_and_only_when_the_day_has_them(
+    tmp_path: Path,
+) -> None:
+    """D-069: a replayed Book B day must reproduce each column that can change a trade. An
+    A-only day compares no LLM kinds, and a smoke call is never part of the day."""
+    day = date(2026, 10, 13)
+    with closing(open_database(tmp_path / "trader.db")) as conn:
+        assert set(comparable(conn, day)) == {"signal", "decision", "trade"}
+        conn.executescript(
+            "INSERT INTO signals (id, date, symbol) VALUES ('20261013-XYZ-orb5', '2026-10-13', "
+            "'XYZ');"
+            "INSERT INTO decisions (signal_id, book, take, reason_code, llm_call_id) VALUES "
+            "('20261013-XYZ-orb5', 'B', 1, 'taken', '20261013-vet-01-2');"
+            "INSERT INTO llm_calls (id, date, role, ok, failure, final, pack_id, purpose) VALUES "
+            "('20261013-vet-01-1', '2026-10-13', 'vet', 0, 'invalid_json', 0, 'p1', 'trading'),"
+            "('20261013-vet-01-2', '2026-10-13', 'vet', 1, NULL, 1, 'p1', 'trading'),"
+            "('20261013-smoke-vet-01-1', '2026-10-13', 'vet', 1, NULL, 1, 'p9', 'smoke');"
+            "INSERT INTO day_modes (date, book, mode, source, multiplier, llm_call_id) VALUES "
+            "('2026-10-13', 'B', 'reduced', 'premarket', '0.5', '20261013-premarket-01-1');"
+            "INSERT INTO verdicts (date, symbol, source, verdict, confidence, signal_id, "
+            "llm_call_id) VALUES ('2026-10-13', 'XYZ', 'vet', 'allow', 0.7, "
+            "'20261013-XYZ-orb5', '20261013-vet-01-2');"
+        )
+        rows = comparable(conn, day)
+    assert rows["b_call"] == ["20261013-XYZ-orb5 20261013-vet-01-2"]
+    assert rows["day_mode"] == ["B reduced premarket 0.5 20261013-premarket-01-1"]
+    assert rows["verdict"] == ["XYZ vet allow 0.7 20261013-XYZ-orb5 20261013-vet-01-2"]
+    assert rows["llm_call"] == [
+        "20261013-vet-01-1 vet 0 invalid_json 0 p1",
+        "20261013-vet-01-2 vet 1 None 1 p1",
+    ]
 
 
 async def test_fee_activities_are_recorded_and_replayed() -> None:

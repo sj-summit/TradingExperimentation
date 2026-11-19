@@ -361,7 +361,7 @@ def test_the_fingerprint_follows_the_runners_texts(
     before = epoch_fingerprint(settings, PROMPTS)
     monkeypatch.setattr("trader.llm.roles.COPY_PACK_ID", "Copy the pack_id.")
     monkeypatch.setattr(client, "REPAIR_NOTE", "Try again:")
-    monkeypatch.setattr(epoch, "PACK_VERSION", 2)
+    monkeypatch.setattr(epoch, "PACK_VERSION", epoch.PACK_VERSION + 1)
     after = epoch_fingerprint(settings, PROMPTS)
     assert list(epoch.changes(before.parts, after.parts)) == [
         "pack_version",

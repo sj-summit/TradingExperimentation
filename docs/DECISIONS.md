@@ -2409,6 +2409,154 @@ Append-only. Each entry records context, the decision, its consequences, and sou
 
 ---
 
+## D-069 — P4.8: Book B in the day: its jobs and deadlines, a worker that parks waiting triggers, `--books A,B` and `--no-llm`, recorded and replayed LLM work, and the report
+- **Date:** 2026-11-19 · **Status:** Accepted (the Phase 4 plan, P4.8 and decisions 5, 8, 9 and 10; the "For P4.8" notes of D-063, D-064, D-065, D-067 and D-068).
+- **The timeline** (`plan.py`). Book B's morning times are fixed clock times: the pre-market scan at 09:00, the brief at 09:05, its deadline 09:28. The review is at 16:15 and its cutoff a minute before the report (16:29). Both move with an early close (13:15 and 13:29). `--dry-run` shows them when Book B runs.
+- **Book B's jobs** (`orchestrator/llm_jobs.py`, `BookBJobs`). None of them raises into the day: Book A never depends on the LLM (S§5.4).
+  - **Boot**, before Book B's book starts:
+    1. `close_abandoned()`: the attempts a crash left open;
+    2. `note_fingerprint()`: a P3 `llm_fingerprint_changed` when the setup changed (D-065);
+    3. the store rebuilt from the journal (`VerdictStore.load`);
+    4. the degradation check, for a restart that came after a failure but before its halt.
+
+    **A boot that fails** is a P2 `llm_job_failed`. Book B is halted `llm_degraded` until the next open and its jobs are off (`disable`), while its account is still reconciled, protected and flattened. Only a wiring error (no `DayDeps.llm`) raises.
+  - **The news feed** starts in the background once the market-data stream is connected (`start_news`): a day of backfill (the vet's 24 h window is the longer one), then the stream.
+    - So the backfill never delays the books' boot, and the stock stream takes the first connection if the plan allows only one (Q2).
+    - A start that fails is tried again every minute, with one P3 `news_unavailable`.
+  - **Morning** (PREMARKET, before the 09:29 subscription):
+    - The brief isn't asked again once today's day mode is settled: the brief's, or the default a failed or missed brief stored (`VerdictStore.mode_known`, new). So a restart never pays for a second brief.
+    - No attempt starts after 09:27 (the deadline less the brief's `min_attempt_s`). From then on, `brief_missed()` stores the default day mode and raises a P3 `brief_missed`.
+    - **The 09:00 scan** (`LivePacks.premarket_scan`):
+      - the day's eligible universe, with one snapshot per symbol on the live feed;
+      - the symbols with news in the brief's 18 h window;
+      - `select_premarket`;
+      - EDGAR prefetched for the picks, until 09:05. On a late start EDGAR gets 30 s, but never past 09:27.
+
+      A scan that fails is a P3 `premarket_scan_failed`. The brief then runs without candidates: it still sets the day mode.
+    - **The brief** at 09:05: its pack as of then, `run("premarket", deadline=09:28, persist=store.persist_brief)`, then `brief_done(result)`.
+    - **A job that raises** is a P2 `llm_job_failed`, with the default day mode.
+  - **The vet, at arming** (OR_SCAN, after `arm`/`rearm` and the `missed_at_arm` skips, before Book B's worker starts):
+    - `start_vet` takes the armed and triggered longs. It leaves out those missed at arming and, after a restart, those Book B already decided.
+    - `vet_targets` and `expect_vet` mark the signals pending at once. The call then runs as a task:
+      1. the pack, with EDGAR for up to `VET_EDGAR_S` (10 s): first the symbols never answered, then again those answered earlier, which keep their answer if time runs out. So a filing accepted since 09:00 shows up whenever time allows;
+      2. `vet_started`;
+      3. `run("vet", deadline=last entry, persist=store.persist_vet)`;
+      4. `vet_done(job, result, sent=pack.kept)`.
+    - **A cancellation** is `vet_abandoned`. **A job that fails** is a P2 `llm_job_failed`, and `vet_done` with a failed result for the job's own symbols. So they are `llm_unavailable` at once ("the vet failed: internal_error") instead of waiting out their deadline.
+    - **The vet runs as S§5.3 says**, whatever the day mode: verdicts are measurement data even on a `no_trade` day.
+  - **The review** (REVIEW, after the shadow job, even if that failed; not after a cancellation):
+    - at 16:15, with the report − 1 min as the call's deadline; no attempt starts after the cutoff less the review's `min_attempt_s` (16:27);
+    - once a day: a `review` step in `day_runs`, written in the transaction that stores a good answer, so a crash can't make a rerun ask again. A failure, `no time` or `nothing to review` is marked after;
+    - its failed attempts don't count toward degradation: the day's entries are over, and the P2 would only be noise;
+    - only with `ReviewWork` (see below).
+  - **After each call:**
+    - a P3 `llm_call_failed` for each failed attempt, from its row;
+    - a P2 `llm_refused` instead for a refusal that repeats until a human acts (`PERSISTENT_REFUSALS`: a dirty sandbox, a missing prompt, a pack over its cap; D-064);
+    - a P3 `llm_call_refused` for a call refused before any attempt (no time, or the day's cap);
+    - then degradation: once the day's failed attempts reach `llm_failures_degrade_after`, a session halt `llm_degraded` for Book B until the next open, and one P2 `llm_degraded`. Neither repeats, after a restart either: the halt in force is checked first. Book B doesn't wait for the halt: it re-reads the count before every decision (D-068).
+- **Book B's worker** (`day.py`):
+  - **Parking:** a `Defer` parks the trigger, with its deadline. The worker then waits for the first of three things: a new trigger, the earliest deadline, or a change in the store (`wait_for_change`). Then it asks every parked trigger again with `waited=True`, together with the new ones, in rank order, one decision at a time. A change during a round wakes the next one.
+  - **Book A** never defers, so its loop is the one it always was. Its golden day and G3's replay pass byte-identical.
+  - **At the stop** (`_stop_trading`), every trigger still parked is asked once more. At the last entry every deadline has passed, since none is later (D-068), so each gets its decision; a test shows the stop settling them in rank order. A stop before then (the day failed) leaves one still pending undecided, and EOD gives it `restart_lost`.
+  - **A restart re-serves per book** (`signals_with_orders`, `rearm(with_orders=...)`): a triggered signal goes back to each book that hasn't decided it and has no order of its own for it. The first draft skipped a signal any book had ordered, so a Book B trigger parked when the engine died was `restart_lost` whenever Book A had entered it.
+- **`run-day`** (`live.py`, `cli.py`):
+  - **`--books`** takes A, B or A,B.
+  - **Book B is off for the day** (plan decision 9) with `--no-llm`, `llm.enabled: false` or `books.B.enabled: false`. Book A runs alone, and the echo, `boot.json` (`"llm": {"book_b": "off: --no-llm"}`), a `day_runs` note and the report say why. Book B alone and off is refused, by `--dry-run` too.
+  - **A missing CLI or credential** (`LlmUnavailableError`) also leaves Book B off, with a P2 `llm_unavailable`: Book A keeps its day. `--dry-run` says whether Book B's LLM is ready.
+  - **A book kept off** is reconciled, protected and flattened by nobody. So a paper day first reads its account, read-only, and anything held or working there is a P2 `idle_book_not_flat` naming `trader flatten --book X`.
+  - **Paper:**
+    - the CLI's `--version` read once (not a model call; it goes into every `llm_calls` row and `boot.json`). One newer than `llm.max_tested_cli_version` is a P3 `llm_cli_untested`: the binary is shared with the interactive CLI, which updates itself;
+    - `ClaudeCliTransport` with `kill_grace_s`, wrapped by `RecordingTransport`;
+    - `NewsHub` on the market-data keys, its sleep on the injected clock and every article recorded;
+    - `EdgarClient`. Without a usable user agent there is none, with a P3 `edgar_unavailable`, and every pack's filings are unknown;
+    - the packs built live and recorded.
+  - **`--sim`:** a scripted model (`fake.valid`: every candidate neutral) and an environment with no credential. The sandbox and artifacts are the simulated day's own, `runtime/sim/<date>/llm_sandbox` and `llm/`, since ids repeat (D-064).
+  - **`boot.json`** gains `"llm"`:
+    - the transport, the provider, the CLI's version, `schema_mode`, `tools_flag`, `safe_mode`;
+    - each role's model and effort;
+    - whether EDGAR is on, and the fingerprint.
+
+    A Book-A-only day without a reason has no such key, as before.
+- **News and EDGAR** (`orchestrator/evidence.py`, `EvidenceDesk`):
+  - **News** is a read of the `news` table: no budget.
+    - `news_ok` says whether the read can be trusted. A failed read, or a feed that isn't running (`NewsHub.mode` neither `stream` nor `poll`), is unknown news.
+    - The packs then say `news_unavailable: true` (`PACK_VERSION` 2), and each prompt says an empty `news` list then means unknown, not none.
+    - The first draft read an outage as "no news", which the brief's prompt treats as a pump sign: the mix-up D-063 rated major for filings.
+  - **EDGAR** is asked one symbol at a time, in rank order, until its budget ends on the injected clock, raced against `clock.sleep_until`. `asyncio.wait_for` would have used the loop's time, not the SimClock's.
+    - **Answers are kept for the day.** Only an answer gives a list; anything else is None, unknown (D-063). The vet refreshes them, as above.
+    - **A 403 or 429** (`EdgarBlockedError`) stops the rest of that budget. Any other failure loses only its own symbol.
+  - **EDGAR's ticker cache** (an older bug): a torn file failed every EDGAR call until someone deleted it. A crash could tear it, or `--sim` beside a paper day, since both use `runtime/edgar/`. It is now written beside and moved into place, and one that won't read is fetched again.
+- **Packs** (`orchestrator/packs.py`):
+  - **`LivePacks`** builds the brief's and the vet's packs from the day.
+    - **The index ETFs' gaps** come from one snapshot of the regime symbols. Each is measured against the daily bar dated the previous session: the snapshot's `dailyBar` before the open, `prevDailyBar` after it (D-024). The first draft always used `prevDailyBar`, so the 09:05 brief measured from the close two sessions back. The ETFs' previous close comes from the snapshot, because the universe's SIP previous close covers listed stocks, not SPY, QQQ and IWM. A gap is unknown when the snapshot fails.
+    - **Book B's equity and recent R:** its start-of-day E, and the R of its latest 10 trades before today.
+    - **Building runs on a thread** beside a threaded journal, as D-062 asked. Beside an inline one (simdrive) it runs inline, as the runner's file work does (D-064).
+  - **`RecordingPacks`** records every pack a job built, sent or not, with when its build began and ended. It also records a build that failed, and, for the vet, the symbols it was asked to judge.
+  - **`ReplayPacks`** serves them back by role and order, each at the time it was ready live. So a replayed vet starts when the live one did, and its triggers' deadlines match.
+    - A recorded failure fails again (`RecordedBuildError`).
+    - A pack the recording lacks is a divergence, and so is a vet asked to judge other symbols than the recorded one.
+- **Recording and replay** (`llm/replay.py`, `orchestrator/replay.py`; decision 10, as D-063 amended it):
+  - **`llm.jsonl.gz`** holds the packs and each attempt's answer: exit code, stdout, stderr's tail, timings, how a late child was stopped, or the error that kept it from starting. Each record is flushed at once (`Recorder.append(..., flush=True)`, new).
+    - Stdout and stderr are kept as text with `surrogateescape`, so any bytes come back exactly.
+    - The credential is redacted, as in the artifacts (`redactor`). Where the runner cut stdout or stderr, the record first drops `CUT_MARGIN` characters at the cut, as the artifacts do (D-064). The first draft didn't, and a tail that began inside the token kept most of it.
+  - **`trader replay`** runs Book B when `boot.json` lists it:
+    - `ReplayPacks` and `ReplayTransport` answer each attempt at max(now, its recorded end);
+    - the runner runs with no credential and no executable, in the replay's own `llm_sandbox` and `llm` folders;
+    - so the replay needs no news, EDGAR or `claude`.
+
+    An attempt matches by role and order, and is checked by its pack's `pack_id` and whether it is a repair. Any mismatch, and an attempt the recording lacks, is a divergence. Recorded records left unused are a divergence too on a single-run day. After a restart (`boot-2.json`) they are only a note: the restart appends its own, and the replay covers only the first run.
+  - **`comparable()`** adds Book B's decisions' `llm_call_id`s, its day mode, the verdicts and the trading LLM calls, only when there are any. So a Book-A-only day's comparison, G3's included, is unchanged.
+  - **The reason Book B was off** reaches the replay's day from `boot.json`.
+  - **A test records an A+B day** in which a trigger waits 55 s for the vet, then replays it with no divergence or difference.
+  - **`context.decode()`**, new, reads an encoded pack back from its bytes, with its trims.
+- **The report** (`reports/daily.py`):
+  - **The header** has the day's attempts (ok, failed, abandoned), the budget used against `max_calls_per_day` (CLI runs: a refusal isn't one), the failed attempts against `llm_failures_degrade_after`, and Book B's day mode. A day it was kept off says why, read from the day's `day_runs` note, so `trader report daily` regenerates it.
+  - **A "B verdict" column:** the verdict Book B's decision rests on, else the day's latest.
+  - **An LLM-calls table.**
+  - **"Claude":** the day mode's reason and the review's summary, and a table of the target reviews.
+  - **The model's text** is escaped:
+    - HTML escapes every cell, as before;
+    - in Markdown the text sits on one line in a code span, its fence longer than any run of backticks in it (`ModelText`). So it opens no link, image, HTML or emphasis. That includes a bare URL, which GFM and VS Code's preview would autolink; the first draft's backslash escaping missed those. In a table its pipes are escaped too.
+- **Found while building it: the simulated brokers numbered orders and fills the same way for both books** (`sim-ord-1`, `sim-exec-1`). With two books on one journal, Book B's fills went to Book A's orders: the first A+B day ended with both books' cash wrong and a P1. Run-day `--sim --books A,B` would have done the same. Ids now carry the book (`sim-b-ord-1`). Book A keeps the plain prefix its golden days were recorded with, so they pass unchanged. Alpaca's own ids are unique.
+- **Config:** a role's `max_turns` must be 2 or more (D-067: the answer arrives as a tool call).
+- **The review's content is P4.10's.** P4.8 runs the job (its time, cutoff, once-a-day marker and failure record) through `ports.ReviewWork`: `pack()`, `persist()` and `not_reviewed()`. P4.10's `memory/reviews.py` provides it.
+  - **Until then** run-day, `--sim` and replay pass none, and no review call is made.
+  - **When it lands,** a replay of a day recorded before it would run a review it never made. So P4.10 adds a capability (D-055) for it.
+- **Known limitations:**
+  - **A refusal made before the transport** leaves no attempt record: a dirty sandbox, a missing prompt, or an input artifact that failed. The replay's clean sandbox then calls the transport and reports a divergence for a day the engine handled correctly. Each such refusal is already a P2 `llm_refused`, so recording them waits until one is seen.
+  - **A torn gzip member** (older, `recorder.py`): after a crash, a false gzip header inside the torn member loses every record after it. A probe recovered 870,712 of 875,000 records. The odds are about 1% for the LLM file, and higher for the stream file.
+- **For P4.9:**
+  - `DayRun` takes `books=("A", "B")`, `llm_script=`, `verdicts`, `day_mode` and `llm_delay`, with `FakeNews` and `FakeEdgar`, and records Book B's LLM work when it records.
+  - The synthetic day still has no pre-market prints (its snapshots start at 09:30), so its brief has no candidates. P4.9 adds pre-market prints, news and filings, and the A+B golden.
+  - **Restart tests:**
+    - A restart after the vet must not vet again a signal Book B already decided. No test covers it yet: a mutation that vetted them again survived.
+    - The restart test with Book A entering (the review's major) checks only that Book B's trigger is no longer `restart_lost`. The synthetic tape's last print before its 09:36:30 restart is 35 s old, so a re-served trigger can end as `risk_gate:R-016` (stale data). To test the entry itself, the fixture needs prints through the restart.
+- **Spec updates:**
+  - ARCHITECTURE §2, §3, §4.2, §4.7, §4.9, §4.10, §4.11 and §8;
+  - STRATEGY §5.2, §5.3 and §5.4;
+  - RISK §11's new incident codes;
+  - the three prompts (`news_unavailable`);
+  - CLAUDE.md's Commands (`--no-llm`, approved with the Phase 4 plan);
+  - PLAN; HANDOFF.
+- **Review:** two adversarial reviewers, then a mutation run.
+  - **The day and its jobs:** 1 major, 2 minors and 2 nits, all fixed:
+    - the restart's re-serving (major);
+    - a cancelled shadow job no longer runs the review;
+    - the news feed no longer delays the books' boot;
+    - the review's once-a-day marker shares its answer's transaction;
+    - the review no longer counts toward degradation.
+  - **Wiring, replay and security:** 3 majors, 6 minors and 8 nits. All are fixed except the two known limitations above.
+    - **Majors:** the brief's index gaps, the credential in a cut tail, and a Book B boot failure that stopped Book A's day.
+    - **Minors:** news before the stock stream, news unknown read as none, a stale EDGAR answer at the vet, bare URLs in the Markdown report, and a book kept off left unwatched.
+    - **Nits:** the report and the replay losing why Book B was off; replay misses that weren't divergences, and `comparable` ignoring the decisions' calls; the replay's vet check, which would have misfired with more than 25 candidates; EDGAR off with no incident; the ticker cache; `--books B --dry-run`'s message; and the CLI's version never checked.
+  - **Mutations:** 210 mutants of P4.8's code, each run in an isolated copy of the repository, and 204 caught.
+    - The first run left 60 alive. Tests were added or sharpened until 54 of them fail one: 47 against the whole suite, and the last 7 against their own tests.
+    - Of the other 6, five change nothing observable. One of them became equivalent only once the report read the day's note. The sixth waits for P4.9's restart tests (above).
+    - Three more mutants check the fixes for the review's findings: a shutdown during the shadow job, the review's degradation, and unused recorded answers. All three are caught.
+- **Tests:** 1,504 pass, up from 1,383. Ruff, its formatter and mypy are clean. Book A's golden day and G3's replay pass unchanged.
+
+---
+
 ## Open questions to resolve during the build (record answers as new entries)
 
 - **Q1 (P1.2):** Is Alpaca's `movers` (top market movers) endpoint available on the free plan? If not, use the IEX snapshot gap scan. **Partly answered: D-024** (the 09:00 scan uses snapshots either way); doctor's `data.movers` check records availability once keys exist. **Answered by doctor on 2026-10-10: available** (`data.movers` PASS; the screener returned 10 gainers).

@@ -309,10 +309,11 @@ def test_the_frame_is_shared_and_ordered() -> None:
     body = decoded(encode(pack))
     assert list(body) == [
         "pack_version", "pack_id", "role", "as_of", "session", "experiment", "limits",
-        "events_today", "market", "book_b", "playbook", "candidates_omitted", "candidates",
-        "instructions_note",
+        "events_today", "news_unavailable", "market", "book_b", "playbook",
+        "candidates_omitted", "candidates", "instructions_note",
     ]  # fmt: skip
-    assert body["pack_version"] == 1
+    assert body["pack_version"] == 2
+    assert body["news_unavailable"] is False
     assert body["role"] == "premarket"
     assert body["as_of"] == "2026-11-03T09:05:00-05:00"
     assert body["session"] == {
@@ -970,7 +971,7 @@ def test_review_sections() -> None:
         )
     )
     body = decoded(encode(pack))
-    assert list(body)[11:] == [
+    assert list(body)[12:] == [
         "books", "signals", "signals_omitted", "incidents", "incidents_omitted", "stats",
         "lessons", "lessons_omitted", "dsl", "history", "targets_omitted", "review_targets",
         "instructions_note",

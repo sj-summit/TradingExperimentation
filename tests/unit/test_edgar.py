@@ -1,3 +1,4 @@
+import json
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -129,6 +130,24 @@ async def test_ticker_map_is_cached_on_disk_for_a_day(
     async with make_client(tmp_path, clock) as client:
         await client.ciks("AAPL")
     assert sec.routes[0].call_count == 2
+
+
+@pytest.mark.parametrize(
+    "torn", ['{"fetched": "2026-10-09", "tick', "[]", '{"fetched": "2026-10-09"}']
+)
+async def test_a_torn_ticker_cache_is_fetched_again_and_replaced_whole(
+    tmp_path: Path, sec: respx.MockRouter, torn: str
+) -> None:
+    """D-069: a cache torn by a crash, or by two runs at once, is fetched again, not fatal; the
+    new one is written beside it and moved into place, so no reader sees half a file."""
+    cache = tmp_path / "edgar" / "company_tickers.json"
+    cache.parent.mkdir(parents=True)
+    cache.write_text(torn, encoding="utf-8")
+    async with make_client(tmp_path, SimClock(NOW)) as client:
+        assert await client.ciks("AAPL") == ["0000320193"]
+    assert sec.routes[0].call_count == 1
+    assert json.loads(cache.read_text(encoding="utf-8"))["fetched"] == "2026-10-09"
+    assert [p.name for p in cache.parent.iterdir()] == ["company_tickers.json"]
 
 
 async def test_class_shares_use_edgars_hyphen(tmp_path: Path, sec: respx.MockRouter) -> None:

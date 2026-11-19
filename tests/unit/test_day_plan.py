@@ -46,6 +46,53 @@ def test_an_early_close_moves_everything_after_the_open() -> None:
     assert "  12:55:00  flatten" in plan.lines()
 
 
+def test_book_b_times_on_a_normal_session() -> None:
+    """P4.8: the 09:00 scan, the 09:05 brief and its 09:28 deadline, the 16:15 review and its
+    cutoff a minute before the report (the Phase 4 plan's decision 5)."""
+    d = date(2026, 10, 13)
+    plan = day_plan(CALENDAR, d, SETTINGS, RISK)
+    assert (plan.premarket_scan_at, plan.brief_at, plan.brief_deadline) == (
+        at(d, 9, 0), at(d, 9, 5), at(d, 9, 28),
+    )  # fmt: skip
+    assert (plan.review_at, plan.review_cutoff) == (at(d, 16, 15), at(d, 16, 29))
+    assert "  09:05:00  Claude's pre-market brief (Book B)" not in plan.lines()
+    lines = plan.lines(book_b=True)
+    for row in (
+        "  09:00:00  pre-market scan (Book B)",
+        "  09:05:00  Claude's pre-market brief (Book B)",
+        "  09:28:00  the brief's deadline",
+        "  16:15:00  Claude's post-close review (Book B)",
+        "  16:29:00  the review's cutoff",
+    ):
+        assert row in lines
+    # each B row sits before the first row that comes later; the others keep their order
+    assert lines[1:4] == [
+        "  09:00:00  pre-market scan (Book B)",
+        "  09:05:00  Claude's pre-market brief (Book B)",
+        "  09:28:00  the brief's deadline",
+    ]
+    assert lines[-4:] == [
+        "  16:12:00  shadow outcomes",
+        "  16:15:00  Claude's post-close review (Book B)",
+        "  16:29:00  the review's cutoff",
+        "  16:30:00  report",
+    ]
+    assert [line for line in lines if "(Book B)" not in line and "'s " not in line] == (
+        plan.lines()
+    )
+
+
+def test_an_early_close_moves_the_review_not_the_brief() -> None:
+    d = date(2026, 11, 27)  # 13:00 close
+    plan = day_plan(CALENDAR, d, SETTINGS, RISK)
+    assert (plan.premarket_scan_at, plan.brief_at, plan.brief_deadline) == (
+        at(d, 9, 0), at(d, 9, 5), at(d, 9, 28),
+    )  # fmt: skip
+    assert (plan.review_at, plan.review_cutoff, plan.report_at) == (
+        at(d, 13, 15), at(d, 13, 29), at(d, 13, 30),
+    )  # fmt: skip
+
+
 def test_a_holiday_has_no_plan() -> None:
     with pytest.raises(NotATradingDayError):
         day_plan(CALENDAR, date(2026, 11, 26), SETTINGS, RISK)

@@ -247,7 +247,7 @@ async def entry(journal: Journal, status: str, *, filled: int = 0, symbol: str =
 async def test_eod_marks_taken_entries_that_never_filled(journal: Journal) -> None:
     await book(journal, Service()).on_trigger(event(), signal())
     await entry(journal, "canceled")
-    assert await signals_with_orders(journal, DAY) == frozenset({"20261013-XYZ-orb5"})
+    assert await signals_with_orders(journal, DAY) == {"A": frozenset({"20261013-XYZ-orb5"})}
     assert await finalize_decisions(journal, "A", DAY, at=NOW) == ["20261013-XYZ-orb5"]
     assert await finalize_decisions(journal, "A", DAY, at=NOW) == []  # idempotent
     final = await journal.fetch_all("SELECT reason_code FROM final_decisions")

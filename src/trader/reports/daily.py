@@ -1,12 +1,19 @@
-"""The daily report (A§4.10; DECISIONS D-046), as Markdown and HTML from one data model.
+"""The daily report (A§4.10; DECISIONS D-046, D-069), as Markdown and HTML from one data model.
 
-Phase 3 fills Book A's columns; Book B's show "n/a" until Phase 4, and the LLM section says
-none. HTML is built with ``html.escape`` (no template engine, no new dependency), so text from
-incidents or symbols can't inject markup.
+Each book's columns show its decisions and results, "n/a" for a book that didn't run. When
+Book B ran, the report adds its LLM work: the header's calls, budget, failed attempts and day
+mode; Book B's verdict per signal; a table of the day's attempts; and Claude's review (P4.10
+stores it). A day Book B was asked for but kept off says why.
+
+HTML is built with ``html.escape`` (no template engine, no new dependency), so text from
+incidents, symbols or the model can't inject markup. In Markdown, text the model wrote goes in a
+code span, where nothing is markup: no link (bare URLs and e-mail addresses included, which GFM
+and VS Code's preview would otherwise make clickable), image, HTML or emphasis.
 """
 
 import html
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -16,6 +23,7 @@ from pathlib import Path
 from trader.config import BookName
 from trader.core.calendar import Session
 from trader.core.clock import parse_et_iso
+from trader.llm.budget import ABANDONED, CLI_RUNS
 from trader.memory.journal import Journal, db_to_dec
 from trader.strategy.orb_sip import load_signals
 
@@ -57,6 +65,7 @@ class SignalLine:
     shadow_exit: str | None
     decisions: dict[str, str] = field(default_factory=dict)  # book -> final reason code
     results: dict[str, str] = field(default_factory=dict)  # book -> "R 1.23, $4.56"
+    b_verdict: str = ""  # Book B's: "vet veto 0.80", the one its decision rests on if any
 
 
 @dataclass(frozen=True)
@@ -82,6 +91,48 @@ class IncidentLine:
 
 
 @dataclass(frozen=True)
+class CallLine:
+    """One LLM attempt (a row of ``llm_calls``)."""
+
+    attempt: str
+    role: str
+    started: str
+    took_s: float | None
+    result: str  # ok, or the failure
+    model: str
+    cost: float | None
+    clamped: int | None
+
+
+@dataclass(frozen=True)
+class TargetLine:
+    """One of the review's signal reviews: the model's text, escaped when rendered."""
+
+    symbol: str
+    went_well: str
+    went_badly: str
+    why: str
+    b_process: str
+
+
+@dataclass(frozen=True)
+class LlmDay:
+    """Book B's LLM work for the day."""
+
+    calls: tuple[CallLine, ...] = ()
+    cli_runs: int = 0  # toward max_calls_per_day
+    failed: int = 0  # toward llm_failures_degrade_after
+    abandoned: int = 0
+    max_calls: int | None = None
+    degrade_after: int | None = None
+    day_mode: str | None = None  # "normal x1 (premarket, <call id>)"
+    day_mode_reason: str = ""  # the model's
+    review_status: str | None = None
+    review_summary: str = ""  # the model's
+    reviews: tuple[TargetLine, ...] = ()
+
+
+@dataclass(frozen=True)
 class DailyReport:
     day: date
     session: Session | None
@@ -93,6 +144,8 @@ class DailyReport:
     incidents: tuple[IncidentLine, ...]
     halts: dict[str, list[str]]
     regime: dict[str, object]
+    llm: LlmDay = LlmDay()
+    book_b_off: str | None = None  # why Book B didn't run, though asked for
 
     def summary(self) -> str:
         """One line for the end-of-day notification (no secrets, no account numbers)."""
@@ -118,6 +171,9 @@ async def build_daily(
     mode: str,
     session: Session | None,
     now: datetime,
+    book_b_off: str | None = None,
+    max_calls: int | None = None,
+    degrade_after: int | None = None,
 ) -> DailyReport:
     signals = await load_signals(journal, day)
     shadow = {
@@ -173,6 +229,7 @@ async def build_daily(
                 trades=tuple(lines),
             )
         )
+    b_verdicts = await _b_verdicts(journal, day) if "B" in books else {}
     signal_lines = tuple(
         SignalLine(
             rank=s.rel_vol_rank,
@@ -186,6 +243,7 @@ async def build_daily(
             shadow_exit=shadow.get(s.id, (None, None))[1],
             decisions=finals.get(s.id, {}),
             results={b: _result(t) for b, t in trades.get(s.id, {}).items()},
+            b_verdict=b_verdicts.get(s.symbol, ""),
         )
         for s in signals
     )
@@ -213,17 +271,136 @@ async def build_daily(
     if not regime and signals:
         regime = {k: v for k, v in signals[0].features.items()
                   if k in ("regime_spy_trend", "regime_vol_bucket", "event_day")}  # fmt: skip
+    llm = (
+        await _llm_day(journal, day, max_calls=max_calls, degrade_after=degrade_after)
+        if "B" in books
+        else LlmDay()
+    )
+    if book_b_off is None and "B" not in books:  # as the day noted it (a regenerated report)
+        note = await journal.fetch_one(
+            "SELECT detail FROM day_runs WHERE date = ? AND kind = 'note' AND name = 'book_b_off' "
+            "ORDER BY id DESC LIMIT 1",
+            (day.isoformat(),),
+        )
+        book_b_off = note["detail"] if note is not None else None
     return DailyReport(day=day, session=session, epoch=epoch, mode=mode, books=tuple(books),
                        signals=signal_lines, book_lines=tuple(book_lines), incidents=incidents,
-                       halts=halts, regime=regime)  # fmt: skip
+                       halts=halts, regime=regime, llm=llm, book_b_off=book_b_off)  # fmt: skip
+
+
+async def _b_verdicts(journal: Journal, day: date) -> dict[str, str]:
+    """Book B's verdict per symbol: the one its decision rests on, else the day's latest."""
+    d = day.isoformat()
+    rows = await journal.fetch_all(
+        "SELECT symbol, source, verdict, confidence, llm_call_id FROM verdicts v WHERE date = ? "
+        "AND llm_call_id IN (SELECT id FROM llm_calls WHERE purpose = 'trading') ORDER BY id",
+        (d,),
+    )
+    rested = {
+        (r["symbol"], r["llm_call_id"])
+        for r in await journal.fetch_all(
+            "SELECT s.symbol, f.llm_call_id FROM final_decisions f JOIN signals s "
+            "ON s.id = f.signal_id WHERE s.date = ? AND f.book = 'B' AND f.llm_call_id IS NOT NULL",
+            (d,),
+        )
+    }
+    out: dict[str, str] = {}
+    chosen: set[str] = set()
+    for r in rows:  # oldest first: the latest wins, unless the decision named one
+        text = f"{r['source']} {r['verdict']} {r['confidence']:.2f}"
+        if (r["symbol"], r["llm_call_id"]) in rested:
+            out[r["symbol"]] = text
+            chosen.add(r["symbol"])
+        elif r["symbol"] not in chosen:
+            out[r["symbol"]] = text
+    return out
+
+
+async def _llm_day(
+    journal: Journal, day: date, *, max_calls: int | None, degrade_after: int | None
+) -> LlmDay:
+    d = day.isoformat()
+    rows = await journal.fetch_all(
+        "SELECT id, role, started_at, duration_ms, ok, failure, model_resolved, model_alias, "
+        "cost_estimate_usd, clamped FROM llm_calls WHERE date = ? AND purpose = 'trading' "
+        "ORDER BY started_at, id",
+        (d,),
+    )
+    calls = tuple(
+        CallLine(
+            attempt=r["id"],
+            role=r["role"],
+            started=_clock(r["started_at"] or ""),
+            took_s=None if r["duration_ms"] is None else r["duration_ms"] / 1000,
+            result="ok" if r["ok"] else (r["failure"] or "open"),
+            model=r["model_resolved"] or r["model_alias"] or "",
+            cost=r["cost_estimate_usd"],
+            clamped=r["clamped"],
+        )
+        for r in rows
+    )
+    runs = await journal.fetch_one(
+        f"SELECT COUNT(*) AS n FROM llm_calls WHERE date = ? AND purpose = 'trading' "
+        f"AND {CLI_RUNS}",
+        (d,),
+    )
+    mode = await journal.fetch_one(
+        "SELECT mode, source, multiplier, reason, llm_call_id FROM day_modes "
+        "WHERE date = ? AND book = 'B'",
+        (d,),
+    )
+    review = await journal.fetch_one(
+        "SELECT status, summary FROM daily_reviews WHERE date = ?", (d,)
+    )
+    targets = await journal.fetch_all(
+        "SELECT s.symbol, r.went_well, r.went_badly, r.why, r.b_process FROM signal_reviews r "
+        "JOIN signals s ON s.id = r.signal_id WHERE r.date = ? ORDER BY s.rel_vol_rank",
+        (d,),
+    )
+    day_mode = None
+    if mode is not None:
+        source = mode["source"] or "premarket"
+        call = f", {mode['llm_call_id']}" if mode["llm_call_id"] else ""
+        day_mode = f"{mode['mode']} x{mode['multiplier'] or '?'} ({source}{call})"
+    return LlmDay(
+        calls=calls,
+        cli_runs=int(runs["n"]) if runs else 0,
+        failed=sum(1 for c in calls if c.result not in ("ok", ABANDONED, "open")),
+        abandoned=sum(1 for c in calls if c.result == ABANDONED),
+        max_calls=max_calls,
+        degrade_after=degrade_after,
+        day_mode=day_mode,
+        day_mode_reason=(mode["reason"] or "") if mode is not None else "",
+        review_status=review["status"] if review is not None else None,
+        review_summary=(review["summary"] or "") if review is not None else "",
+        reviews=tuple(
+            TargetLine(
+                symbol=t["symbol"],
+                went_well=t["went_well"] or "",
+                went_badly=t["went_badly"] or "",
+                why=t["why"] or "",
+                b_process=t["b_process"] or "",
+            )
+            for t in targets
+        ),
+    )
 
 
 # ---------------------------------------------------------------- rendering
 
 
+class ModelText(str):
+    """Text the model wrote: Markdown escapes all of it (HTML escapes every cell anyway)."""
+
+
 def _tables(report: DailyReport) -> list[tuple[str, list[str], list[list[str]]]]:
     """(title, header, rows) for every table; shared by Markdown and HTML."""
-    booked = ("A", "B")
+
+    def book_cell(s: SignalLine, b: BookName) -> str:
+        if b not in report.books:
+            return "n/a"
+        return f"{s.decisions.get(b, '')} {s.results.get(b, '')}".strip()
+
     signal_rows = [
         [
             str(s.rank),
@@ -235,14 +412,9 @@ def _tables(report: DailyReport) -> list[tuple[str, list[str], list[list[str]]]]
             s.triggered_at.strftime("%H:%M:%S") if s.triggered_at else "",
             _num(s.shadow_r),
             s.shadow_exit or "",
-            *[
-                (
-                    f"{s.decisions.get(b, '')} {s.results.get(b, '')}".strip()
-                    if b in report.books
-                    else "n/a"
-                )
-                for b in booked
-            ],
+            book_cell(s, "A"),
+            s.b_verdict if "B" in report.books else "n/a",
+            book_cell(s, "B"),
         ]
         for s in report.signals
     ]
@@ -250,7 +422,7 @@ def _tables(report: DailyReport) -> list[tuple[str, list[str], list[list[str]]]]
         (
             "Signals (top 20)",
             ["#", "symbol", "rel_vol", "direction", "status", "trigger", "triggered",
-             "shadow R", "shadow exit", "Book A", "Book B"],
+             "shadow R", "shadow exit", "Book A", "B verdict", "Book B"],
             signal_rows,
         ),
         (
@@ -276,6 +448,27 @@ def _tables(report: DailyReport) -> list[tuple[str, list[str], list[list[str]]]]
             [[_clock(i.ts), i.severity, i.component, i.code, i.message] for i in report.incidents],
         )
     )
+    llm = report.llm
+    if llm.calls:
+        tables.append(
+            (
+                "LLM calls",
+                ["attempt", "role", "started", "took (s)", "result", "model", "cost (est.)",
+                 "clamped"],
+                [[c.attempt, c.role, c.started, _num(c.took_s), c.result, c.model,
+                  "" if c.cost is None else f"${c.cost:.2f}", _txt(c.clamped)]
+                 for c in llm.calls],
+            )
+        )  # fmt: skip
+    if llm.reviews:
+        tables.append(
+            (
+                "Claude's review: the targets",
+                ["symbol", "went well", "went badly", "why", "Book B's process"],
+                [[t.symbol, ModelText(t.went_well), ModelText(t.went_badly), ModelText(t.why),
+                  t.b_process] for t in llm.reviews],
+            )
+        )  # fmt: skip
     return tables
 
 
@@ -292,13 +485,59 @@ def _header_lines(report: DailyReport) -> list[str]:
         f"{hours} | epoch {report.epoch} | mode {report.mode} | books {', '.join(report.books)}",
         f"regime in force (prior session): {regime}",
         f"halts in force: {halts}",
-        "LLM calls: none (Book B and Claude arrive in Phase 4)",
+        *_llm_lines(report),
     ]
+
+
+def _llm_lines(report: DailyReport) -> list[str]:
+    """The header's LLM lines: Book B's calls, budget, failed attempts and day mode."""
+    if "B" not in report.books:
+        why = f"Book B off: {report.book_b_off}" if report.book_b_off else "Book B not run"
+        return [f"LLM calls: none ({why})"]
+    llm = report.llm
+    ok = sum(1 for c in llm.calls if c.result == "ok")
+    counted = f"{ok} ok, {llm.failed} failed" + (
+        f", {llm.abandoned} abandoned" if llm.abandoned else ""
+    )
+    budget = f"/{llm.max_calls}" if llm.max_calls is not None else ""
+    toward = f"/{llm.degrade_after}" if llm.degrade_after is not None else ""
+    return [
+        f"LLM calls: {len(llm.calls)} attempts ({counted}); budget {llm.cli_runs}{budget} CLI "
+        f"runs; failed attempts {llm.failed}{toward} toward llm_degraded",
+        f"Book B day mode: {llm.day_mode or 'not set'}",
+    ]
+
+
+def _claude_md(report: DailyReport) -> list[str]:
+    """Claude's own words: the day mode's reason and the review's summary, escaped."""
+    llm = report.llm
+    if "B" not in report.books or not (llm.day_mode_reason or llm.review_status):
+        return []
+    out = ["", "## Claude", ""]
+    if llm.day_mode_reason:
+        out.append(f"- The day mode's reason: {_model_md(llm.day_mode_reason)}")
+    if llm.review_status:
+        out.append(f"- The review ({llm.review_status}): {_model_md(llm.review_summary)}")
+    return out
+
+
+def _claude_html(report: DailyReport) -> list[str]:
+    llm, e = report.llm, html.escape
+    if "B" not in report.books or not (llm.day_mode_reason or llm.review_status):
+        return []
+    out = ["<h2>Claude</h2><ul>"]
+    if llm.day_mode_reason:
+        out.append(f"<li>The day mode's reason: {e(llm.day_mode_reason)}</li>")
+    if llm.review_status:
+        out.append(f"<li>The review ({e(llm.review_status)}): {e(llm.review_summary)}</li>")
+    out.append("</ul>")
+    return out
 
 
 def render_markdown(report: DailyReport) -> str:
     lines = [f"# Daily report {report.day}", ""]
     lines += [f"- {line}" for line in _header_lines(report)]
+    lines += _claude_md(report)
     for title, header, rows in _tables(report):
         lines += ["", f"## {title}", ""]
         if not rows:
@@ -306,7 +545,14 @@ def render_markdown(report: DailyReport) -> str:
             continue
         lines.append("| " + " | ".join(header) + " |")
         lines.append("|" + "---|" * len(header))
-        lines += ["| " + " | ".join(_md(cell) for cell in row) + " |" for row in rows]
+        lines += [
+            "| "
+            + " | ".join(
+                _model_md(c, in_table=True) if isinstance(c, ModelText) else _md(c) for c in row
+            )
+            + " |"
+            for row in rows
+        ]
     lines += ["", "## Limitations", ""] + [f"- {item}" for item in LIMITATIONS] + [""]
     return "\n".join(lines)
 
@@ -322,6 +568,7 @@ def render_html(report: DailyReport) -> str:
         f"<h1>Daily report {e(str(report.day))}</h1><ul>",
         *[f"<li>{e(line)}</li>" for line in _header_lines(report)],
         "</ul>",
+        *_claude_html(report),
     ]
     for title, header, rows in _tables(report):
         parts.append(f"<h2>{e(title)}</h2>")
@@ -361,6 +608,20 @@ def _clock(ts: str) -> str:
 
 def _md(cell: str) -> str:
     return cell.replace("|", "\\|").replace("\n", " ")
+
+
+def _model_md(text: str, *, in_table: bool = False) -> str:
+    """The model's text for Markdown: on one line, in a code span longer than any run of
+    backticks it holds (the module's docstring). In a table cell its pipes are escaped too,
+    which GFM requires even inside a code span."""
+    flat = " ".join(text.split())
+    if not flat:
+        return ""
+    fence = "`" * (max((len(run) for run in re.findall(r"`+", flat)), default=0) + 1)
+    pad = " " if flat.startswith("`") or flat.endswith("`") else ""
+    if in_table:
+        flat = flat.replace("|", "\\|")
+    return f"{fence}{pad}{flat}{pad}{fence}"
 
 
 def _txt(value: object) -> str:

@@ -7,11 +7,12 @@
 | ``broker-A.jsonl.gz`` | Book A's broker calls and trade updates (``broker-B`` likewise) |
 | ``boot.json`` | each book's ledger, halts and state at boot (``boot-2.json`` after a restart) |
 | ``news.jsonl.gz`` | every news item |
+| ``llm.jsonl.gz`` | Book B's packs and each LLM attempt's answer (``llm/replay.py``, D-069) |
 | ``or_scan.parquet`` | the 09:35 opening-range scan (written by P3.1) |
 | ``universe.parquet`` | the day's universe snapshot |
 
-LLM context packs and envelopes stay where ``llm_calls`` points. Decimals and timestamps are
-recorded as strings, exactly as the models serialize them, so a replay rebuilds the same values.
+LLM artifacts also stay where ``llm_calls`` points. Decimals and timestamps are recorded as
+strings, exactly as the models serialize them, so a replay rebuilds the same values.
 
 JSON-lines files are appended and flushed every ``flush_every`` records and on close. A crash
 loses at most the unflushed tail: ``read_jsonl`` returns every record up to the last flush.
@@ -79,9 +80,10 @@ class Recorder:
             record["rx"] = fmt_iso(rx)
         self._append(STREAM_FILE, record)
 
-    def append(self, name: str, record: dict[str, Any]) -> None:
-        """One JSON line to ``name`` in the day's folder (REST and broker recordings)."""
-        self._append(name, record)
+    def append(self, name: str, record: dict[str, Any], *, flush: bool = False) -> None:
+        """One JSON line to ``name`` in the day's folder (REST, broker and LLM recordings).
+        ``flush`` makes it readable after a crash at once (the LLM's records, D-069)."""
+        self._append(name, record, flush=flush)
 
     def record_news(self, item: NewsItem) -> None:
         self._append(NEWS_FILE, item.model_dump(mode="json"))
@@ -97,11 +99,11 @@ class Recorder:
             handle.close()
         self._open.clear()
 
-    def _append(self, name: str, record: dict[str, Any]) -> None:
+    def _append(self, name: str, record: dict[str, Any], *, flush: bool = False) -> None:
         handle, pending = self._open.get(name) or (self._new(name), 0)
         handle.write(json.dumps(record, separators=(",", ":")) + "\n")
         pending += 1
-        if pending >= self._flush_every:
+        if flush or pending >= self._flush_every:
             handle.flush()  # a gzip sync point: everything so far is readable after a crash
             pending = 0
         self._open[name] = (handle, pending)

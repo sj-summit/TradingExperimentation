@@ -410,7 +410,8 @@ PACK_KEYS = frozenset(
         "candidates_omitted", "day_mode_source", "decision_basis", "edited_after_decision",
         "events_today", "filing_forms", "filings_lookback_days", "filings_omitted",
         "filings_unavailable", "incidents_omitted", "last_print", "lessons_omitted",
-        "minutes_from_decision", "news_omitted", "open_issues_omitted", "open_notes_omitted",
+        "minutes_from_decision", "news_omitted", "news_unavailable", "open_issues_omitted",
+        "open_notes_omitted",
         "picked_as", "premarket_price", "review_targets", "selected_for", "signals_omitted",
         "summary_omitted", "suspicious_news", "targets_omitted", "verdict_source",
     }

@@ -126,24 +126,32 @@ async def _universe(root: Path, date: str | None, *, persist: bool) -> None:
 @app.command("run-day")
 def run_day(
     ctx: typer.Context,
-    books: Annotated[str, typer.Option("--books", help="A (Book B arrives in Phase 4).")] = "A",
+    books: Annotated[
+        str, typer.Option("--books", help="A, B or A,B: Book B adds Claude's veto.")
+    ] = "A",
     sim: Annotated[
         bool,
-        typer.Option("--sim", help="Live data, simulated brokers, under runtime/sim/<date>/."),
+        typer.Option(
+            "--sim",
+            help="Live data, simulated brokers and a scripted model, under runtime/sim/<date>/.",
+        ),
     ] = False,
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Boot's checks and the timeline; trades nothing.")
     ] = False,
+    no_llm: Annotated[
+        bool, typer.Option("--no-llm", help="Book B off for the day: Book A runs alone.")
+    ] = False,
 ) -> None:
-    """HUMAN GATE until Phase 6: today's full session (A§3) for Book A's paper account, from
+    """HUMAN GATE until Phase 6: today's full session (A§3) for the books' paper accounts, from
     boot to the report. Start it by 08:25 ET; it exits after the 16:30 report."""
-    _run(_run_day(ctx.obj, books, sim=sim, dry_run=dry_run))
+    _run(_run_day(ctx.obj, books, sim=sim, dry_run=dry_run, no_llm=no_llm))
 
 
-async def _run_day(root: Path, books: str, *, sim: bool, dry_run: bool) -> None:
+async def _run_day(root: Path, books: str, *, sim: bool, dry_run: bool, no_llm: bool) -> None:
     from trader.orchestrator.live import RunOptions, parse_books, run_day
 
-    options = RunOptions(books=parse_books(books), sim=sim, dry_run=dry_run)
+    options = RunOptions(books=parse_books(books), sim=sim, dry_run=dry_run, no_llm=no_llm)
     await run_day(root, options, typer.echo)
 
 
@@ -269,7 +277,14 @@ async def _report_daily(root: Path, date: str | None) -> None:
         )
         books = tuple(r["book"] for r in rows) or ("A",)
         report = await build_daily(
-            local.journal, day, books=books, mode=local.cfg.settings.mode, session=session, now=now
+            local.journal,
+            day,
+            books=books,
+            mode=local.cfg.settings.mode,
+            session=session,
+            now=now,
+            max_calls=local.cfg.settings.llm.max_calls_per_day,
+            degrade_after=local.cfg.risk.llm_failures_degrade_after,
         )
         md, page = write_daily(report, local.cfg.path(local.cfg.settings.storage.reports_dir))
         typer.echo(report.summary())

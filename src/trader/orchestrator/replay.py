@@ -11,8 +11,13 @@ each book's ledger, halts and state, the regime tags) and ``universe.parquet``:
 
 It never notifies, never records and never touches a real account. Afterwards it lists every
 divergence (a call the recording lacks) and every difference between the replay's signals, final
-decisions and trades and the recorded ones. The replay covers the first engine of the day: after
-a restart (``boot-2.json``) it says so.
+decisions, trades, day modes, verdicts and LLM calls and the recorded ones. The replay covers the
+first engine of the day: after a restart (``boot-2.json``) it says so.
+
+**Book B** (the Phase 4 plan's decision 10; D-063, D-069): ``llm.jsonl.gz`` serves each job its
+recorded pack (``ReplayPacks``) and each attempt its recorded answer (``ReplayTransport``), so the
+replay needs no news, no EDGAR and no ``claude``. The runner runs as it did live, in the replay's
+own folders and with no credential, and stores the same verdicts.
 """
 
 import dataclasses
@@ -27,6 +32,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import trader
 from trader.config import BookName, RiskConfig, Settings
 from trader.core.calendar import Session, TradingCalendar
 from trader.core.clock import SimClock, fmt_iso, parse_et_iso
@@ -38,6 +44,7 @@ from trader.data.recorder import (
     STREAM_FILE,
     UNIVERSE_FILE,
     broker_file,
+    read_jsonl,
     read_table,
 )
 from trader.data.replay import ReplayHub, ReplayMarketData, load_stream
@@ -45,13 +52,21 @@ from trader.data.stream import MarketEvent
 from trader.execution.broker import BrokerAdapter
 from trader.execution.replay import ReplayBroker
 from trader.execution.sim_broker import SimBroker
+from trader.llm.budget import Budget
+from trader.llm.client import LlmCalls
+from trader.llm.replay import LLM_FILE, ReplayTransport
+from trader.llm.roles import role_specs
 from trader.memory.journal import Journal
 from trader.memory.regime import RegimeTags, store_regime
 from trader.notify import NullNotifier
 from trader.orchestrator.day import Cadence, DayDeps, DayOrchestrator, DayPaths
+from trader.orchestrator.llm_jobs import LlmDeps
+from trader.orchestrator.packs import ReplayPacks
 from trader.orchestrator.provenance import source_sha256
 from trader.orchestrator.simdrive import drive
 from trader.risk.ledger import SEED_REF, LedgerEntry, insert_entries
+
+SOURCE_ROOT = Path(trader.__file__).resolve().parents[2]  # the checkout this code runs from
 
 CONFIG_FILES = {
     "settings": "config/settings.yaml",
@@ -97,6 +112,8 @@ async def replay_day(
     root: Path | None = None,
     cadence: Cadence | None = None,
 ) -> ReplayReport:
+    """Replay ``day`` into ``out``. ``root``: the repository the prompts are read from, and
+    the config compared with the recording's (by default this code's own checkout)."""
     folder = recordings / day.isoformat()
     boot, universe, notes = _prepare(folder, out, root)
     clock = SimClock(started_at(boot))
@@ -124,6 +141,18 @@ async def replay_day(
                 folder / broker_file(book), clock, fallback=fallback
             )
         adapters: dict[BookName, BrokerAdapter] = dict(brokers)
+        llm: LlmDeps | None = None
+        transport: ReplayTransport | None = None
+        packs: ReplayPacks | None = None
+        if "B" in boot["books"]:
+            records = list(read_jsonl(folder / LLM_FILE)) if (folder / LLM_FILE).exists() else []
+            transport, packs = ReplayTransport(records, clock), ReplayPacks(records, clock)
+            served = packs
+            llm = LlmDeps(
+                calls=_replay_calls(journal, clock, transport, settings, out, root),
+                packs=lambda _ctx: served,
+                setup={"transport": "replay"},
+            )
         deps = DayDeps(
             settings=settings,
             risk=risk,
@@ -145,11 +174,24 @@ async def replay_day(
             # Only what the recorded engine did: an older day replays without calls it never
             # made (D-055).
             capabilities=frozenset(boot.get("capabilities", ())),
+            llm=llm,
+            book_b_off=_book_b_off(boot),
         )
         outcome = await drive(clock, DayOrchestrator(deps).run(), watched=[journal])
         divergences = list(market.divergences) + [
             f"Book {name}: {d}" for name, b in sorted(brokers.items()) for d in b.divergences
         ]
+        if transport is not None and packs is not None:
+            divergences += transport.divergences + packs.divergences
+            if transport.unused or packs.unused:
+                left = (
+                    f"the replay left {transport.unused} recorded LLM attempts and "
+                    f"{packs.unused} packs unused"
+                )
+                if (folder / "boot-2.json").exists():  # a restart's: the replay covers run 1
+                    notes.append(left)
+                else:  # calls the recorded engine made and the replay didn't
+                    divergences.append(f"llm: {left}")
         replayed = await journal.read(lambda conn: comparable(conn, day))
     finally:
         await journal.aclose()
@@ -245,8 +287,61 @@ async def seed(
     return TradingCalendar(sessions, first, last)
 
 
+def _replay_calls(
+    journal: Journal,
+    clock: SimClock,
+    transport: ReplayTransport,
+    settings: Settings,
+    out: Path,
+    root: Path | None,
+) -> LlmCalls:
+    """The runner as live had it, answering from the recording: no credential, no executable,
+    and the replay's own sandbox and artifacts, since ids repeat (D-064)."""
+    llm = settings.llm
+    return LlmCalls(
+        journal=journal,
+        clock=clock,
+        transport=transport,
+        command=("replay",),
+        roles=role_specs(settings),
+        env={},
+        prompts_dir=(root or SOURCE_ROOT) / "prompts",
+        sandbox_dir=out / "llm_sandbox",
+        artifacts_dir=out / "llm",
+        budget=Budget(
+            journal, max_calls_per_day=llm.max_calls_per_day, max_concurrent=llm.max_concurrent
+        ),
+        schema_mode=llm.schema_mode,
+        tools_flag=llm.tools_flag,
+        safe_mode=llm.safe_mode,
+        max_pack_bytes=llm.max_pack_bytes,
+    )
+
+
+def _book_b_off(boot: Mapping[str, Any]) -> str | None:
+    """Why the recorded day kept Book B off, if it did (``boot.json``'s ``llm.book_b``)."""
+    llm = boot.get("llm")
+    said = str(llm.get("book_b", "")) if isinstance(llm, Mapping) else ""
+    return said.removeprefix("off: ") if said.startswith("off: ") else None
+
+
+# What a replay of a Book B day must also reproduce (D-069). An older journal lacks a column
+# or two: it has no such rows either.
+_LLM_COMPARED = {
+    "b_call": "SELECT f.signal_id, f.llm_call_id FROM final_decisions f JOIN signals s "
+    "ON s.id = f.signal_id WHERE s.date = ? AND f.book = 'B' ORDER BY f.signal_id",
+    "day_mode": "SELECT book, mode, source, multiplier, llm_call_id FROM day_modes "
+    "WHERE date = ? ORDER BY book",
+    "verdict": "SELECT symbol, source, verdict, confidence, signal_id, llm_call_id FROM verdicts "
+    "WHERE date = ? ORDER BY llm_call_id, symbol",
+    "llm_call": "SELECT id, role, ok, failure, final, pack_id FROM llm_calls WHERE date = ? "
+    "AND purpose = 'trading' ORDER BY id",
+}
+
+
 def comparable(conn: sqlite3.Connection, day: date) -> dict[str, list[str]]:
-    """What a replay must reproduce: signals, each book's final decision, and trades."""
+    """What a replay must reproduce: signals, each book's final decision, and trades; for
+    Book B, the day mode, the verdicts and the LLM calls."""
     d = day.isoformat()
     signals = conn.execute(
         "SELECT id, direction, status, trigger_price, stop_price FROM signals WHERE date = ? "
@@ -263,11 +358,19 @@ def comparable(conn: sqlite3.Connection, day: date) -> dict[str, list[str]]:
         "ORDER BY id",
         (f"{d}T%",),
     ).fetchall()
-    return {
+    out = {
         "signal": [" ".join(str(v) for v in tuple(r)) for r in signals],
         "decision": [" ".join(str(v) for v in tuple(r)) for r in decisions],
         "trade": [" ".join(str(v) for v in tuple(r)) for r in trades],
     }
+    for kind, sql in _LLM_COMPARED.items():
+        try:
+            rows = conn.execute(sql, (d,)).fetchall()
+        except sqlite3.OperationalError:  # a journal from before the column
+            rows = []
+        if rows:
+            out[kind] = [" ".join(str(v) for v in tuple(r)) for r in rows]
+    return out
 
 
 def diff(recorded: Mapping[str, list[str]], replayed: Mapping[str, list[str]]) -> list[str]:

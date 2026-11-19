@@ -1,4 +1,4 @@
-# HANDOFF: Phase 4 under way; P4.0a–P4.0c, P4.1–P4.7 and 🛑 G4a done; next P4.8 (updated 2026-11-18)
+# HANDOFF: Phase 4 under way; P4.0a–P4.0c, P4.1–P4.8 and 🛑 G4a done; next P4.9 (updated 2026-11-19)
 
 **Latest:**
 - **Phase 4's plan is approved** (2026-10-14), now at `docs/PHASE4_PLAN.md`. Its file under `~\.claude\plans` was removed by Claude Code's cleanup of old files; the copy in the repository is its unchanged text (D-068). Order: P4.0a, P4.0b, P4.0c, P4.1–P4.6, 🛑 G4a, P4.7–P4.10, 🛑 G4b.
@@ -102,13 +102,44 @@
     - migration 0008 (the verdicts' and day modes' columns);
     - a trigger that waited is priced from the feed, or from one REST snapshot if the feed is silent.
   - **Review:** three adversarial reviewers found no blocker, 2 majors and 13 minors, all fixed. 74 mutations caught; 1,383 tests pass.
-- **Commits:** HEAD is `b2b0697` ("P4.6 done", the human's commit of 2026-10-18 22:13 ET), which holds everything through D-066. D-067, P4.7 and D-068, and these doc updates, are uncommitted. Commit only if asked.
+- **P4.8 is done (D-069): Book B in the day.**
+  - **Its jobs** (`orchestrator/llm_jobs.py`):
+    - **boot:** abandoned attempts closed, the fingerprint noted, the store rebuilt. A boot that fails halts Book B for the day with a P2, and Book A goes on. The news feed starts in the background once the stock stream is connected, and retries each minute;
+    - **the 09:00 scan and the 09:05 brief** (deadline 09:28; no attempt after 09:27; never asked twice);
+    - **the vet at arming** (EDGAR for at most 10 s; its deadline is the last entry);
+    - **the review after the shadow job**, which runs once P4.10 provides its content.
+
+    After each call: a P3 per failed attempt, a P2 for a refusal a human must fix, and at three failed attempts the `llm_degraded` halt with one P2. No job raises into the day.
+  - **The worker** parks a trigger Book B defers and asks it again when the verdicts change or at its deadline; the last entry settles any still parked. Book A's loop is unchanged.
+  - **`run-day --books A,B`**, and **`--no-llm`** (also `llm.enabled: false`, or a missing CLI or token, with a P2): Book A runs alone, and the boot record and the report say why.
+    - `--sim` uses a scripted model and no credential.
+    - `--dry-run` shows Book B's times and whether its LLM is ready.
+  - **Recording and replay:** `llm.jsonl.gz` holds every pack and each attempt's answer (redacted, flushed at once). `trader replay` serves them back at their recorded times, with no news, EDGAR or `claude`.
+  - **The report:** Book B's calls, budget, failures and day mode; a B-verdict column; an LLM-calls table; Claude's text, in code spans so it can't make a link.
+  - **Found:** the simulated brokers gave both books the same order and fill ids, so an A+B simulated day mixed them up. Fixed: ids now carry the book, and Book A keeps its own, so its goldens are unchanged.
+  - **Review:** two adversarial reviewers found 4 majors, 8 minors and 10 nits. All are fixed but two, which D-069 records as known limitations: a refusal made before the transport doesn't replay, and a torn gzip member loses what follows it.
+    - **The majors:**
+      - a Book B trigger parked at a crash was lost when Book A had entered it;
+      - the brief's index gaps were measured from two sessions back;
+      - a cut stderr kept most of the credential in the recording;
+      - a Book B boot failure stopped Book A's day.
+    - **Then 210 mutants:** 204 caught, 5 equivalent, and 1 left for P4.9's restart tests. 1,504 tests pass.
+- **Commits:** HEAD is `b8875f1` ("P4.7 Done", the human's commit), which holds everything through D-068. P4.8 and D-069, and these doc updates, are uncommitted. Commit only if asked.
 - **Waiting on the human:**
   - **The PC clock is fixed** (2026-11-17 20:54; D-067). The machine that runs the bot (H0.4) must keep the Windows Time service running. Doctor's `alpaca.clock` and the bot's hourly skew check will catch it if the service stops again.
   - **Before G4b:** the Phase 1 checks (`trader news`, `trader filings`, `trader stream --news`) and the `ALPACA_DATA_*` keys.
   - `run-day` isn't needed between gates: it stays a human gate until Phase 6.
-- **Next (Claude):** P4.8 (orchestrator, live wiring, recording, replay, reports). D-068's "For P4.8" lists how the jobs and the worker must drive the store and Book B.
+- **Next (Claude):** P4.9, end-to-end A+B days. D-069's "For P4.9" says what `DayRun` already does and what the synthetic day still lacks (pre-market prints, news, filings). Then P4.10, the review's content (`ReviewWork`, D-069).
 - **New since G3, for the G4b runbook:**
+  - **Book B's milestones** (D-069):
+    - `book B ready` at boot, and `news started`;
+    - `pre-market scan` at 09:00;
+    - `brief done` soon after 09:05, with the day mode;
+    - `vet expected` at arming, then `vet done`;
+    - `trigger parked` when a Book B trigger waits for its verdict.
+  - **Book B's incidents:**
+    - P2: `llm_degraded` (Book B halted to the next open), `llm_refused` (a human must fix the cause: the sandbox, a prompt, the pack's size), `llm_job_failed`, `llm_unavailable` (Book B off: no CLI or token), `idle_book_not_flat` (a book kept off holds positions or orders: flatten it or run it);
+    - P3: `llm_call_failed` (one per failed attempt), `llm_call_refused`, `brief_missed`, `premarket_scan_failed`, `news_unavailable`, `llm_cli_untested` (the CLI updated itself past `max_tested_cli_version`: rerun the smoke), `edgar_unavailable` (no usable EDGAR user agent).
   - **Log lines:**
     - `fees booked`, at boot and EOD. The first boot after 10-15 should book 10-12 to 10-14's 6 charges and 3 reversals (net $0.00), leaving E at $996.08 if no day trades before it;
     - `clock checked`, every hour;

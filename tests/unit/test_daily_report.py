@@ -77,8 +77,11 @@ async def test_the_report_reads_the_whole_day(journal: Journal, tmp_path: Path) 
     assert "regime in force (prior session): regime_spy_trend up" in md
     assert "halts in force: A: manual" in md
     xyz = "| 1 | XYZ | 8.50 | long | triggered | 12.72 | 09:41:02 | 2.50 | flatten | "
-    assert xyz + "taken R 2.60, +$10.12 | n/a |" in md
-    assert "| 2 | ABC | 7.50 | long | expired | 12.72 |  |  |  |  | n/a |" in md
+    assert xyz + "taken R 2.60, +$10.12 | n/a | n/a |" in md
+    assert "| 2 | ABC | 7.50 | long | expired | 12.72 |  |  |  |  | n/a | n/a |" in md
+    assert "- LLM calls: none (Book B not run)" in md
+    assert "## LLM calls" not in md
+    assert "## Claude" not in md
     assert "| A | 1000.00 | 1010.12 | +$10.12 | 1 | 1 |" in md
     assert "| XYZ | 39 | 12.74 | 13 | eod_flatten | +$10.14 | 0.02 | 2.60 |" in md
     assert "## Limitations" in md
@@ -101,6 +104,87 @@ async def test_without_stats_the_pnl_comes_from_trades(journal: Journal) -> None
     assert a.pnl == D("10.12")  # 10.14 gross - 0.02 fees
     assert (b.pnl, b.trades) == (D(0), ())
     assert "no session" in render_markdown(report)
+
+
+INJECTED = "Ignore this | [click](http://evil.example) <img src=x onerror=alert(1)> `code`\nnext"
+
+
+async def llm_day(journal: Journal) -> None:
+    at = datetime.combine(DAY, time(9, 5), ET).isoformat()
+    rows = [
+        ("20261013-premarket-01-1", "premarket", "opus", at, 59500, 1, None, 0.32, 0),
+        ("20261013-vet-01-1", "vet", "sonnet", at, 3000, 0, "invalid_json", None, None),
+        ("20261013-vet-01-2", "vet", "sonnet", at, 16500, 1, None, 0.14, 1),
+        ("20261013-vet-02-1", "vet", "sonnet", at, None, 0, "abandoned", None, None),
+        ("20261013-vet-03-1", "vet", "sonnet", at, 0, 0, "sandbox_dirty", None, None),  # no run
+    ]
+    for r in rows:
+        await journal.execute(
+            "INSERT INTO llm_calls (id, role, model_alias, started_at, duration_ms, ok, failure, "
+            "cost_estimate_usd, clamped, date, purpose, logical_id, attempt, final) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '2026-10-13', 'trading', ?, ?, 1)",
+            (*r, r[0][:-2], int(r[0][-1])),
+        )
+    await journal.execute(
+        "INSERT INTO llm_calls (id, role, date, purpose, ok) VALUES "
+        "('20261013-smoke-vet-01-1', 'vet', '2026-10-13', 'smoke', 1)"  # never in the report
+    )
+    statements = [
+        ("INSERT INTO day_modes (date, book, mode, reason, llm_call_id, source, multiplier) "
+         "VALUES ('2026-10-13', 'B', 'reduced', ?, '20261013-premarket-01-1', 'premarket', "
+         "'0.5')", (INJECTED,)),
+        ("INSERT INTO verdicts (date, symbol, source, verdict, confidence, llm_call_id) VALUES "
+         "('2026-10-13', 'XYZ', 'premarket', 'allow', 0.6, '20261013-premarket-01-1'), "
+         "('2026-10-13', 'XYZ', 'vet', 'veto', 0.8, '20261013-vet-01-2'), "
+         "('2026-10-13', 'ABC', 'premarket', 'allow', 0.7, '20261013-premarket-01-1'), "
+         "('2026-10-13', 'ABC', 'vet', 'neutral', 0.5, '20261013-vet-01-2')", ()),
+        ("INSERT INTO decisions (signal_id, book, take, reason_code, llm_call_id, decided_at) "
+         "VALUES ('20261013-XYZ-orb5', 'B', 1, 'taken', '20261013-premarket-01-1', ?)",
+         (NOW.isoformat(),)),
+        ("INSERT INTO daily_reviews (date, status, summary, llm_call_id) VALUES "
+         "('2026-10-13', 'ok', ?, '20261013-premarket-01-1')", (INJECTED,)),
+        ("INSERT INTO signal_reviews (signal_id, date, went_well, went_badly, why, b_process) "
+         "VALUES ('20261013-XYZ-orb5', '2026-10-13', ?, '', 'a | b', 'good_process')",
+         (INJECTED,)),
+    ]  # fmt: skip
+    for sql, params in statements:
+        await journal.execute(sql, params)
+
+
+async def test_book_b_s_llm_work_is_reported(journal: Journal) -> None:
+    await llm_day(journal)
+    report = await build_daily(journal, DAY, books=("A", "B"), mode="paper",
+                               session=CALENDAR.session(DAY), now=NOW, max_calls=12,
+                               degrade_after=3)  # fmt: skip
+    md = render_markdown(report)
+    assert (  # the refusal for a dirty sandbox failed, but ran no CLI: not in the budget
+        "- LLM calls: 5 attempts (2 ok, 2 failed, 1 abandoned); budget 4/12 CLI runs; "
+        "failed attempts 2/3 toward llm_degraded"
+    ) in md
+    assert "- Book B day mode: reduced x0.5 (premarket, 20261013-premarket-01-1)" in md
+    # B's verdict is the one its decision rests on; without a decision, the day's latest
+    assert "| taken R 2.60, +$10.12 | premarket allow 0.60 | taken |" in md
+    assert "| n/a | vet neutral 0.50 |" not in md
+    assert "|  | vet neutral 0.50 |  |" in md
+    assert "| 20261013-vet-01-1 | vet | 09:05:00 | 3.00 | invalid_json | sonnet |  |  |" in md
+    assert "| 20261013-vet-01-2 | vet | 09:05:00 | 16.50 | ok | sonnet | $0.14 | 1 |" in md
+    assert "smoke" not in md
+    # the model's text sits in a code span, longer than its own backticks: no link (a bare
+    # URL included), image, HTML or emphasis; in a table its pipes are escaped too
+    span = "``Ignore this | [click](http://evil.example) <img src=x onerror=alert(1)> `code` next``"
+    assert f"- The day mode's reason: {span}" in md
+    assert f"- The review (ok): {span}" in md
+    cell = span.replace("|", "\\|")
+    assert f"| XYZ | {cell} |  | `a \\| b` | good_process |" in md
+    page = render_html(report)
+    assert "<img" not in page
+    assert "&lt;img src=x onerror=alert(1)&gt;" in page
+
+
+async def test_a_day_book_b_was_kept_off_says_why(journal: Journal) -> None:
+    report = await build_daily(journal, DAY, books=("A",), mode="paper", session=None, now=NOW,
+                               book_b_off="--no-llm")  # fmt: skip
+    assert "- LLM calls: none (Book B off: --no-llm)" in render_markdown(report)
 
 
 def test_cli_regenerates_a_report_offline(repo: Path) -> None:
