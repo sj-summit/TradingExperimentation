@@ -6,10 +6,12 @@ D-063, D-069).
     latest trade), and the symbols with news in the brief's window, through
     ``candidates.select_premarket``; then EDGAR prefetched for the picks, within its budget;
   - the brief's pack at 09:05, the vet's at arming, the review's from ``ReviewWork`` (P4.10);
-  - the common sections: the session, today's events, the index ETFs' gaps (one snapshot of the
-    regime symbols, against the close of the bar dated the previous session), the previous
-    session's regime tags, Book B's equity and recent R, the experiment's numbers, and whether
-    the news could be read (``news_unavailable``: an empty list then means unknown, not none).
+  - the common sections: the session, today's events, the index ETFs (one snapshot of the
+    regime symbols, against the close of the bar dated the previous session: the pre-market
+    gap before the open, then the opening gap and the change since that close; ``index_market``),
+    the previous session's regime tags, Book B's equity and recent R, the experiment's numbers,
+    and whether the news could be read (``news_unavailable``: an empty list then means unknown,
+    not none).
 
   Building runs off the event loop beside a threaded journal: the sanitizer can take seconds on
   an adversarial pack (D-063). Beside an inline journal (simdrive) it runs inline, so a SimClock
@@ -34,7 +36,9 @@ from trader.config import BookName, RiskConfig, Settings
 from trader.core.calendar import DayTimes, Session
 from trader.core.clock import Clock, ensure_et, fmt_iso, parse_et_iso
 from trader.core.events import Event
-from trader.core.models import Signal
+from trader.core.models import Bar, Signal, Snapshot, Trade
+from trader.data import indicators
+from trader.data.conditions import counts_for_price
 from trader.data.replay import ReplayMissError
 from trader.llm.candidates import Listing, PremarketCandidate, premarket_gap, select_premarket
 from trader.llm.context import (
@@ -44,6 +48,7 @@ from trader.llm.context import (
     EncodedPack,
     Market,
     Pack,
+    PlaybookEntry,
     Role,
     Trimmed,
     VetCandidate,
@@ -54,6 +59,7 @@ from trader.llm.context import (
     vet_pack,
 )
 from trader.memory.journal import Journal
+from trader.memory.playbook import matching, playbook, vet_features
 from trader.memory.regime import RegimeTags
 from trader.orchestrator.evidence import EvidenceDesk, evidence_for
 from trader.orchestrator.ports import DayMarket, PackSource, ReviewWork
@@ -92,6 +98,60 @@ async def recent_r(journal: Journal, book: BookName, day: date) -> list[float]:
         (book, day.isoformat(), RECENT_TRADES),
     )
     return [float(r["r_multiple"]) for r in rows]
+
+
+def index_market(
+    snapshots: Mapping[str, Snapshot],
+    symbols: Sequence[str],
+    *,
+    previous_session: date,
+    session: Session,
+    as_of: datetime,
+) -> tuple[dict[str, float | None], dict[str, float | None] | None]:
+    """The index ETFs' gaps, and from the open their changes, in percent against the close of the
+    daily bar dated ``previous_session`` (``Market``; D-073).
+
+    Before the open Alpaca's ``dailyBar`` is the previous session's and ``prevDailyBar`` the one
+    before; after it ``dailyBar`` is today's and ``prevDailyBar`` the previous session's
+    (D-024). So a bar is picked by its date, not by its name.
+    - **Before the open** (the brief), the gap is the last print since 04:00 against that close
+      (``premarket_gap``), and there are no changes.
+    - **From the open** (the vet, the review), the gap is today's opening gap: today's daily
+      bar's open against that close. The change runs to the last regular-hours print, else to
+      today's bar's close: a 16:15 snapshot's latest trade can be an after-hours print.
+
+    Unknown (None) when the bar needed is missing."""
+    opened = ensure_et(as_of) >= session.open
+    gaps: dict[str, float | None] = {}
+    changes: dict[str, float | None] = {}
+    for symbol in symbols:
+        snap = snapshots.get(symbol)
+        bars = () if snap is None else (snap.daily_bar, snap.prev_daily_bar)
+        prev = _dated(bars, previous_session)
+        last = snap.latest_trade if snap is not None else None
+        if not opened:
+            gaps[symbol] = (
+                None if prev is None else premarket_gap(prev.close, last, day=session.date)
+            )
+            continue
+        today = _dated(bars, session.date)
+        if prev is None or prev.close <= 0 or today is None:
+            gaps[symbol] = changes[symbol] = None
+            continue
+        price = last.price if last is not None and _regular(last, session) else today.close
+        gaps[symbol] = indicators.gap_pct(today.open, prev.close)
+        changes[symbol] = indicators.gap_pct(price, prev.close)
+    return gaps, (changes if opened else None)
+
+
+def _dated(bars: Iterable[Bar | None], day: date) -> Bar | None:
+    return next((b for b in bars if b is not None and ensure_et(b.ts).date() == day), None)
+
+
+def _regular(print_: Trade, session: Session) -> bool:
+    """A print from the session's regular hours that may set a price."""
+    at = ensure_et(print_.ts)
+    return session.open <= at < session.close and print_.price > 0 and counts_for_price(print_)
 
 
 class LivePacks:
@@ -164,16 +224,18 @@ class LivePacks:
         news = await self._evidence.news(symbols, since=now - self._lookback("vet"))
         names = await self._names(symbols)
         evidence = evidence_for(symbols, news, filings)
+        lessons = await self._playbook()
         candidates = [
             VetCandidate(
                 signal=s,
                 name=names.get(s.symbol, ("", ""))[0],
                 exchange=names.get(s.symbol, ("", ""))[1],
                 evidence=evidence[s.symbol],
+                lessons=tuple(matching(lessons, vet_features(s))),
             )
             for s in ranked
         ]
-        common = await self._common(now, book_b)
+        common = await self._common(now, book_b, playbook=lessons)
         limits = role_limits(ctx.settings, "vet")
         return await self._build(
             lambda: ctx.encode(
@@ -203,7 +265,9 @@ class LivePacks:
             return await asyncio.to_thread(make)
         return make()
 
-    async def _common(self, as_of: datetime, book_b: BookB) -> Common:
+    async def _common(
+        self, as_of: datetime, book_b: BookB, *, playbook: Sequence[PlaybookEntry] | None = None
+    ) -> Common:
         """The common sections. Call it after the role's news read: ``news_available`` says
         whether that read, and the feed behind it, could be trusted."""
         ctx = self._ctx
@@ -211,19 +275,21 @@ class LivePacks:
             session=ctx.session,
             times=ctx.times,
             events=ctx.events,
-            market=Market(gaps=await self._index_gaps(as_of), regime=ctx.regime),
+            market=await self._market(as_of),
             book_b=book_b,
             experiment=experiment_section(ctx.settings, ctx.risk),
             news_available=self._evidence.news_ok,
+            playbook=tuple(await self._playbook() if playbook is None else playbook),
         )
 
-    async def _index_gaps(self, as_of: datetime) -> dict[str, float | None]:
-        """The regime symbols' moves against the previous session's close, from one snapshot.
+    async def _playbook(self) -> list[PlaybookEntry]:
+        """The promoted lessons, ranked (``memory/playbook.py``; D-077)."""
+        cfg = self._ctx.settings.lessons
+        return await self._ctx.journal.read(lambda conn: playbook(conn, cfg))
 
-        That close is the daily bar dated the previous session. Before the open Alpaca's
-        ``dailyBar`` is that session's and ``prevDailyBar`` the one before; after the open
-        ``prevDailyBar`` is that session's (D-024). So the bar is picked by its date, not by
-        its name. Unknown (None) when no bar has that date or the snapshot fails."""
+    async def _market(self, as_of: datetime) -> Market:
+        """The index ETFs from one snapshot of the regime symbols (``index_market``); unknown
+        when the snapshot fails."""
         ctx = self._ctx
         symbols = list(ctx.settings.data.regime_symbols)
         try:
@@ -231,23 +297,10 @@ class LivePacks:
         except Exception as exc:
             log.warning("index gaps unknown", error=f"{type(exc).__name__}: {exc}")
             snaps = {}
-        out: dict[str, float | None] = {}
-        for symbol in symbols:
-            snap = snaps.get(symbol)
-            bars = () if snap is None else (snap.daily_bar, snap.prev_daily_bar)
-            prev = next(
-                (
-                    b
-                    for b in bars
-                    if b is not None and ensure_et(b.ts).date() == ctx.previous_session
-                ),
-                None,
-            )
-            last = snap.latest_trade if snap is not None else None
-            out[symbol] = (
-                None if prev is None else premarket_gap(prev.close, last, day=as_of.date())
-            )
-        return out
+        gaps, changes = index_market(
+            snaps, symbols, previous_session=ctx.previous_session, session=ctx.session, as_of=as_of
+        )
+        return Market(gaps=gaps, changes=changes, regime=ctx.regime)
 
     async def _listings(self) -> list[Listing]:
         rows = await self._ctx.journal.fetch_all(

@@ -6,6 +6,7 @@
     {"time": "14:00", "name": "FOMC minutes (fictional)", "impact": "high"}
   ],
   "market_gaps": {"SPY": -0.38, "QQQ": -0.61, "IWM": 0.12},
+  "market_changes": {"SPY": -0.21, "QQQ": -0.47, "IWM": 0.35},
   "sources": ["benzinga", "globenewswire", "businesswire", "accesswire", "prnewswire"],
   "issuers": [
     {"symbol": "QZBRIN", "name": "Brindlewood Therapeutics Inc", "exchange": "NASDAQ", "kind": "biotech", "prev_close": "3.12", "gap_pct": 48.6},

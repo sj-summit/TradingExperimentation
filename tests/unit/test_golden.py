@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from tests.fixtures import g3_day
+from tests.fixtures import g3_day, g4b_day
 from tests.fixtures.dayrun import DayRun
 from tests.fixtures.days import DAY, standard_day
 from tests.fixtures.exec_harness import RISK, SETTINGS
@@ -38,9 +38,15 @@ from trader.core.models import OrderIntent
 from trader.execution.broker import OrderNotCancelable, OrderRejected
 from trader.execution.replay import ReplayBroker
 from trader.execution.sim_broker import SimBroker
+from trader.memory.stats import Bootstrap
 from trader.orchestrator.capabilities import CURRENT
 from trader.orchestrator.replay import comparable, diff, replay_day
 from trader.orchestrator.simdrive import drive
+from trader.reports.evaluation import build_memo, counts
+from trader.reports.evaluation import render_html as memo_html
+from trader.reports.weekly import build_weekly
+from trader.reports.weekly import render_html as weekly_html
+from trader.reports.weekly import render_markdown as weekly_md
 from trader.risk.ledger import LedgerEntry, insert_entries
 
 D = Decimal
@@ -301,6 +307,64 @@ async def test_the_g3_day_replays_as_it_was_recorded(tmp_path: Path) -> None:
         g3_day.GOLDEN.write_text(got + "\n", encoding="utf-8")
     want = g3_day.GOLDEN.read_text(encoding="utf-8")
     assert got + "\n" == want, "run UPDATE_GOLDEN=1 if intended"
+
+
+@pytest.mark.timeout(600)  # a whole real A+B day
+async def test_the_g4b_day_replays_as_it_was_recorded(tmp_path: Path) -> None:
+    """G4b (2026-11-20; D-072): both books on Alpaca paper's real answers, with Claude's recorded
+    packs and answers served back, give the journal the live session wrote. The engine asks
+    nothing the recording lacks and sends every call the pack it recorded. The replay's own
+    journal, the review's tables included, is pinned too; ``UPDATE_GOLDEN=1`` rewrites it."""
+    report = await replay_day(
+        recordings=g4b_day.RECORDINGS,
+        day=g4b_day.G4B_DAY,
+        out=tmp_path / "replay",
+        settings=g4b_day.settings(),
+        risk=g4b_day.risk(),
+        events=g4b_day.events(),
+    )
+    assert report.state == "DONE"
+    assert report.divergences == []
+    with closing(sqlite3.connect(tmp_path / "replay" / "trader.db")) as conn:
+        conn.row_factory = sqlite3.Row
+        assert diff(g4b_day.recorded(), comparable(conn, g4b_day.G4B_DAY)) == g4b_day.CODE_CHANGES
+        reviewed = conn.execute(
+            "SELECT status, targets_json FROM daily_reviews WHERE date = ?",
+            (g4b_day.G4B_DAY.isoformat(),),
+        ).fetchone()
+        targets = json.loads(reviewed["targets_json"])
+        stored = {r[0] for r in conn.execute("SELECT signal_id FROM signal_reviews")}
+        got = dumps(snapshot_ab(conn))
+        reports_read_the_g4b_journal(conn)
+    assert reviewed["status"] == "ok"
+    assert len(targets) == 7
+    assert stored == set(targets)
+    if os.environ.get("UPDATE_GOLDEN") == "1":
+        g4b_day.GOLDEN.write_text(got + "\n", encoding="utf-8")
+    want = g4b_day.GOLDEN.read_text(encoding="utf-8")
+    assert got + "\n" == want, "run UPDATE_GOLDEN=1 if intended"
+
+
+def reports_read_the_g4b_journal(conn: sqlite3.Connection) -> None:
+    """The weekly report and the evaluation memo on a journal the real engine wrote (P5.4,
+    P5.5). On G4b's day 10 longs triggered live and VNT's shadow on SIP bars alone: 11 with a
+    standing verdict, all allowed or neutral. BILL's veto never triggered, so there is no V
+    (D-072)."""
+    cfg = g4b_day.settings().lessons
+    week = build_weekly(conn, year=2026, week=47, boot=Bootstrap.of(cfg))
+    veto = week.epoch_stats.veto
+    assert (veto.n_allowed, veto.n_vetoed, veto.v) == (11, 0, None)
+    assert week.epoch_stats.b_minus_a.value == pytest.approx(-0.148, abs=5e-4)
+    md = weekly_md(week)
+    assert md.startswith("# Weekly report 2026-W47 (2026-11-16 to 2026-11-20)")
+    assert "| 2026-11-20 09:35 | P3 | execution.A | partial_fill_protected |" in md
+    assert "<h1>" in weekly_html(week)
+
+    memo = build_memo(conn, through=g4b_day.G4B_DAY, cfg=cfg)
+    assert memo.outcome == "keep running"
+    assert counts(memo) == "1 trading day, 11 triggered longs, 0 Book B vetoes"
+    assert memo.hypotheses[0].numbers.startswith("V n/a, no interval; allowed n 11, vetoed n 0")
+    assert "<h2>Hypotheses</h2>" in memo_html(memo)
 
 
 # ---------------------------------------------------------------- ReplayBroker

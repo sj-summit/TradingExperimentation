@@ -85,7 +85,7 @@ llm:
       model: opus
       effort: high
       timeout_s: 600
-      max_turns: 3
+      max_turns: 4               # the answer takes 2; 2 spare for the CLI's schema retries (D-073)
       allow_web: false           # E5 experiment; when true, tools = WebSearch,WebFetch and max_turns 12
       max_candidates: 40
       max_news_per_symbol: 8
@@ -93,7 +93,7 @@ llm:
       model: sonnet
       effort: low
       timeout_s: 60
-      max_turns: 3
+      max_turns: 4               # the answer takes 2; 2 spare for the CLI's schema retries (D-073)
       max_wait_s: 60             # Book B pending policy (STRATEGY.md §5.4)
       revet_premarket: false
       anonymize_entities: false  # E1 experiment
@@ -102,7 +102,7 @@ llm:
       model: opus
       effort: high
       timeout_s: 600             # repair attempt only if it can finish by 16:29 (reports at 16:30)
-      max_turns: 3
+      max_turns: 4               # the answer takes 2; 2 spare for the CLI's schema retries (D-073)
       history_days: 10           # past daily summaries recalled into the review pack (STRATEGY.md §6.6)
       notable_untraded: 5        # extra triggered signals reviewed: largest |shadow_r| that no book traded (§6.5)
       max_news_per_target: 5

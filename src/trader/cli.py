@@ -36,6 +36,17 @@ followups_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(followups_app, name="followups")
+epoch_app = typer.Typer(
+    help="The evaluation epoch: which one is current, and starting the next; only you start "
+    "one (STRATEGY.md 9).",
+    no_args_is_help=True,
+)
+app.add_typer(epoch_app, name="epoch")
+lessons_app = typer.Typer(
+    help="Claude's lesson proposals, tested by code on later signals (STRATEGY.md 6.2-6.3).",
+    no_args_is_help=True,
+)
+app.add_typer(lessons_app, name="lessons")
 
 DateOption = Annotated[
     str | None,
@@ -297,6 +308,109 @@ async def _report_daily(root: Path, date: str | None) -> None:
         typer.echo(f"report: {md}\n        {page}")
 
 
+@report_app.command("weekly")
+def report_weekly(
+    ctx: typer.Context,
+    week: Annotated[
+        str | None,
+        typer.Option(
+            "--week", help="ISO week YYYY-Www, e.g. 2026-W47. Default: the last one done."
+        ),
+    ] = None,
+    offline: Annotated[
+        bool, typer.Option("--offline", help="Don't fetch SPY's missing daily closes.")
+    ] = False,
+) -> None:
+    """The week's report (Markdown and HTML), with the epoch to date. First fetches the
+    week's missing SPY closes (one SIP request a session), unless --offline."""
+    _run(_report_weekly(ctx.obj, week, offline=offline))
+
+
+async def _report_weekly(root: Path, week: str | None, *, offline: bool) -> None:
+    import re
+
+    from trader.reports.weekly import fill_spy_closes, iso_week, last_complete_week
+    from trader.runtime import open_local, open_runtime
+
+    picked: tuple[int, int] | None = None
+    if week is not None:
+        found = re.fullmatch(r"(\d{4})-W(\d{2})", week.strip())
+        if found is None:
+            typer.echo(f"--week takes YYYY-Www, like 2026-W47, not {week!r}")
+            raise typer.Exit(1)
+        picked = (int(found[1]), int(found[2]))
+    if offline:
+        async with open_local(root) as local:
+            await _write_weekly(local, picked or last_complete_week(local.clock.now().date()))
+        return
+    async with open_runtime(root) as rt:
+        chosen = picked or last_complete_week(rt.clock.now().date())
+        first, last = iso_week(*chosen)
+        rows = await rt.journal.fetch_all(
+            "SELECT DISTINCT date FROM daily_stats WHERE date BETWEEN ? AND ? ORDER BY date",
+            (first.isoformat(), last.isoformat()),
+        )
+        sessions = [dt.date.fromisoformat(r["date"]) for r in rows]
+        missing = await fill_spy_closes(rt.journal, rt.rest, rt.clock, sessions)
+        if missing:
+            typer.echo(f"SPY's close still missing for {', '.join(map(str, missing))}")
+        await _write_weekly(rt, chosen)
+
+
+@report_app.command("evaluation")
+def report_evaluation(
+    ctx: typer.Context,
+    epoch: Annotated[
+        int | None, typer.Option("--epoch", help="The epoch to judge. Default: the current one.")
+    ] = None,
+    through: Annotated[
+        str | None, typer.Option("--through", help="Its last session YYYY-MM-DD. Default: today.")
+    ] = None,
+) -> None:
+    """The pre-registered evaluation memo (STRATEGY.md 8): every criterion pass, fail or
+    insufficient data, and the outcome. Nothing here trades live. Offline."""
+    _run(_report_evaluation(ctx.obj, epoch, through))
+
+
+async def _report_evaluation(root: Path, epoch: int | None, through: str | None) -> None:
+    from trader.reports.evaluation import build_memo, counts, write_memo
+    from trader.runtime import open_local
+
+    try:
+        picked = dt.date.fromisoformat(through.strip()) if through is not None else None
+    except ValueError:
+        typer.echo(f"--through takes YYYY-MM-DD, like 2026-11-20, not {through!r}")
+        raise typer.Exit(1) from None
+    async with open_local(root) as local:
+        last = picked or local.clock.now().date()
+        cfg = local.cfg.settings.lessons
+        memo = await local.journal.read(
+            lambda conn: build_memo(conn, through=last, cfg=cfg, epoch=epoch)
+        )
+        md, page = write_memo(memo, local.cfg.path(local.cfg.settings.storage.reports_dir))
+    typer.echo(f"epoch {memo.epoch} through {memo.through}: {memo.outcome} ({counts(memo)})")
+    typer.echo(f"report: {md}\n        {page}")
+
+
+async def _write_weekly(local: Any, chosen: tuple[int, int]) -> None:
+    from trader.memory.stats import Bootstrap
+    from trader.reports.weekly import build_weekly, write_weekly
+
+    boot = Bootstrap.of(local.cfg.settings.lessons)
+    year, week = chosen
+    report = await local.journal.read(
+        lambda conn: build_weekly(conn, year=year, week=week, boot=boot)
+    )
+    md, page = write_weekly(report, local.cfg.path(local.cfg.settings.storage.reports_dir))
+    v = report.epoch_stats.veto
+    value = "-" if v.v is None else f"{v.v:+.3f}"
+    typer.echo(
+        f"week {year}-W{week:02d}: {len(report.curve)} sessions in epoch {report.epoch}; "
+        f"V {value} (n {v.n_allowed}/{v.n_vetoed})"
+    )
+    typer.echo(f"report: {md}\n        {page}")
+
+
 @followups_app.command("list")
 def followups_list(
     ctx: typer.Context,
@@ -373,6 +487,140 @@ async def _followups_set(root: Path, kind: str, item_id: int, status: str, respo
 def _printable(text: str) -> str:
     """A model's text for the terminal: no control characters or escape sequences."""
     return "".join(ch if ch.isprintable() else " " for ch in text)
+
+
+@lessons_app.command("evaluate")
+def lessons_evaluate(
+    ctx: typer.Context,
+    promote: Annotated[
+        bool, typer.Option("--promote", help="Store the outcomes: promote, reject or demote.")
+    ] = False,
+) -> None:
+    """Test every proposed and promoted lesson on the current epoch's signals after the day that
+    proposed it. Without --promote nothing is written. Offline."""
+    _run(_lessons_evaluate(ctx.obj, promote=promote))
+
+
+@lessons_app.command("list")
+def lessons_list(ctx: typer.Context) -> None:
+    """Every lesson, with its status, numbers and statement. Offline."""
+    _run(_lessons_list(ctx.obj))
+
+
+async def _lessons_evaluate(root: Path, *, promote: bool) -> None:
+    from trader.memory.lessons import evaluate_lessons
+    from trader.memory.playbook import PLAYBOOK_FILE, playbook, write_playbook
+    from trader.runtime import open_local
+
+    async with open_local(root) as local:
+        now, cfg = local.clock.now(), local.cfg.settings.lessons
+        outcomes = await (local.journal.write if promote else local.journal.read)(
+            lambda conn: evaluate_lessons(conn, now=now, cfg=cfg, write=promote)
+        )
+        if promote:
+            entries = await local.journal.read(lambda conn: playbook(conn, cfg))
+            runtime = local.cfg.path(local.cfg.settings.storage.db_path).parent
+            written = write_playbook(runtime / PLAYBOOK_FILE, entries, as_of=now)
+    if not outcomes:
+        typer.echo("No proposed or promoted lessons.")
+    for o in outcomes:
+        typer.echo(f"{o.lesson.id:<6} {o.lesson.status:>8} -> {o.status:<8} "
+                   f"{_numbers(o.evaluation)}  {o.reason}")  # fmt: skip
+    if promote:
+        typer.echo(f"playbook: {len(entries)} lessons in {written}")
+    else:
+        typer.echo("nothing written (--promote stores the outcomes)")
+
+
+async def _lessons_list(root: Path) -> None:
+    from trader.memory.lessons import read_lessons
+    from trader.runtime import open_local
+
+    async with open_local(root) as local:
+        rows = await local.journal.fetch_all("SELECT * FROM lessons ORDER BY id")
+        lessons = {x.id: x for x in await local.journal.read(read_lessons)}
+    if not rows:
+        typer.echo("No lessons yet.")
+    for r in rows:
+        ci = "" if r["ci_low"] is None else f" CI [{r['ci_low']:+.2f}, {r['ci_high']:+.2f}]"
+        effect = "" if r["effect_r"] is None else f" effect {r['effect_r']:+.2f}R"
+        n = "" if r["n_subset"] is None else f" n {r['n_subset']}/{r['n_complement']}"
+        typer.echo(f"{r['id']:<6} {r['status']:<8}{n}{effect}{ci}  "
+                   f"{_printable(lessons[r['id']].statement)}")  # fmt: skip
+
+
+def _numbers(ev: Any) -> str:
+    if ev is None:
+        return "-"
+    effect = "effect -" if ev.effect_r is None else f"effect {ev.effect_r:+.2f}R"
+    i = ev.interval
+    ci = "" if i is None else f" CI [{i.low:+.2f}, {i.high:+.2f}]"
+    return f"n {ev.n_subset}/{ev.n_complement} {effect}{ci}"
+
+
+@epoch_app.command("show")
+def epoch_show(ctx: typer.Context) -> None:
+    """The current epoch, and every epoch's record. Offline."""
+    _run(_epoch_show(ctx.obj))
+
+
+@epoch_app.command("start")
+def epoch_start(
+    ctx: typer.Context,
+    epoch: Annotated[int, typer.Argument(help="The next epoch's number: the current one + 1.")],
+    decision: Annotated[str, typer.Option("--decision", help="Its DECISIONS entry: D-080.")],
+    reason: Annotated[str, typer.Option("--reason", help="Why it begins, for the record.")],
+    note: Annotated[
+        int | None, typer.Option("--note", help="The review note that led to it, if one did.")
+    ] = None,
+) -> None:
+    """Start the next evaluation epoch: record it with the hashes of the settings, risk and
+    events files and the LLM fingerprint, and make it current. Yours to run, never while a
+    run-day is. Offline."""
+    _run(_epoch_start(ctx.obj, epoch, decision=decision, reason=reason, note=note))
+
+
+async def _epoch_show(root: Path) -> None:
+    from trader.memory.epochs import current_epoch, epochs
+    from trader.runtime import open_local
+
+    async with open_local(root) as local:
+        now, rows = await local.journal.read(lambda conn: (current_epoch(conn), epochs(conn)))
+    typer.echo(f"current epoch: {now}")
+    for e in rows:
+        since = e.started_at[:10] if e.started_at else "the start"
+        note = f", note {e.note_id}" if e.note_id is not None else ""
+        typer.echo(f"  {e.epoch}  since {since}  {e.decision or '-'}{note}: {e.reason}")
+
+
+async def _epoch_start(
+    root: Path, epoch: int, *, decision: str, reason: str, note: int | None
+) -> None:
+    import hashlib
+
+    from trader.memory.epochs import EpochError, start_epoch
+    from trader.orchestrator.lock import LOCK_NAME, RunLock
+    from trader.runtime import open_local
+
+    async with open_local(root) as local:
+        cfg = local.cfg
+        files = {"settings": "settings.yaml", "risk": "risk.yaml", "events": "events.yaml"}
+        hashes = {
+            name: hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+            for name, path in ((n, cfg.root / "config" / f) for n, f in files.items())
+        }
+        now = local.clock.now()
+        # the epoch never changes in the middle of a day: run-day stamps its rows with it
+        with RunLock(cfg.path(cfg.settings.storage.db_path).parent / LOCK_NAME):
+            try:
+                row = await local.journal.write(
+                    lambda conn: start_epoch(conn, epoch=epoch, at=now, reason=reason,
+                                             decision=decision, note_id=note, hashes=hashes)
+                )  # fmt: skip
+            except EpochError as exc:
+                typer.echo(str(exc))
+                raise typer.Exit(1) from exc
+    typer.echo(f"epoch {row.epoch} begins ({row.decision}): {row.reason}")
 
 
 @notify_app.command("test")

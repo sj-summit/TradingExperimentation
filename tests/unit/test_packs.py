@@ -228,6 +228,77 @@ async def test_unknown_index_gaps_when_the_snapshot_fails(journal: Journal) -> N
     pack = await drive(clock, live(journal, clock, market, News([]), Edgar()).brief(book_b=BOOK_B))
     gaps = json.loads(pack.data)["market"]
     assert (gaps["spy_gap_pct"], gaps["qqq_gap_pct"], gaps["iwm_gap_pct"]) == (None, None, None)
+    assert "spy_change_pct" not in gaps  # before the open: no changes
+
+
+def bar(day: date, open_: str, close: str) -> Bar:
+    o, c = D(open_), D(close)
+    return Bar(ts=et_datetime(day, time(0)), open=o, high=max(o, c), low=min(o, c), close=c,
+               volume=1)  # fmt: skip
+
+
+def rounded(values: dict[str, float | None] | None) -> dict[str, float | None]:
+    assert values is not None
+    return {k: None if v is None else round(v, 2) for k, v in values.items()}
+
+
+def test_after_the_close_the_index_market_is_the_open_s_gap_and_the_day_s_change() -> None:
+    """D-073, with G4b's numbers: at 16:15 SPY had opened 0.32% down and closed 3.51% down. The
+    change runs to the last regular-hours print; QQQ's latest print came after the close, so its
+    change runs to today's bar's close instead (-5.48%, not the after-hours -5.13%)."""
+    snaps = {
+        "SPY": Snapshot(symbol="SPY", latest_trade=trade("SPY", "690.68", at(15, 59, 59)),
+                        daily_bar=bar(DAY, "713.56", "690.68"),
+                        prev_daily_bar=daily(PREVIOUS, "715.84")),
+        "QQQ": Snapshot(symbol="QQQ", latest_trade=trade("QQQ", "611.98", at(16, 13)),
+                        daily_bar=bar(DAY, "638.48", "609.75"),
+                        prev_daily_bar=daily(PREVIOUS, "645.095")),
+        "IWM": Snapshot(symbol="IWM", daily_bar=daily(PREVIOUS, "264.21")),  # no bar for today
+    }  # fmt: skip
+    gaps, changes = packs_module.index_market(
+        snaps, ["SPY", "QQQ", "IWM", "DIA"], previous_session=PREVIOUS, session=SESSION,
+        as_of=at(16, 15),
+    )  # fmt: skip
+    assert rounded(gaps) == {"SPY": -0.32, "QQQ": -1.03, "IWM": None, "DIA": None}
+    assert rounded(changes) == {"SPY": -3.51, "QQQ": -5.48, "IWM": None, "DIA": None}
+
+
+def test_at_the_vet_the_change_runs_to_the_last_regular_hours_print() -> None:
+    """At 09:35 the change uses the latest print once the session has opened; a print from
+    before the open, or one whose conditions set no price, falls back to today's bar's close."""
+    odd = Trade(symbol="IWM", ts=at(9, 35, 6), price=D("250"), size=10, conditions=("@", "I"))
+    snaps = {
+        "SPY": Snapshot(symbol="SPY", latest_trade=trade("SPY", "712.745", at(9, 35, 7)),
+                        daily_bar=bar(DAY, "713.56", "712.05"),
+                        prev_daily_bar=daily(PREVIOUS, "715.84")),
+        "QQQ": Snapshot(symbol="QQQ", latest_trade=trade("QQQ", "640", at(9, 29, 59)),
+                        daily_bar=bar(DAY, "638.48", "635"),
+                        prev_daily_bar=daily(PREVIOUS, "645.095")),
+        "IWM": Snapshot(symbol="IWM", latest_trade=odd, daily_bar=bar(DAY, "263.29", "263.9"),
+                        prev_daily_bar=daily(PREVIOUS, "264.21")),
+    }  # fmt: skip
+    gaps, changes = packs_module.index_market(
+        snaps, ["SPY", "QQQ", "IWM"], previous_session=PREVIOUS, session=SESSION,
+        as_of=at(9, 35, 7),
+    )  # fmt: skip
+    assert rounded(gaps) == {"SPY": -0.32, "QQQ": -1.03, "IWM": -0.35}
+    assert rounded(changes) == {"SPY": -0.43, "QQQ": -1.56, "IWM": -0.12}
+
+
+async def test_the_vet_s_pack_carries_the_changes_and_the_brief_s_does_not(
+    journal: Journal,
+) -> None:
+    clock = SimClock(at(9, 35, 5))
+    market = Market()
+    market.bars = {"SPY": (bar(DAY, "505", "506"), daily(PREVIOUS, "500"))}
+    market.prints = {"SPY": trade("SPY", "507", at(9, 35, 4))}
+    source = live(journal, clock, market, News([]), Edgar())
+    vet = json.loads((await drive(clock, source.vet([signal("AAA", 1)], book_b=BOOK_B,
+                                                     edgar_until=clock.now()))).data)  # fmt: skip
+    assert {k: v for k, v in vet["market"].items() if k.startswith("spy_")} == {
+        "spy_gap_pct": 1.0, "spy_change_pct": 1.4,
+    }  # fmt: skip
+    assert (vet["market"]["qqq_gap_pct"], vet["market"]["qqq_change_pct"]) == (None, None)
 
 
 @pytest.mark.parametrize(

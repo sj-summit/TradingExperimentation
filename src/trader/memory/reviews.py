@@ -71,9 +71,12 @@ from trader.llm.context import (
     role_limits,
 )
 from trader.llm.schemas import DailyReview, SymbolAssessment
+from trader.memory.epochs import current_epoch
 from trader.memory.journal import Journal, db_to_dec
 from trader.memory.shadow import ShadowOutcome
+from trader.memory.stats import Bootstrap, VetoValue, read_epoch, veto_value
 from trader.memory.trades import TradeRow, trade_from_row
+from trader.memory.verdict_view import standing_for_day, standing_verdicts
 from trader.strategy.orb_sip import signal_from_row
 
 log = structlog.get_logger(__name__)
@@ -237,7 +240,13 @@ class _Gathered:
 
 
 def _gather(
-    conn: sqlite3.Connection, day: date, as_of: datetime, *, lookback: timedelta, history_days: int
+    conn: sqlite3.Connection,
+    day: date,
+    as_of: datetime,
+    *,
+    lookback: timedelta,
+    history_days: int,
+    boot: Bootstrap | None = None,
 ) -> _Gathered:
     d = day.isoformat()
     signals = [
@@ -248,15 +257,12 @@ def _gather(
     ]
     ids = {s.id for s in signals}
     decisions: dict[str, dict[str, str]] = defaultdict(dict)
-    rested: dict[str, str] = {}  # signal id -> the call Book B's decision rests on
     for r in conn.execute(
-        "SELECT f.signal_id, f.book, f.reason_code, f.llm_call_id FROM final_decisions f "
+        "SELECT f.signal_id, f.book, f.reason_code FROM final_decisions f "
         "JOIN signals s ON s.id = f.signal_id WHERE s.date = ?",
         (d,),
     ):
         decisions[r["signal_id"]][r["book"]] = r["reason_code"]
-        if r["book"] == "B" and r["llm_call_id"]:
-            rested[r["signal_id"]] = r["llm_call_id"]
     trades: dict[str, dict[str, TradeRow]] = defaultdict(dict)
     for r in conn.execute("SELECT * FROM trades WHERE entry_ts LIKE ? ORDER BY id", (f"{d}T%",)):
         t = trade_from_row(r)
@@ -268,7 +274,7 @@ def _gather(
         sig = by_id.get(r["signal_id"])
         if sig is not None:
             shadows[sig.id] = (_shadow(r, sig), bool(r["sip_only_trigger"]))
-    verdicts = _b_verdicts(conn, day, signals, rested)
+    verdicts = _b_verdicts(conn, day)
     out = []
     for sig in signals:
         shadow, sip_only = shadows.get(sig.id, (None, False))
@@ -308,7 +314,7 @@ def _gather(
                 (f"{d}T%",),
             )
         ],
-        stats=epoch_stats(conn, current_epoch(conn), day),
+        stats=epoch_stats(conn, current_epoch(conn), day, boot=boot),
         lessons=_lessons(conn),
         history=read_history(conn, day, days=history_days),
     )
@@ -330,10 +336,8 @@ def _shadow(r: sqlite3.Row, sig: Signal) -> ShadowOutcome:
     )
 
 
-def _b_verdicts(
-    conn: sqlite3.Connection, day: date, signals: Sequence[Signal], rested: Mapping[str, str]
-) -> dict[str, VerdictRow]:
-    """Book B's verdict per symbol: the one its decision rests on, else the day's latest."""
+def _b_verdicts(conn: sqlite3.Connection, day: date) -> dict[str, VerdictRow]:
+    """Book B's standing verdict per symbol (``verdict_view``), with when its pack was sent."""
     sent = {
         r["logical_id"]: parse_et_iso(r["sent"])
         for r in conn.execute(
@@ -342,18 +346,8 @@ def _b_verdicts(
             (day.isoformat(),),
         )
     }
-    rests = {sig.symbol: rested[sig.id] for sig in signals if sig.id in rested}
-    out: dict[str, VerdictRow] = {}
-    chosen: set[str] = set()
-    for r in conn.execute(
-        "SELECT v.*, c.logical_id FROM verdicts v JOIN llm_calls c ON c.id = v.llm_call_id "
-        "WHERE v.date = ? AND c.purpose = 'trading' ORDER BY v.id",
-        (day.isoformat(),),
-    ):
-        symbol = r["symbol"]
-        if symbol in chosen:
-            continue
-        row = VerdictRow(
+    return {
+        symbol: VerdictRow(
             assessment=SymbolAssessment(
                 symbol=symbol,
                 catalyst_type=r["catalyst_type"],
@@ -368,10 +362,8 @@ def _b_verdicts(
             llm_call_id=r["llm_call_id"],
             sent_at=sent.get(r["logical_id"]),
         )
-        out[symbol] = row  # oldest first: the latest wins, unless the decision named one
-        if rests.get(symbol) == r["llm_call_id"]:
-            chosen.add(symbol)
-    return out
+        for symbol, r in standing_for_day(conn, day).items()
+    }
 
 
 def _books(conn: sqlite3.Connection, day: date) -> dict[str, BookResult]:
@@ -388,11 +380,6 @@ def _books(conn: sqlite3.Connection, day: date) -> dict[str, BookResult]:
     return out
 
 
-def current_epoch(conn: sqlite3.Connection) -> int:
-    row = conn.execute("SELECT value FROM meta WHERE key = 'eval_epoch'").fetchone()
-    return int(row[0]) if row is not None else 0
-
-
 def running_stats(
     *,
     epoch: int,
@@ -401,10 +388,14 @@ def running_stats(
     b_r: Sequence[float],
     shadow_r: Sequence[float],
     vetoed_r: Sequence[float],
-    b_vetoes: int,
+    b_vetoed_triggers: int,
+    b_veto_verdicts: int,
 ) -> dict[str, float | int | None]:
     """The review's ``stats``: each book's trades, mean R and win rate; the triggered longs'
-    shadow R; Book B's vetoes and the shadow R they turned down."""
+    shadow R; Book B's vetoes and the shadow R they turned down (D-073):
+    - ``b_vetoed_triggers``: Book B's ``vetoed`` decisions, each a veto of a signal that
+      triggered on the live feed, and ``b_vetoed_mean_shadow_r`` their mean shadow R;
+    - ``b_veto_verdicts``: the longs whose standing verdict is a veto, triggered or not."""
     out: dict[str, float | int | None] = {"epoch": epoch, "days": days}
     for key, rs in (("a", a_r), ("b", b_r)):
         out[f"{key}_trades"] = len(rs)
@@ -412,13 +403,32 @@ def running_stats(
         out[f"{key}_win_rate"] = (sum(r > 0 for r in rs) / len(rs)) if rs else None
     out["shadow_longs"] = len(shadow_r)
     out["shadow_mean_r"] = _mean(shadow_r)
-    out["b_vetoes"] = b_vetoes
+    out["b_vetoed_triggers"] = b_vetoed_triggers
     out["b_vetoed_mean_shadow_r"] = _mean(vetoed_r)
+    out["b_veto_verdicts"] = b_veto_verdicts
     return out
 
 
-def epoch_stats(conn: sqlite3.Connection, epoch: int, day: date) -> dict[str, float | int | None]:
-    """The epoch's running numbers, through ``day`` (S§6.1's rolling stats)."""
+def veto_stats(veto: VetoValue) -> dict[str, float | int | None]:
+    """The veto value's numbers for the review's ``stats`` (``memory/stats.py``; D-075): V, its
+    interval and each side's n over the triggered longs with a standing verdict, and the vetoed
+    side's own mean shadow R."""
+    interval = veto.v_interval
+    return {
+        "v_r": veto.v,
+        "v_ci_low": None if interval is None else interval.low,
+        "v_ci_high": None if interval is None else interval.high,
+        "v_n_allowed": veto.n_allowed,
+        "v_n_vetoed": veto.n_vetoed,
+        "v_vetoed_mean_r": veto.mean_vetoed,
+    }
+
+
+def epoch_stats(
+    conn: sqlite3.Connection, epoch: int, day: date, *, boot: Bootstrap | None = None
+) -> dict[str, float | int | None]:
+    """The epoch's running numbers, through ``day`` (S§6.1's rolling stats); with ``boot``, the
+    veto value and its interval too (``veto_stats``)."""
     d = day.isoformat()
     row = conn.execute(
         "SELECT COUNT(DISTINCT date) FROM daily_stats WHERE eval_epoch = ? AND date <= ?",
@@ -452,15 +462,31 @@ def epoch_stats(conn: sqlite3.Connection, epoch: int, day: date) -> dict[str, fl
             (epoch, d),
         )
     ]
-    return running_stats(
+    longs = {
+        (r["date"], r["symbol"])
+        for r in conn.execute(
+            "SELECT date, symbol FROM signals WHERE eval_epoch = ? AND date <= ? "
+            "AND direction = 'long'",
+            (epoch, d),
+        )
+    }
+    first = min((date.fromisoformat(when) for when, _ in longs), default=day)
+    standing = standing_verdicts(conn, first=first, last=day)
+    out = running_stats(
         epoch=epoch,
         days=int(row[0]),
         a_r=books["A"],
         b_r=books["B"],
         shadow_r=shadow,
         vetoed_r=[r for r in vetoed if r is not None],
-        b_vetoes=len(vetoed),
+        b_vetoed_triggers=len(vetoed),
+        b_veto_verdicts=sum(
+            1 for key, v in standing.items() if key in longs and v["verdict"] == "veto"
+        ),
     )
+    if boot is not None:
+        out |= veto_stats(veto_value(read_epoch(conn, epoch, last=day).longs, boot))
+    return out
 
 
 def _mean(values: Sequence[float]) -> float | None:
@@ -872,9 +898,15 @@ class DailyReviewWork:
         limits = role_limits(settings, "review")
         news = settings.news
         lookback = timedelta(hours=max(news.premarket_lookback_hours, news.vet_lookback_hours))
+        boot = Bootstrap.of(settings.lessons)
         got = await self._journal.read(
             lambda conn: _gather(
-                conn, day, ensure_et(as_of), lookback=lookback, history_days=limits.history_days
+                conn,
+                day,
+                ensure_et(as_of),
+                lookback=lookback,
+                history_days=limits.history_days,
+                boot=boot,
             )
         )
         if not got.signals:

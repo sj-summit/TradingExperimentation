@@ -312,7 +312,7 @@ def test_the_frame_is_shared_and_ordered() -> None:
         "events_today", "news_unavailable", "market", "book_b", "playbook",
         "candidates_omitted", "candidates", "instructions_note",
     ]  # fmt: skip
-    assert body["pack_version"] == 2
+    assert body["pack_version"] == 3
     assert body["news_unavailable"] is False
     assert body["role"] == "premarket"
     assert body["as_of"] == "2026-11-03T09:05:00-05:00"
@@ -340,6 +340,20 @@ def test_the_frame_is_shared_and_ordered() -> None:
         "filing_forms": list(FORMS),
     }  # fmt: skip
     assert body["instructions_note"] == ctx.INSTRUCTIONS_NOTE
+
+
+def test_from_the_open_the_market_holds_each_index_s_gap_and_change() -> None:
+    """D-073: after the open (the vet's and the review's packs) each index has its opening gap
+    and its change since the previous close; before it (the brief's) only the pre-market gap.
+    The change has its own name: a review target's ``spy_move_pct`` is SPY over its window."""
+    market = Market(gaps={"SPY": -0.3184, "QQQ": None}, changes={"SPY": -3.5149, "QQQ": None})
+    later = common(market=market, book_b=BookB(equity=Decimal("996.08"), day_mode="normal"))
+    body = decoded(encode(review_pack(**review_inputs(common=later))))
+    assert list(body["market"].items()) == [
+        ("qqq_gap_pct", None), ("spy_gap_pct", -0.32), ("qqq_change_pct", None),
+        ("spy_change_pct", -3.51), ("regime_as_of", None), ("regime_spy_trend", None),
+        ("regime_vol_bucket", None),
+    ]  # fmt: skip
 
 
 def test_an_early_close_shows_in_the_session() -> None:
@@ -826,7 +840,8 @@ DATA_KEYS = frozenset(
         "mean_shadow_r", "mfe_r", "min_effect_r", "min_n_per_side", "min_open_price",
         "minutes_held", "n_complement", "n_subset", "neutral_counts_as", "news_lookback_hours",
         "notable_untraded", "open_issues", "open_notes", "opening_range_minutes", "or_range_atr",
-        "or_return_pct", "pnl_usd", "prev_close", "qqq_gap_pct", "regime_as_of",
+        "or_return_pct", "gross_pnl_usd", "net_pnl_usd", "fees_est_usd", "prev_close",
+        "qqq_gap_pct", "spy_change_pct", "qqq_change_pct", "iwm_change_pct", "regime_as_of",
         "regime_spy_trend", "regime_vol_bucket", "rel_vol", "rel_vol_min", "rel_vol_rank",
         "revet_premarket", "signal_id", "sip_only_trigger", "spy_gap_pct", "spy_move_pct",
         "start_equity_usd", "stop_atr_fraction", "stop_price", "suggested_use", "summary_chars",
@@ -966,7 +981,7 @@ def test_review_sections() -> None:
             books=books,
             signals=signals,
             incidents=incidents,
-            stats={"v": None, "epoch": 0, "a_mean_r": 0.12345, "b_vetoes": 3},
+            stats={"v": None, "epoch": 0, "a_mean_r": 0.12345, "b_vetoed_triggers": 3},
             history=History(factor_tally=[FactorCount("false_breakout", 12, 3, 9, -0.4, 2)]),
         )
     )
@@ -979,7 +994,7 @@ def test_review_sections() -> None:
     assert body["book_b"]["day_mode"] == "normal"
     assert list(body["books"]) == ["A", "B"]
     assert body["books"]["A"] == {
-        "start_equity_usd": 1000.0, "end_equity_usd": 1004.5, "pnl_usd": 4.5, "trades": 1,
+        "start_equity_usd": 1000.0, "end_equity_usd": 1004.5, "net_pnl_usd": 4.5, "trades": 1,
     }  # fmt: skip
     xyz, sho = body["signals"]
     assert (sho["symbol"], sho["shadow"], sho["b_verdict"], sho["decisions"]) == (
@@ -997,8 +1012,8 @@ def test_review_sections() -> None:
     assert list(xyz["trades"]) == ["A", "B"]
     assert xyz["trades"]["A"] == {
         "qty": 33, "entry_price": 14.82, "entry_at": "09:41:02", "exit_price": 15.1,
-        "exit_at": "15:55:01", "exit_reason": "eod_flatten", "pnl_usd": 9.24, "r": 2.545,
-        "entry_slippage": 0.01, "entry_delay_ms": 412,
+        "exit_at": "15:55:01", "exit_reason": "eod_flatten", "gross_pnl_usd": 9.24,
+        "fees_est_usd": 0.01, "r": 2.545, "entry_slippage": 0.01, "entry_delay_ms": 412,
     }  # fmt: skip
     assert xyz["b_verdict"] == {
         "verdict_source": "premarket", "verdict": "veto", "confidence": 0.8,
@@ -1016,7 +1031,7 @@ def test_review_sections() -> None:
     assert body["incidents"][0]["untrusted"] == {"message": "m"}
     assert list(body["stats"].items()) == [
         ("a_mean_r", 0.123),
-        ("b_vetoes", 3),
+        ("b_vetoed_triggers", 3),
         ("epoch", 0),
         ("v", None),
     ]

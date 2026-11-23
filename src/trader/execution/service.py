@@ -243,6 +243,13 @@ async def _protect_overnight(
     )
 
 
+def _stop_leg(order: Order) -> bool:
+    """An OTO's stop-loss leg, by the broker's own marks (as ``Order.stop_leg`` finds one)."""
+    return order.group_id is not None and (
+        order.group_role == "stop_loss" or (order.side == "sell" and order.type == "stop")
+    )
+
+
 async def _look_up(broker: BrokerAdapter, clock: Clock, cid: str) -> Order | None:
     """An uncertain submit: look the id up now and once more a second later."""
     found = await broker.order_by_client_id(cid)
@@ -757,14 +764,31 @@ class ExecutionService:
                     if event.event == "order_cancel_rejected":
                         self._cancel_rejected(event.order)
                 else:
-                    # Someone else's order in this account: never adopt it, reconcile (D-037).
-                    log.warning("foreign order", book=self.book, order=event.order.client_order_id)
-                    self._resync = True
+                    self._unknown(event.order)
             except Exception:
                 # Never lose the stream over one event: a resync re-reads it over REST.
                 log.exception("trade update failed", book=self.book)
                 self._resync = True
             self._wake.set()
+
+    def _unknown(self, order: Order) -> None:
+        """An order the journal doesn't know. Never adopted: a resync reads the account again
+        (D-037), and records our own orders under their entries while it treats anything else
+        as a difference.
+
+        Ours can be unknown for a moment: Alpaca sends an OTO's ``held`` stop leg on the stream
+        before the entry's answer is journaled with the group id that makes the leg ours (G4b:
+        ROST's leg 1 ms after the submit's answer, and before the entry's own event; D-074). A
+        stop leg on the symbol of an entry still waiting for its answer is said to be that,
+        not someone else's order; either way the resync settles it, without the stream ever
+        waiting."""
+        waiting = {e.symbol for e in self._entries.values() if e.order_id is None}
+        if order.symbol in waiting and _stop_leg(order):
+            log.info("stop leg ahead of its entry's answer", book=self.book, symbol=order.symbol,
+                     order=order.client_order_id)  # fmt: skip
+        else:
+            log.warning("foreign order", book=self.book, order=order.client_order_id)
+        self._resync = True
 
     async def _monitor(self) -> None:
         """Protection must outlive any single failure: every error is logged and the loop

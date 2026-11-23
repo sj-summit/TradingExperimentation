@@ -68,6 +68,10 @@ This is paper trading only until the human completes the go-live gate in `docs/P
 | LLM smoke test (HUMAN GATE G4a; uses the subscription) | `uv run trader smoke llm --canary-control --kill-test` |
 | Replay a recorded day offline | `uv run trader replay --date YYYY-MM-DD` |
 | Claude's open process issues and notes; only the human closes one | `uv run trader followups list` / `uv run trader followups set issue ID --status fixed --response "…"` |
+| The evaluation epoch; only the human starts the next | `uv run trader epoch show` / `uv run trader epoch start N --decision D-xxx --reason "…"` |
+| Test the review's lesson proposals on later signals (`--promote` stores the outcomes) | `uv run trader lessons evaluate [--promote]` / `uv run trader lessons list` |
+| The weekly report (the last complete week; `--offline` skips fetching SPY's missing closes) | `uv run trader report weekly [--week YYYY-Www]` |
+| The evaluation memo: an epoch judged by STRATEGY.md §8 (offline; deciding to go live stays the human's) | `uv run trader report evaluation [--epoch N] [--through YYYY-MM-DD]` |
 | Emergency stop | `uv run trader halt --flatten --book all` |
 
 ## Repo map (target; details in ARCHITECTURE.md §2)

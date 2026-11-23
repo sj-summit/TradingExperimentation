@@ -27,7 +27,7 @@ Five principles follow from that question:
 | Broker | Alpaca; two paper accounts with $1,000 each (A and B). |
 | Real-time data | Alpaca free plan: **IEX feed** (single venue), at most 30 streamed symbols. Configurable to `sip` if upgraded. |
 | Historical data | Alpaca SIP bars older than 15 minutes (free) for daily features and shadow outcomes, and the SIP trade tape for the trigger minutes bars can't order (§7.2). Rolling opening-range baselines use the **same feed as live** (IEX by default) so relative volume compares like with like. |
-| News | Alpaca news (Benzinga) WebSocket and REST; SEC EDGAR filings. |
+| News | Alpaca news WebSocket and REST, from one or more feeds that each article's `source` names (every article was `fiscal.ai`'s on 2026-11-20; D-072); SEC EDGAR filings. |
 | Time zone | America/New_York everywhere. |
 
 ---
@@ -277,6 +277,18 @@ The user's "memory section" is implemented as **in-context reflection with stati
 - **Ops:** `eq, ne, gt, gte, lt, lte, in, contains` (`contains` applies to `risk_flags` only).
 - **Limits:** 1–4 filters. The metric is fixed to `shadow_r`.
 - **Rejection:** unknown fields, ops, or types are rejected and logged.
+- **Each field's type** (D-076):
+  - **numbers** (`confidence`, `gap_pct`, `rel_vol`, `rel_vol_rank`, `or_range_atr`, `or_return_pct`, `price`, `atr_pct`, `minutes_to_trigger`): `eq ne gt gte lt lte` with a finite number, never a bool;
+  - **categories** (`catalyst_type`, `verdict`, `verdict_source`, `regime_spy_trend`, `regime_vol_bucket`, `day_of_week`): `eq ne` with one of the field's values, or `in` with 1–10 of them;
+  - **`event_day`:** `eq ne` with true or false;
+  - **`risk_flags`:** `contains` with one risk flag, and nothing else.
+
+  A query with any other key is rejected. Code applies a query to rows in Python, never as SQL.
+- **What the fields mean** (D-076):
+  - Book B's fields (`catalyst_type`, `risk_flags`, `verdict`, `verdict_source`, `confidence`) are its standing verdict's.
+  - `price` is the trigger price.
+  - `minutes_to_trigger` is the whole minutes from the arming to the SIP trigger minute, never below 0.
+  - A row without a field a query names, such as a verdict on a long Book B never judged, is on neither side of that query.
 
 ### 6.3 Promotion and demotion (weekly job, deterministic, seeded bootstrap)
 
@@ -288,6 +300,15 @@ The user's "memory section" is implemented as **in-context reflection with stati
 
 **Demote** a promoted lesson when a monthly re-evaluation on all data shows the CI now includes 0. Rejected proposals stay in the table for audit.
 
+**How this is applied** (the human's decision, 2026-11-21; D-076):
+- **Only later signals count.** A proposal is tested only on triggered longs dated after the review day that proposed it, never on the data that suggested it. The CI resamples whole trading days (§7.3).
+- **One look.** A proposal stays `proposed` until each side has `min_n_per_side` signals. It is then tested once:
+  - a pass makes it `promoted`, a failure `rejected`, and it is never tested again;
+  - so repeated looks can't promote it by chance;
+  - an invalid query is `rejected` at once.
+- **Monthly** means the first `trader lessons evaluate` of each calendar month: it re-tests promoted lessons on all their later signals, and a CI that now reaches 0 makes the lesson `demoted`. Other runs refresh a promoted lesson's numbers and leave its status alone.
+- **The record:** each lesson keeps its numbers, when it was evaluated, promoted or demoted, and `status_reason`.
+
 ### 6.4 Playbook
 
 Code regenerates `runtime/playbook.md` from promoted lessons only:
@@ -296,6 +317,13 @@ Code regenerates `runtime/playbook.md` from promoted lessons only:
 - Each lesson carries its statement, n, effect, CI, and promotion date.
 
 The playbook goes into the pre-market and vet prompts as **soft guidance**. Lessons never modify rules, risk limits, or parameters.
+
+**How it reaches Claude** (D-077):
+- **Every pack's `playbook`** lists the lessons with their numbers (n is the signals the lesson's conditions matched in its test) and the conditions code validated. The statement, which a model wrote, sits under `untrusted`.
+- **Each vet candidate's `matching_lessons`** names the lessons whose conditions hold on the candidate's features known at arming. A lesson matches only if code checked at least one condition. A condition on a field the candidate lacks then, such as `minutes_to_trigger`, means no match.
+- **Book B's own fields** (catalyst, flags, verdict, its source, confidence) are the model's to apply, since it sets them itself.
+- **The brief's candidates** carry no matches. Before the open their `gap_pct` is the pre-market move, not the opening gap the lessons were tested on.
+- **`runtime/playbook.md`**, for the human, is rewritten by `trader lessons evaluate --promote`.
 
 ### 6.5 Review targets and signal reviews
 
@@ -386,9 +414,20 @@ A pattern that keeps showing up in the tally and carries `knowable_at_decision: 
 
 - **Per-trade results:** trades, win rate, mean R, expectancy in $ and R, profit factor.
 - **Equity results:** max drawdown, daily Sharpe, exposure.
-- **Execution quality:** average entry slippage vs trigger, entry delay (Book B).
-- **Comparison:** SPY buy-and-hold over the same days.
-- **Veto value:** `V = mean(shadow_r | B allowed) − mean(shadow_r | B vetoed)`, with a 90% bootstrap CI and the n of each side.
+- **Execution quality:**
+  - average entry slippage vs trigger, entry delay (Book B);
+  - each trade's live R minus its signal's shadow R, which measures how far the shadow's fills are from the broker's (D-072, D-075).
+- **Comparison:**
+  - SPY buy-and-hold over the same days: bought at the close before the books' first session;
+  - Book B's mean R per trade minus Book A's, with its interval.
+- **Veto value:** `V = mean(shadow_r | B allowed) − mean(shadow_r | B vetoed)`, with a 90% bootstrap CI and the n of each side (D-075).
+  - **The population:** the epoch's longs whose shadow triggered (on SIP bars, so a SIP-only trigger counts), with a shadow R and a standing verdict, meaning the one Book B's decision rests on, else the day's latest.
+  - **The sides:** allowed means `allow` or `neutral` (neutral counts as allow); vetoed means `veto`.
+  - **Left out:** triggered longs with no verdict, which are counted.
+  - **Also shown:** the vetoed side's own mean shadow R with its interval, since V can be positive while the vetoes lose money.
+- **Intervals** (the human's decision, 2026-11-21) resample whole trading days with replacement, since one day's signals share the market:
+  - `lessons.bootstrap_resamples` (10,000) times, from `lessons.bootstrap_seed`, at `lessons.ci_level` (90%), as percentile intervals;
+  - a resample with a side empty is skipped and counted.
 
 ---
 
@@ -423,12 +462,39 @@ A pattern that keeps showing up in the tally and carries `knowable_at_decision: 
 |---|---|
 | H1 fails, Book A positive | The LLM adds nothing measurable. Consider running the rules alone, or continuing paper. |
 | Both books negative | Stop, or redesign the strategy (human decision). |
+| Inconclusive: by 90 trading days in the epoch the minimum data isn't reached, or H1 has fewer than 20 vetoes, or V's interval includes 0 while its width exceeds 0.5R | Not evidence either way. The human chooses, once: extend the epoch by 30 trading days, or stop and treat H1 as not shown. A second inconclusive memo means H1 is not shown. |
+
+The inconclusive row was pre-registered on 2026-11-21, before any evaluation data existed (the human's decision; D-079).
+
+### How the memo computes each line (`trader report evaluation`; D-079)
+
+Every line is pass, fail, or insufficient data, with its numbers. Intervals are 90%, with whole days resampled (§7.3).
+- **H1** passes when V's interval lies above 0.
+- **H2** passes when Book B's mean R per trade minus Book A's is at least 0; its interval is shown.
+- **H3** passes when, on `reduced` and `no_trade` days, the triggered longs' mean shadow R minus that on `normal` days has an interval below 0. It needs `min_n_per_side` signals on each side.
+- **H4** passes when ranks 1–5 minus ranks 16–20 has an interval above 0, shown beside a Spearman correlation of rank against shadow R. It needs `min_n_per_side` signals in each bucket.
+- **The triggered signals** counted for the minimum data, and studied by H3 and H4, are the epoch's longs whose shadow triggered, including a trigger seen on SIP bars alone (§7.3). The research-only shadow shorts never count, since no book can trade them.
+- **The vetoes** counted for the minimum data are triggered longs with a standing veto: H1's population.
+- **H1, H2 and criteria 1–3** read insufficient data until the minimum data is met. H3 and H4 wait only for their own n per side.
+- **Criterion 2's** R after fees is each trade's net P&L over its dollar risk, qty × (entry − stop).
+- **Criterion 4** reads "insufficient data" until Phase 6 marks runs as unattended. The memo shows the longest P1-free run of sessions meanwhile.
+- **Criterion 5** always reads "for the human".
+- **The outcome:**
+  1. inconclusive, as the row above says;
+  2. else "keep running" while the minimum data isn't reached, or while V's interval spans 0 by more than 0.5 R;
+  3. else "both books negative" or "H1 fails, Book A positive", by net P&L;
+  4. else "the criteria code can check pass" when criteria 1–3 hold, and the go/no-go is the human's (G7);
+  5. else "criteria not met".
 
 ---
 
 ## 9. Change control
 
 - **During an epoch,** only bug fixes are allowed. Any change to a parameter, prompt, model, or data feed increments `eval_epoch` (stored in the DB) and gets a DECISIONS.md entry.
+- **The epoch record** (`epochs`, D-075):
+  - Each epoch keeps when it began, why, its DECISIONS entry, the review note that led to it if one did, and the hashes of the settings, risk and events files and of the LLM fingerprint it froze.
+  - Only the human starts one: `trader epoch start N --decision D-xxx --reason …`, never while a run-day runs.
+  - Epoch 0 is the build and its shakedown, until P7.1's freeze.
 - **Reporting** always shows metrics per epoch. Prompt hashes and model aliases are journaled per call.
 - **The LLM setup is fingerprinted at boot** (prompts, instructions, schemas, models, efforts and flags): a change raises a P3 `llm_fingerprint_changed` naming what changed, so it can't start a new epoch unnoticed (D-065).
 - **The prompts hold no numbers.** Every number the setup uses reaches Claude in the context pack (`experiment`, `limits`), so a changed setting can't leave a prompt stating the old one.

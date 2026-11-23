@@ -13,7 +13,6 @@ and VS Code's preview would otherwise make clickable), image, HTML or emphasis.
 
 import html
 import json
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -25,19 +24,9 @@ from trader.core.calendar import Session
 from trader.core.clock import parse_et_iso
 from trader.llm.budget import ABANDONED, CLI_RUNS
 from trader.memory.journal import Journal, db_to_dec
+from trader.memory.verdict_view import standing_for_day
+from trader.reports.render import LIMITATIONS, ModelText, md_cell, model_md
 from trader.strategy.orb_sip import load_signals
-
-LIMITATIONS = (
-    "Data: IEX-only real-time data makes triggers lag, and makes relative volume noisier.",
-    "Paper fills: they ignore market impact, queue position, and latency slippage. Dividends "
-    "aren't simulated either. Paper does charge regulatory fees, overnight; the ledger books "
-    "what it charged.",
-    "Sample size: small samples mean wide confidence intervals. Two to three months of signals "
-    "cannot prove a durable edge.",
-    "Backtest vs live: the paper's backtest (2016-2023, with leverage, long and short) is not a "
-    "forecast. Day-trading edges decay, and most retail day traders lose money.",
-    "LLM drift: model updates behind an alias can change behavior mid-epoch.",
-)
 
 
 @dataclass(frozen=True)
@@ -303,31 +292,11 @@ async def build_daily(
 
 
 async def _b_verdicts(journal: Journal, day: date) -> dict[str, str]:
-    """Book B's verdict per symbol: the one its decision rests on, else the day's latest."""
-    d = day.isoformat()
-    rows = await journal.fetch_all(
-        "SELECT symbol, source, verdict, confidence, llm_call_id FROM verdicts v WHERE date = ? "
-        "AND llm_call_id IN (SELECT id FROM llm_calls WHERE purpose = 'trading') ORDER BY id",
-        (d,),
-    )
-    rested = {
-        (r["symbol"], r["llm_call_id"])
-        for r in await journal.fetch_all(
-            "SELECT s.symbol, f.llm_call_id FROM final_decisions f JOIN signals s "
-            "ON s.id = f.signal_id WHERE s.date = ? AND f.book = 'B' AND f.llm_call_id IS NOT NULL",
-            (d,),
-        )
+    """Book B's standing verdict per symbol (``verdict_view``), as the report shows it."""
+    rows = await journal.read(lambda conn: standing_for_day(conn, day))
+    return {
+        symbol: f"{r['source']} {r['verdict']} {r['confidence']:.2f}" for symbol, r in rows.items()
     }
-    out: dict[str, str] = {}
-    chosen: set[str] = set()
-    for r in rows:  # oldest first: the latest wins, unless the decision named one
-        text = f"{r['source']} {r['verdict']} {r['confidence']:.2f}"
-        if (r["symbol"], r["llm_call_id"]) in rested:
-            out[r["symbol"]] = text
-            chosen.add(r["symbol"])
-        elif r["symbol"] not in chosen:
-            out[r["symbol"]] = text
-    return out
 
 
 async def _llm_day(
@@ -422,10 +391,6 @@ async def _llm_day(
 
 
 # ---------------------------------------------------------------- rendering
-
-
-class ModelText(str):
-    """Text the model wrote: Markdown escapes all of it (HTML escapes every cell anyway)."""
 
 
 def _tables(report: DailyReport) -> list[tuple[str, list[str], list[list[str]]]]:
@@ -559,9 +524,9 @@ def _claude_md(report: DailyReport) -> list[str]:
         return []
     out = ["", "## Claude", ""]
     if llm.day_mode_reason:
-        out.append(f"- The day mode's reason: {_model_md(llm.day_mode_reason)}")
+        out.append(f"- The day mode's reason: {model_md(llm.day_mode_reason)}")
     if llm.review_status == "ok":
-        out.append(f"- The review (ok): {_model_md(llm.review_summary)}")
+        out.append(f"- The review (ok): {model_md(llm.review_summary)}")
     elif llm.review_status:  # the engine's words, not the model's
         out.append(f"- The review ({llm.review_status}): {llm.review_failure or 'no reason given'}")
     return out
@@ -595,7 +560,7 @@ def render_markdown(report: DailyReport) -> str:
         lines += [
             "| "
             + " | ".join(
-                _model_md(c, in_table=True) if isinstance(c, ModelText) else _md(c) for c in row
+                model_md(c, in_table=True) if isinstance(c, ModelText) else md_cell(c) for c in row
             )
             + " |"
             for row in rows
@@ -651,24 +616,6 @@ def _clock(ts: str) -> str:
         return parse_et_iso(ts).strftime("%H:%M:%S")
     except ValueError:
         return ts
-
-
-def _md(cell: str) -> str:
-    return cell.replace("|", "\\|").replace("\n", " ")
-
-
-def _model_md(text: str, *, in_table: bool = False) -> str:
-    """The model's text for Markdown: on one line, in a code span longer than any run of
-    backticks it holds (the module's docstring). In a table cell its pipes are escaped too,
-    which GFM requires even inside a code span."""
-    flat = " ".join(text.split())
-    if not flat:
-        return ""
-    fence = "`" * (max((len(run) for run in re.findall(r"`+", flat)), default=0) + 1)
-    pad = " " if flat.startswith("`") or flat.endswith("`") else ""
-    if in_table:
-        flat = flat.replace("|", "\\|")
-    return f"{fence}{pad}{flat}{pad}{fence}"
 
 
 def _txt(value: object) -> str:

@@ -65,6 +65,9 @@ def offline(repo: Path, monkeypatch: pytest.MonkeyPatch) -> SimClock:
         "from_config",
         lambda _cfg, book, _clock: SimBroker(clock=clock, book=book),
     )
+    # The CLI passes no clock, so run_day would read the PC's: on a weekend or a holiday the
+    # day would have "nothing to do". Its fallback is the fixture's morning too.
+    monkeypatch.setattr(live, "RealClock", lambda: clock)
     return clock
 
 

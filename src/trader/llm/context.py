@@ -83,7 +83,9 @@ from trader.memory.trades import TradeRow
 Role = Literal["premarket", "vet", "review"]
 Json = dict[str, Any]
 
-PACK_VERSION = 2  # 2: news_unavailable (D-069)
+# 2: news_unavailable (D-069). 3: from the open, the market's opening gaps and changes; the
+# review's gross and net money; its veto counts (D-073).
+PACK_VERSION = 3
 MAX_PACK_BYTES = 300_000  # A§7.2; LlmCalls.encode passes llm.max_pack_bytes (D-064)
 ID_HEX = 16  # hex digits of the pack's SHA-256 in its id: 64 bits no answer can guess
 # Characters read per news field. Alpaca's summaries run a few hundred; a longer field is
@@ -146,11 +148,17 @@ class PackTooLargeError(ValueError):
 
 @dataclass(frozen=True)
 class Market:
-    """Index gaps in percent against the previous close (``None`` when unknown), and the
-    previous session's regime tags."""
+    """The index ETFs in percent against the previous session's close, ``None`` when unknown
+    (``orchestrator/packs.py``'s ``index_market``; D-073), and that session's regime tags.
+
+    - ``gaps``: before the open, the pre-market move; from the open, the opening gap.
+    - ``changes``: from the open only, the change since that close; ``None`` before it, so
+      the brief's pack has none. (A review target's ``spy_move_pct`` is something else:
+      SPY over that target's window.)"""
 
     gaps: Mapping[str, float | None]
     regime: RegimeTags | None = None
+    changes: Mapping[str, float | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -174,6 +182,21 @@ class Common:
     book_b: BookB
     experiment: Mapping[str, Any]
     news_available: bool = True
+    playbook: Sequence["PlaybookEntry"] = ()  # the promoted lessons, ranked (P5.3, D-077)
+
+
+@dataclass(frozen=True)
+class PlaybookEntry:
+    """A promoted lesson as the packs show it (S§6.4; A§8's shape; ``memory/playbook.py``):
+    its numbers, the conditions code validated, and the statement a model wrote."""
+
+    id: str
+    suggested_use: str
+    n: int  # the signals its conditions matched in its test
+    effect_r: float
+    ci: tuple[float, float]
+    conditions: Sequence[tuple[str, str, float | str | bool | tuple[str, ...]]]
+    statement: str  # a model's
 
 
 @dataclass(frozen=True)
@@ -291,7 +314,7 @@ class VetCandidate:
     name: str
     exchange: str
     evidence: Evidence = Evidence()
-    lessons: Sequence[str] = ()  # ids of the promoted lessons its features match (P5.3)
+    lessons: Sequence[str] = ()  # ids of the promoted lessons its features match (D-077)
 
 
 @dataclass(frozen=True)
@@ -332,7 +355,7 @@ class ReviewTarget:
 class BookResult:
     start_equity: Decimal | None
     end_equity: Decimal | None
-    pnl: Decimal | None
+    pnl: Decimal | None  # net: ``daily_stats.pnl``, after the day's estimated fees
     trades: int
 
 
@@ -509,7 +532,7 @@ def review_pack(
             book: {
                 "start_equity_usd": _num(r.start_equity, 2),
                 "end_equity_usd": _num(r.end_equity, 2),
-                "pnl_usd": _num(r.pnl, 2),
+                "net_pnl_usd": _num(r.pnl, 2),  # after the estimated fees (D-073)
                 "trades": r.trades,
             }
             for book, r in sorted(books.items())
@@ -577,7 +600,7 @@ def _pack(
         "news_unavailable": not common.news_available,
         "market": _market(common.market),
         "book_b": _book_b(common.book_b, with_mode=role != "premarket"),
-        "playbook": [],
+        "playbook": [_playbook_entry(e) for e in common.playbook[:MAX_LESSONS]],
         **(extra or {}),
         _omitted_key(role): omitted,
         ranked: rows,
@@ -788,6 +811,11 @@ def _market(m: Market) -> Json:
     out: Json = {
         f"{symbol.lower()}_gap_pct": _num(gap, 2) for symbol, gap in sorted(m.gaps.items())
     }
+    if m.changes is not None:
+        out |= {
+            f"{symbol.lower()}_change_pct": _num(change, 2)
+            for symbol, change in sorted(m.changes.items())
+        }
     r = m.regime
     return out | {
         "regime_as_of": r.date.isoformat() if r else None,
@@ -834,7 +862,8 @@ def _trade(t: TradeRow) -> Json:
         "exit_price": _num(t.exit_price),
         "exit_at": _hhmmss(t.exit_ts),
         "exit_reason": t.exit_reason,
-        "pnl_usd": _num(t.pnl, 2),
+        "gross_pnl_usd": _num(t.pnl, 2),  # before fees; the book's P&L is after them (D-073)
+        "fees_est_usd": _num(t.fees_est, 2),
         "r": _num(t.r_multiple, 3),
         "entry_slippage": _num(t.entry_slippage),
         "entry_delay_ms": t.entry_delay_ms,
@@ -860,6 +889,31 @@ def _stats(stats: Mapping[str, float | int | None]) -> Json:
             raise ValueError(f"stats value {key!r} is not a number")
         out[key] = value if isinstance(value, int) or value is None else _num(value, 3)
     return out
+
+
+def _playbook_entry(e: PlaybookEntry) -> Json:
+    """A§8's shape: the numbers and the conditions (validated: fields, ops, enum values and
+    numbers) outside ``untrusted``, the model's statement inside."""
+    return {
+        "id": _text(e.id, 16),
+        "suggested_use": _text(e.suggested_use, 16),
+        "n": e.n,
+        "effect_r": _num(e.effect_r, 3),
+        "ci": [_num(e.ci[0], 3), _num(e.ci[1], 3)],
+        "conditions": [
+            {"field": field, "op": op, "value": _condition_value(value)}
+            for field, op, value in e.conditions
+        ],
+        "untrusted": {"statement": _text(e.statement, 200)},
+    }
+
+
+def _condition_value(value: float | str | bool | tuple[str, ...]) -> Any:
+    if isinstance(value, tuple):
+        return [_text(v, 40) for v in value]
+    if isinstance(value, str):
+        return _text(value, 40)
+    return value if isinstance(value, bool) else _num(value, 4)
 
 
 def _lesson(lesson: LessonView) -> Json:

@@ -151,7 +151,7 @@ def review_bodies(cfg: AppConfig) -> list[dict[str, Any]]:
             ],
             targets=[target("XYZ", 0, items=items, decision_at=decided)],
             incidents=[IncidentView(et_datetime(DAY, time(10)), "P3", "llm", "x", "m")],
-            stats={"b_vetoes": 1},
+            stats={"b_vetoed_triggers": 1, "b_veto_verdicts": 2},
             lessons=[
                 LessonView(
                     id="L-001",

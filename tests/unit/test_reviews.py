@@ -45,6 +45,7 @@ from trader.memory.reviews import (
 )
 from trader.memory.shadow import ShadowOutcome
 from trader.memory.trades import TradeRow
+from trader.memory.verdict_view import standing_for_day, standing_verdicts
 from trader.strategy.orb_sip import insert_signals
 
 D = Decimal
@@ -434,6 +435,81 @@ def test_epoch_stats_are_plain_running_numbers(conn: sqlite3.Connection) -> None
     stats = epoch_stats(conn, 0, DAY)
     assert (stats["a_trades"], stats["a_mean_r"], stats["a_win_rate"]) == (2, 0.5, 0.5)
     assert (stats["b_trades"], stats["b_mean_r"], stats["shadow_longs"]) == (0, None, 1)
+
+
+def add_verdicts(conn: sqlite3.Connection, rows: list[tuple[str, str, str, str]]) -> None:
+    """``(day, symbol, call id, verdict)``, oldest first; each call is a trading one, unless
+    its id says smoke."""
+    for day, symbol, call, word in rows:
+        role = call.split("-")[1]
+        conn.execute(
+            "INSERT OR IGNORE INTO llm_calls (id, date, role, logical_id, attempt, final, ok, "
+            "purpose) VALUES (?, ?, ?, ?, 1, 1, 1, ?)",
+            (call, day, role, call.rsplit("-", 1)[0], "smoke" if "smoke" in call else "trading"),
+        )
+        conn.execute(
+            "INSERT INTO verdicts (date, symbol, source, verdict, confidence, catalyst_type, "
+            "catalyst_fresh, catalyst_confirmed, risk_flags_json, reason, llm_call_id) "
+            "VALUES (?, ?, ?, ?, 0.7, 'earnings', 1, 1, '[]', 'r', ?)",
+            (day, symbol, "premarket" if role == "premarket" else "vet", word, call),
+        )
+
+
+def decide(conn: sqlite3.Connection, symbol: str, reason: str, call: str | None) -> None:
+    conn.execute(
+        "INSERT INTO decisions (signal_id, book, take, reason_code, llm_call_id, decided_at) "
+        "VALUES (?, 'B', ?, ?, ?, '2026-10-13T09:41:00-04:00')",
+        (f"20261013-{symbol}-orb5", int(reason == "taken"), reason, call),
+    )
+
+
+def test_the_veto_counts_tell_a_vetoed_trigger_from_a_standing_veto(
+    conn: sqlite3.Connection,
+) -> None:
+    """D-073 (G4b's BILL): ``b_vetoed_triggers`` counts Book B's ``vetoed`` decisions, which only
+    a trigger brings; ``b_veto_verdicts`` counts every long whose standing verdict is a veto,
+    triggered or not."""
+    insert_signals(conn, [sig("IDLE", 4, triggered=None)])
+    brief, vet = "20261013-premarket-01-1", "20261013-vet-01-1"
+    add_verdicts(conn, [
+        ("2026-10-13", "LOSE", brief, "veto"),  # the trigger is vetoed on the brief's word
+        ("2026-10-13", "WIN", brief, "veto"),  # then the vet allows WIN, and B takes it
+        ("2026-10-13", "NOSIG", brief, "veto"),  # a brief candidate that never became a signal
+        ("2026-10-13", "IDLE", vet, "veto"),  # never triggered: no decision, the veto stands
+        ("2026-10-13", "WIN", vet, "allow"),
+        ("2026-10-13", "OTHER", vet, "neutral"),
+        ("2026-10-13", "OTHER", "20261013-smoke-01-1", "veto"),  # a smoke run's: never B's
+    ])  # fmt: skip
+    decide(conn, "LOSE", "vetoed", brief)
+    decide(conn, "WIN", "taken", vet)
+    stats = epoch_stats(conn, 0, DAY)
+    assert (stats["b_vetoed_triggers"], stats["b_veto_verdicts"]) == (1, 2)
+    assert "b_vetoes" not in stats
+
+
+def test_the_standing_verdict_is_the_one_book_b_rests_on_else_the_day_s_latest(
+    conn: sqlite3.Connection,
+) -> None:
+    """D-071's rule, kept in one place (D-073), day by day over a span."""
+    previous = (DAY - timedelta(days=1)).isoformat()
+    insert_signals(conn, [sig("WIN", 1, day=DAY - timedelta(days=1))])
+    brief, vet = "20261013-premarket-01-1", "20261013-vet-01-1"
+    add_verdicts(conn, [
+        (previous, "WIN", "20261012-vet-01-1", "veto"),  # the day before: its own standing veto
+        ("2026-10-13", "WIN", brief, "allow"),  # B's decision rests on the brief's allow...
+        ("2026-10-13", "WIN", vet, "veto"),  # ...though the vet said otherwise later
+        ("2026-10-13", "LOSE", brief, "allow"),  # no decision names a call: the day's latest
+        ("2026-10-13", "LOSE", vet, "neutral"),
+    ])  # fmt: skip
+    decide(conn, "WIN", "taken", brief)
+    standing = standing_verdicts(conn, first=DAY - timedelta(days=1), last=DAY)
+    got = {key: (r["verdict"], r["llm_call_id"]) for key, r in standing.items()}
+    assert got == {
+        (previous, "WIN"): ("veto", "20261012-vet-01-1"),
+        ("2026-10-13", "WIN"): ("allow", brief),
+        ("2026-10-13", "LOSE"): ("neutral", vet),
+    }
+    assert set(standing_for_day(conn, DAY)) == {"WIN", "LOSE"}
 
 
 # ---------------------------------------------------------------- follow-ups

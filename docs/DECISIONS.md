@@ -2648,10 +2648,411 @@ Append-only. Each entry records context, the decision, its consequences, and sou
 
 ---
 
+## D-072 — G4b passed: a supervised A+B paper session, its replay, and what Claude's review found (partly answers Q2)
+- **Date:** 2026-11-21 · **Status:** Accepted (G4b: the human ran `uv run trader run-day --books A,B` on 2026-11-20).
+- **The session:** Friday 2026-11-20, on the human's commit `acea04f` (`boot.json`'s `git_sha`), with the capabilities `fees_v1`, `review_v1`, `shadow_tape` and `skew_hourly`.
+  - **The day before** (HANDOFF): `trader news`, `trader filings` and `trader stream --news` worked. There are no `ALPACA_DATA_*` keys, so market data used Book B's. Doctor gave one WARN, `events`, for the quiet days before the 12-04 jobs report.
+  - **The dry run** at 08:07 was as the runbook expected; run-day started at 08:37.
+  - **Every milestone came on time:**
+    - `book B ready`; `fees booked` (Book A: 10-12 to 10-14's 6 charges and 3 reversals, net $0.00); `news started` (1,764 articles backfilled);
+    - the 09:00 scan (31 candidates of 1,853 symbols, 245 with news), and EDGAR answered for all 31;
+    - `brief done` at 09:06:11; `subscribed` at 09:29; `scan done` at 09:35:04 (20 selected, 12 armed); `vet expected`, then `vet done`; one `trigger parked`;
+    - flatten passes at 15:55 and 16:00, both books flat; EOD at 16:05, with a $0.00 residual in each book; 19 shadow outcomes at 16:12 (2 from the tape);
+    - `review done` at 16:16:21; the report; DONE at 16:30.
+  - **The log** has one warning, `foreign order` (below), and no errors. One P3 incident, `partial_fill_protected`; no P1 or P2.
+- **Pass, on all five criteria:**
+  1. the last line is `run-day 2026-11-20: DONE`;
+  2. no P1;
+  3. `doctor --quick` the next day: `alpaca.A` $990.11 and `alpaca.B` $994.82, each with 0 positions and 0 orders;
+  4. the report has the LLM-calls line, the day mode, the calls table, the review's line and its targets table;
+  5. `trader replay --date 2026-11-20` ends `the replay matches the recorded day`, after 3 min 49 s.
+
+  Claude ran `doctor --quick` and the replay, both read-only, and checked the rest against the log, the journal and the report.
+  - **Phase 4's "Done when" holds:**
+    - each of the 3 attempts has its `llm_calls` row and both artifacts;
+    - each of Book B's 10 decisions has its reason code and the call behind it;
+    - the review stored a signal review for each of its 7 targets;
+    - the replay reproduced the decisions, serving the recorded answers back.
+- **The replay, beyond what it compares:** its review tables, shadow outcomes, daily stats, fills, ledger and verdicts equal the live journal's. Its timestamps differ by milliseconds, because its clock jumps between recorded instants. One value differs too:
+  - **Book A's ROST limit was 216.12 live and 216.13 in the replay.**
+  - **Why:** the trigger print (215.905) and four prints at 215.9 came in two frames, 0.5 ms apart. Live, the second frame was in before Book A priced its limit (`last 215.9`). The replay prices at the trigger print (`last 215.905`).
+  - **Effect:** none on the decision or the fill (216). A replay can't reproduce scheduling that fine, so the golden fixture pins the replay's value.
+- **The market:** SPY fell 3.51% (715.84 to 690.68), though it opened only 0.32% down. QQQ fell 5.5% and IWM 2.8%. The regime was down and high-vol.
+- **The day's trading:**
+  - **Signals:** 20 in all: 12 longs, every one armed; 7 shadow shorts; 1 with no direction.
+  - **Outcomes:** 10 longs triggered on IEX, and every one's shadow stopped out (−1.01 to −1.21R), three after an MFE above 2R (KBH 4.76, GTX 3.55, DIVO 2.37). TW's shadow short made +3.36R.
+  - **Entries:** both books took ROST and FNDA, their two entries for the day. They skipped the rest for capacity (R-006, R-007), and BSP for the chase guard.
+  - **Results:** Book A lost $5.97 ($6.03 with the estimated fees); Book B lost $5.18 ($5.22).
+  - **The difference was ROST's entry.** Book B's trigger waited 6.3 s for the vet, and its order filled at 215.59 against Book A's 216: $0.80 of the $0.81. The wait made it, not a veto.
+- **Claude's calls,** with the settings' models, efforts and limits:
+
+  | Role | Model, effort | Took (API) | Limit | Turns | Output tokens | Cost estimate | Answer |
+  |---|---|---|---|---|---|---|---|
+  | premarket | opus, high | 70.9 s (69.8) | 600 s; deadline 09:28 | 3 | 9,796 | $0.35 | 31 of 31; day mode normal; allow 1 (GAP 0.62), neutral 30 |
+  | vet | sonnet, low | 8.4 s (7.5) | 60 s; Book B waits 60 s | 2 | 1,310 | $0.04 | 11 of 11; veto 1 (BILL 0.75), neutral 10 |
+  | review | opus, high | 81.5 s (80.7) | 600 s; cutoff 16:29 | 3 | 9,046 | $0.36 | 7 of 7 targets; 7 issues, 2 notes, no lesson proposals |
+
+  - **Clean:** no failures, repairs, timeouts, clamps or drops; 3 of 12 CLI runs. The calls cost about $0.75 at list prices, which the subscription counts toward its usage limits.
+  - **The day mode:** normal. There was no scheduled event, and the risk-off tape was neither an extreme release-driven move nor a market-wide shock.
+  - **The brief and the review used all 3 turns,** where G4a's calls used 2 (D-067).
+    - So each needed the spare turn that `max_turns: 3` keeps, probably for the CLI's retry of an answer that failed the schema.
+    - One more failed answer would have ended the call at the turn limit. A repair would then still have had time: the brief finished 22 minutes before its deadline, the review 13 before its cutoff.
+    - **For the human:** `max_turns: 4` would keep a spare.
+  - **The vet's timing:**
+    - EDGAR's lookups for its 11 symbols took 3.3 s after arming, so the verdicts came 11.8 s after arming.
+    - ROST triggered 5.5 s after arming and was parked for 6.3 s.
+    - FNDA's trigger found its verdict ready.
+  - **The verdicts were mostly neutral:** 40 of 42.
+    - Most of the brief's candidates were leveraged and inverse ETFs (SQQQ, SOXS, SPXS, TZA, VXX and others), which a down tape puts at the top of the gappers.
+    - STRATEGY §1 admits ETFs. **For the human:** should leveraged and inverse ETFs stay in the universe?
+- **What the review raised** (`trader followups list`): 7 issues and 2 notes, all new. Claude's reading of each:
+  1. *warn, execution: fills lagged triggers by 13–20 s.* **Alpaca paper's lag, not ours.**
+     - The four entries at 09:35 sat in `pending_new` for 9.5–13.1 s (`entry accepted waited_s`), then filled 1.4–4 s later.
+     - G3's 09:35 entry (FIGS, 2026-10-13) also took 13.6 s, while run 2's entries at 09:42 and 09:44 filled in about 1 s. It seems the paper broker is slow in the opening rush.
+     - D-053's rule kept the 10 s `entry_timeout_s` from cancelling these orders: an acceptance restarts the timeout.
+     - Live entries may not lag like this, so it belongs in Phase 7's limitations.
+  2. *warn, shadow_sim: the shadow is optimistic about stop fills in fast moves.* **Valid.**
+     - ROST's stop at 214.62 filled at 213.71 and 213.70 within a minute: −1.66R and −1.95R live, against −1.01R in the shadow.
+     - The shadow fills a stop at the stop price, plus its slippage (D-057), and a stop the price gaps through fills worse.
+     - Lessons tested on shadow R would carry this bias (note 2). For P5.1 and P5.2.
+  3. *info, execution.A: ROST's partial fill went 0.7 s without a stop.* **By design:** D-053's exception, since an OTO's stop leg waits for the whole entry to fill.
+  4. *info, book_b.vet: EMN's verdict was neutral, though its reason was against the long.* **Valid:** a point about the model's consistency. A prompt rule ("a reason against the long is a veto") would start a new epoch.
+  5. *info, book_b.premarket: GAP's brief saw +3.46%, but it opened +7.26%, and nothing re-vetted it.* **By design** (`revet_premarket: false`), but a fair point. **For the human:** re-vet a premarket verdict when the open's gap is much larger?
+  6. *info, accounting: the trades sum to −5.97, the book to −6.03.* **The pack's fault.** A trade's `pnl_usd` is gross, a book's is net of the estimated fees ($0.06 and $0.04), and the pack says neither. **Fix:** give each trade its fees.
+  7. *info, stats: `b_vetoes` is 0, yet BILL was vetoed.* **The pack's fault.** The stat counts Book B's `vetoed` decisions, that is, vetoes of signals that triggered, and BILL triggered on neither feed. **Fix:** name the stat for what it counts.
+  - *Note 1: stops at 0.1 ATR look tight, and `take_profit_r` is null.* These are the strategy's parameters (S§3, the paper's rules), and one day is no evidence. **For the human,** with Phase 7's data.
+  - *Note 2: shadow R may understate stop losses,* as in issue 2.
+  - **Claude's own find:** the review's summary says "SPY gapped −3.51%".
+    - The pack's `market.spy_gap_pct` is the move from the previous close to the latest trade. At 09:05 that is a pre-market gap; at 16:15 it is the whole day's move. The open gap was −0.32%.
+    - **Fix:** in the review's pack, label it as the day's change and add the open gaps beside it.
+- **Other findings:**
+  - **The `foreign order` (Book A, 09:35:09.650) was our own.**
+    - It was the `stop_loss` leg of ROST's OTO entry. Alpaca's update for it arrived 2 ms after the submit's answer, before the entry's row, with its group id, was journaled.
+    - `is_ours` found no match, so the service called it foreign and resynced; a later read recorded the leg under its parent.
+    - Harmless but misleading. **Fix:** call an order foreign only after any submission in flight has been journaled.
+  - **The PC clock drifted** from +0.098 s to +0.345 s during the session, about 35 ms an hour, against R§9's 2 s limit.
+    - On 11-21, doctor read 0.16 s, so the Windows Time service is correcting it (D-067's 32,768 s poll).
+    - That is fine for a day. For Phase 6's unattended weeks, the service must stay running.
+  - **News:**
+    - Every article came from `fiscal.ai`: 2,394 were stored that day (1,764 from the boot's backfill, 630 from the stream), 395 of them dated within the session.
+    - The pre-check's "thin feed" (HANDOFF, 2026-11-19) was wrong: two minutes of the stream just happened to bring none.
+    - D-028's "Benzinga" is now "one or more feeds, named by `source`", in Alpaca's docs' words. No code reads `source`.
+  - **Q2, partly answered.**
+    - The news socket ran beside the stock socket all day, as it had in `trader stream --news` the day before. So the free plan allows two market-data sockets.
+    - The 09:35 subscription reached 15 symbols with trades and quotes, 30 subscriptions in all, with no 405. That is at the limit either way, so it doesn't show whether channels count toward the 30. Whether IEX sends `statuses` is still open too.
+  - **Fees:** the boot booked 10-12 to 10-14's charges and reversals, net $0.00, as the runbook said. The day's estimates post overnight, and the next boot books them.
+- **The golden replay,** as G3's run 2 became one (D-054):
+  - **The fixture:** `tests/golden/recordings/2026-11-20/` holds the recording (4.1 MB): both brokers, `llm.jsonl.gz`, and the stream, trimmed as G3's is from 146 MB to 2.5 MB. Beside it are the session's config files and the live journal's comparable rows. `tests/fixtures/g4b_day.py` rebuilds it all.
+  - **The test,** `test_the_g4b_day_replays_as_it_was_recorded`, replays the day in about 35 s. It checks:
+    - there are no divergences, and the comparable rows equal the live ones;
+    - a review is stored for each of the 7 targets;
+    - the replay's journal matches the pin (`tests/golden/g4b_2026-11-20.json`), Book B's and the review's tables included.
+- **A test that read the PC's date:** `test_the_cli_takes_no_llm` failed on Saturday, 2026-11-21.
+  - **Why:** it runs `trader run-day --dry-run` through the CLI, which passes no clock, so `run_day` fell back to the PC's clock and found "not a trading day".
+  - **Fix:** the `offline` fixture now patches that fallback to its own SimClock, as its other tests already pass theirs.
+- **Next:**
+  - Phase 4 is done. Phase 5 starts in plan mode.
+  - Claude will propose this entry's fixes as its first tasks: the review pack's labels (the day's move, the trades' fees, the veto count) and the foreign-order race.
+  - The human's questions above: `max_turns`; leveraged and inverse ETFs; re-vetting a premarket verdict; the stop's width.
+- **Spec updates:** PLAN (G4b ticked; STATUS); HANDOFF; Q2, below.
+
+---
+
+## D-073 — P5.0a: the packs' market after the open, the review's money and veto counts, one standing-verdict rule, and max_turns 4
+- **Date:** 2026-11-21 · **Status:** Accepted (the Phase 5 plan, approved 2026-11-21: decisions 1–3 and 5, and the human's choice of `max_turns: 4`; D-072's findings).
+- **The market section** (pack version 3). `orchestrator/packs.py`'s `index_market`, a pure function, replaces `_index_gaps`.
+  - **Before the open** (the brief): `{sym}_gap_pct` is the pre-market move, as before.
+  - **From the open** (the vet, the review):
+    - `{sym}_gap_pct` is the opening gap: today's daily bar's open against the previous session's close;
+    - a new `{sym}_change_pct` is the change since that close, to the last regular-hours print, else to today's bar's close.
+  - **Why a print can be skipped:** at 16:15 the latest trade can be an after-hours print. On G4b's day QQQ's was, at 611.98 against a 609.75 close.
+  - **Whether the session has opened** is decided by the pack's time, not per symbol. So one pack never mixes a pre-market gap with an opening one.
+  - **G4b's numbers:** SPY's review would have read gap −0.32 and change −3.51, not "gap" −3.51. The vet would have read gap −0.32 and change −0.43, where it read "gap" −0.43.
+  - **The plan said `{sym}_move_pct`.** That name was taken: a review target's `spy_move_pct` is SPY over that target's window. So the market's key is `{sym}_change_pct`.
+- **The review's money keys say what they hold.**
+  - A trade's `pnl_usd` became `gross_pnl_usd`, beside a new `fees_est_usd` (`trades.fees_est`).
+  - A book's `pnl_usd` became `net_pnl_usd`, which is `daily_stats.pnl`, after the estimated fees.
+  - On G4b's day the model could then have matched −5.97 gross, less $0.06 of fees, to −6.03.
+  - The smoke pack had built a net P&L into each trade. Its trades are gross now, and its books net of their fees.
+- **The review's veto counts** (`stats`):
+  - `b_vetoes` became `b_vetoed_triggers`: Book B's `vetoed` decisions, each a veto of a signal that triggered live. `b_vetoed_mean_shadow_r` is still their mean shadow R.
+  - A new `b_veto_verdicts` counts the epoch's longs whose standing verdict is a veto, triggered or not: G4b's BILL.
+  - P5.1 brings V and its interval to the same section.
+- **One standing-verdict rule.** `memory/verdict_view.py` holds "the verdict Book B's decision rests on, else the day's latest". `reviews._b_verdicts` and `reports/daily._b_verdicts` each had their own copy; both now call it.
+  - It works over a span of days, keyed by date and symbol, so P5.1's stats and P5.2's lessons can use it too.
+  - A smoke run's verdicts never count.
+- **`llm.max_turns: 4`** for every role, in `settings.yaml` (the human approved the edit) and the example. G4b's brief and review each used all 3 turns, and G4a's calls used 2.
+- **The fingerprint changes.** `PACK_VERSION` and the `--max-turns` flag are both in it (D-065). So the next live boot raises a P3 `llm_fingerprint_changed` naming `pack_version` and the three roles' argv. That is expected in epoch 0.
+- **What else changed:**
+  - **The A+B golden's three `pack_id`s** changed (brief, vet, review), as the plan said, and nothing else in it did.
+  - **Unchanged:** Book A's golden day, G3's replay and G4b's replay, which serves its recorded packs. So does the daily report: its verdict column reads the same through the shared rule.
+- **Spec updates:**
+  - ARCHITECTURE §2 (the layout), §4.8 (`verdict_view.py`) and §8 (the market, the money and the veto counts; version 3 in the example);
+  - STRATEGY §2's news line, from D-072: the feeds that `source` names, not Benzinga;
+  - PLAN: P5.0a ticked; STATUS.
+- **Tests:**
+  - `index_market` with G4b's numbers: at 16:15, an after-hours print gives way to the bar's close; at 09:35, the change runs to the latest print, and a pre-open print or an excluded condition falls back to the bar;
+  - the vet's pack has the changes, and the brief's doesn't;
+  - the pack's market keys, the money keys and the version;
+  - the veto counts on BILL's case (a vet veto that never triggered), with a smoke run's veto ignored;
+  - the standing rule over two days.
+  - All 1,541 tests pass. Ruff, its formatter and mypy are clean.
+
+---
+
+## D-074 — P5.0b: a stop leg ahead of its entry's answer is not a foreign order (amends the plan's design)
+- **Date:** 2026-11-21 · **Status:** Accepted (the Phase 5 plan's decision 4, amended here; D-072's finding).
+- **The race (G4b):**
+  - Alpaca sent ROST's OTO `held` stop leg on the stream 1 ms after the submit's REST answer, and before the entry's own event.
+  - The service writes the entry's row before the POST, without a group id. The group id lands only when `_adopt` journals the answer, and the live journal's reader can run ahead of that write.
+  - So `is_ours` missed the leg, logged `foreign order` and resynced. The resync then recorded the leg under its entry: harmless, but a false alarm.
+- **The plan's design, tried and dropped:**
+  - The plan had `_consume` wait for in-flight submits to land, then look the order up again. Built that way, it deadlocked the SimClock harness:
+    - `_consume` waited on the clock;
+    - the stream's queue behind it never drained;
+    - and a driver (the test harness, `simdrive`) moves the clock only once the queues are idle.
+  - A replay or simulated day could stick the same way. In live runs it would hold every later trade update behind the wait.
+- **What was built instead.** `ExecutionService._unknown` classifies the unknown order and never waits.
+  - **Our leg ahead of its answer:** a stop leg (`group_id`, and `group_role: stop_loss` or a sell stop) on the symbol of an entry still waiting for its answer (`order_id` not yet known). It is logged as `stop leg ahead of its entry's answer`, at info level.
+  - **Anything else** is still a `foreign order` warning (D-037).
+  - **Either way** the resync runs as before. It records our leg under its entry, and treats anything else as a difference: two looks, then a P1 halt (D-037). So nothing that protects the book changed; only the label did.
+- **The replays.** G3's and G4b's replays and every golden are unchanged. In a replay the entry's answer lands before the leg's recorded event.
+- **Tests** (SimBroker, threaded journal, `structlog.testing.capture_logs`):
+  - **Alpaca's order:** the leg's event first, and the answer only after the service has looked the leg up. The result: no `foreign order`, one `stop leg ahead…` line, the leg under its entry, and no incident.
+  - **Another symbol's** OTO placed by hand during our submit is still foreign.
+  - **An unknown order with no entry waiting** is foreign.
+  - **Two broken variants are caught:** no order counted as a stop leg, or any symbol accepted.
+  - **Results:** 1,543 of 1,544 tests passed. The one failure, the journal's table count, came from P5.1's migration 0010, written while the run was going (D-075). Ruff, its formatter and mypy are clean.
+- **Spec updates:** PLAN (P5.0b ticked; STATUS); `docs/PHASE5_PLAN.md`'s decision 4 stands amended by this entry.
+
+---
+
+## D-075 — P5.1: the metrics, the veto value and its population, intervals by resampled days, and the epoch record
+- **Date:** 2026-11-22 · **Status:** Accepted (the Phase 5 plan: decisions 6, 7 and 9, and the human's choice to resample whole days; held items 2 and 3 of 2026-10-09).
+- **`memory/stats.py`:** one read of the journal (`read_epoch`), then pure functions.
+  - **Each book** (`book_metrics`):
+    - trades, win rate (R > 0), mean R;
+    - expectancy in dollars, gross and net of the estimated fees;
+    - profit factor, on net P&L;
+    - the days' net P&L;
+    - max drawdown, from the first day's start equity through each day's end;
+    - the daily Sharpe (sample standard deviation, × √252);
+    - exposure: the share of session time with a position open, counting overlapping trades once and holding an unexited trade to the close;
+    - mean entry slippage and delay;
+    - **live R minus shadow R** per trade, which measures D-072's stop-fill bias before anyone changes the shadow rule.
+  - **The veto value** (`veto_value`), in STRATEGY §7.3's words: the epoch's longs whose shadow triggered (a SIP-only trigger counts), with a shadow R and a standing verdict.
+    - `allow` and `neutral` are allowed; `veto` is vetoed.
+    - Triggered longs with no verdict are counted and left out.
+    - Beside V and each side's n stands the vetoed side's own mean shadow R, with its interval (held item 3: V can be positive while the vetoes lose).
+  - **Book B − Book A** (`b_minus_a`), their mean R per trade, with its interval: H2's number.
+  - **SPY buy-and-hold** (`spy_buy_and_hold`), from `regime_daily`:
+    - bought at the close before the books' first session, valued at the last close through their last;
+    - `covered` says whether that close is the last session's. A Friday's arrives at Monday's boot. P5.4's report fills the gap.
+- **The intervals** (`day_bootstrap`; the human's decision, 2026-11-21).
+  - Each resample draws as many whole trading days as there are, with replacement, and adds up their sums and counts.
+  - The statistic is a function of those totals. A resample where it is undefined (a side with no signal) is skipped and counted.
+  - Percentile intervals at `lessons.ci_level` (90%), with `lessons.bootstrap_resamples` (10,000) resamples from `lessons.bootstrap_seed`. The draws use numpy's `default_rng`, so they don't depend on the hash seed.
+  - Days are drawn one at a time, so memory stays at resamples × statistics.
+- **The review's `stats`** gain V from `stats.py`: `v_r`, `v_ci_low`, `v_ci_high`, `v_n_allowed`, `v_n_vetoed` and `v_vetoed_mean_r`. The A+B golden's review `pack_id` changed again, and nothing else did.
+- **The epoch record** (held item 2), in migration 0010:
+  - **The `epochs` table:** epoch, start, reason, DECISIONS id, the note that led to it, and the hashes of the settings, risk and events files and of the LLM fingerprint.
+    - Epoch 0's row says "the build and its shakedown, before P7.1's freeze", under this entry.
+    - `lessons.status_reason` comes with it, for P5.2.
+  - **`memory/epochs.py`:** `start_epoch` writes the row and bumps `meta.eval_epoch` in one transaction. It refuses:
+    - any number but the next one;
+    - a DECISIONS id that isn't one;
+    - an empty reason;
+    - an unknown note.
+  - **The CLI:**
+    - `trader epoch show` lists the epochs;
+    - `trader epoch start N --decision D-xxx --reason "…" [--note ID]` is the human's. It holds `run-day.lock` while it writes, since run-day stamps every row with the epoch, so it refuses while a day runs.
+  - `current_epoch` moved here from `reviews.py`.
+- **Spec updates:**
+  - STRATEGY §7.3 (the population, the intervals, the comparisons) and §9 (the record);
+  - ARCHITECTURE §2, §4.8 (`stats.py`, `epochs.py`), §4.11 (`epoch`), §6 (migration 0010) and §8 (the review's V);
+  - CLAUDE.md's Commands (`epoch`, as the plan said);
+  - PLAN: P5.1 ticked; STATUS.
+- **Tests** (`tests/unit/test_stats.py`; a multi-day fixture builder, `tests/fixtures/journal_days.py`, for P5.1–P5.5):
+  - **the bootstrap:** seeded, with the skipped draws counted; wider by days than by signals when a day moves together;
+  - **a book's numbers,** worked by hand, and a drawdown from the first day's start;
+  - **V's population edges:** neutral, a SIP-only trigger, a veto that never triggered, no verdict, another epoch, a smoke run's verdict;
+  - **the rest:** the review's V; Book B − Book A; SPY covered or not; an epoch summary from the journal; the epoch record and its CLI, the lock included.
+  - **12 mutations, all caught:** neutral not allowed; exposure without the union; drawdown without the start; gross profit factor; a flipped live − shadow; undefined resamples kept; SPY always covered; B − A swapped; the epoch not bumped; a population SD in the Sharpe; a missing verdict counted as allowed; days ignored in resampling.
+  - All 1,558 tests pass, so P5.0b's code passes too (D-074). Ruff, its formatter and mypy are clean.
+
+---
+
+## D-076 — P5.2: the lesson DSL's types, rows of pre-decision features, forward-only one-look promotion, and monthly demotion
+- **Date:** 2026-11-22 · **Status:** Accepted (the Phase 5 plan: decisions 10 and 11, and the human's choice that lessons count only later signals; held item 1 of 2026-10-09).
+- **`memory/lessons.py`.**
+  - **The query** (`validate`): the schema's whitelist, plus a type for every field, written into STRATEGY §6.2. Any other key, a bool for a number, a non-finite number, an unknown value of a category, or 0 or 5 filters is refused, with the reason.
+    - An import-time check makes sure every whitelisted field has exactly one type, so a field added to the schema can't slip through untyped.
+    - Queries are applied in Python. No SQL is ever built from one.
+  - **Numbers don't take `in`.** The plan gave them `in`, but the schema's `in` value is a list of strings. A range does the same job with `gte` and `lte`.
+  - **The rows** (`read_features`): the epoch's triggered longs with a shadow R, each with the S§6.2 fields as the engine knew them before the outcome.
+    - Book B's fields come from the standing verdict (D-073).
+    - `price` is the trigger price, and `minutes_to_trigger` the whole minutes from the arming to the SIP trigger minute.
+    - A field the engine didn't have is unknown, and a row is on neither side of a query that names one of its unknown fields: a long Book B never judged isn't "not vetoed".
+  - **The test** (`judge`, written into STRATEGY §6.3):
+    - only rows dated after the proposal's day count;
+    - the effect is the subset's mean shadow R minus the complement's, with an interval from resampled days (D-075).
+    - **One look:** a proposal waits until each side has `min_n_per_side` (20) rows, then passes once or fails once.
+      - It passes if |effect| ≥ `min_effect_r` (0.10 R) and the whole interval lies on the claimed side of 0.
+      - A rejected or demoted lesson is never judged again.
+    - **The month's first run** (`meta.lessons_demotion_month`) re-tests promoted lessons on all their later rows, and demotes one whose interval now reaches 0. Other runs only refresh a promoted lesson's numbers.
+- **Writing:** `evaluate_lessons(write=True)` stores each outcome in the lesson's row: status, `status_reason` (migration 0010), n's, effect, interval, and when it was evaluated, promoted or demoted. It also records the month's check, all in one transaction.
+- **The CLI:**
+  - `trader lessons evaluate` prints what each lesson would become and writes nothing;
+  - `--promote` stores it, and is the Saturday job's (Phase 6);
+  - `trader lessons list` shows every lesson, its statement made printable.
+- **Spec updates:**
+  - STRATEGY §6.2 (types and meanings) and §6.3 (how it is applied);
+  - ARCHITECTURE §4.8 and §4.11;
+  - CLAUDE.md's Commands;
+  - PLAN: P5.2 ticked; STATUS.
+- **Tests** (`tests/unit/test_lessons.py`, 37):
+  - every type rule, and 25 refused queries: SQL in a field and in a value, a Cyrillic look-alike field, `shadow_r` (an outcome), a nested object, a bool, NaN, a string number, `in` with 0 or 11 values, `contains` on a category, an unknown flag, extra keys, 0 or 5 filters, a wrong metric, non-JSON;
+  - the rows' fields, and unknown fields on neither side;
+  - a planted effect promoting; only later signals counting; a null effect rejected and never looked at again; the claimed side; the 0.10 R floor; an invalid query rejected with its reason while its statement, an injection, is never obeyed;
+  - the monthly re-test; nothing written without `--promote`; the CLI, the model's text made printable.
+  - **12 mutations, all caught:** a bool as a number; no forward confirmation; rejected lessons looked at again; no effect floor; either direction; monthly always; monthly never; unknown counted as the complement; `in` unbounded; `contains` anywhere; a dry run that writes; minutes rounded up.
+  - All 1,595 tests pass. Ruff, its formatter and mypy are clean.
+
+---
+
+## D-077 — P5.3: the playbook in every pack, the vet's matches (not the brief's), runtime/playbook.md, and the shared rendering
+- **Date:** 2026-11-22 · **Status:** Accepted (the Phase 5 plan: decisions 12 and 13; amended below for the brief).
+- **`memory/playbook.py`:**
+  - **Which lessons:** `playbook` takes the promoted lessons that have their numbers, ranked by n × |effect| (n is the signals the lesson's conditions matched in its test), capped at `lessons.max_playbook_lessons` (15). A promoted lesson whose stored query no longer validates is skipped.
+  - **In the packs:** `LivePacks` reads them at each pack (`Common.playbook`), so every role's `playbook` shows them in A§8's shape. The conditions code validated, enum values and numbers, sit outside `untrusted`; the statement, a model's, inside. No prompt changed: the prompts already describe both sections.
+  - **The vet's matches** (`matching`, `vet_features`): a vet candidate's `matching_lessons` names the lessons whose conditions hold on its features known at arming: the gap, relative volume and rank, the opening range's numbers, the trigger price, ATR%, and the regime and calendar tags.
+    - Conditions on Book B's own fields (catalyst, flags, verdict, its source, confidence) are the model's to apply, so code skips them.
+    - A condition on any other field the candidate lacks, such as `minutes_to_trigger`, means no match, since code can't confirm it.
+    - A lesson matches only if code checked at least one condition.
+  - **`runtime/playbook.md`** is the human's copy, rewritten by `trader lessons evaluate --promote`. A statement is rendered as an inert code span.
+- **Amended: the brief's candidates carry no `matching_lessons`.** The plan gave both roles matches, but before the open a candidate's `gap_pct` is the pre-market move, not the opening gap the lessons' rows hold.
+  - A match on it would assert something code can't know, and the rest of the brief's features (ATR%, the tags) would rarely decide one.
+  - The brief still reads the whole playbook with its conditions.
+  - So the brief's pack is unchanged when no lesson is promoted, and the A+B golden doesn't move.
+- **Pack version 3 stays** (plan decision 12): no live session has run since P5.0a.
+- **`reports/render.py`** now holds what P5.4's plan moved there: STRATEGY §10's limitations, `ModelText`, `md_cell`, `model_md` and `md_row`, all taken out of `daily.py`. The playbook's Markdown needed `model_md`. The daily report's output is unchanged, and its tests pass as they were.
+- **Spec updates:**
+  - STRATEGY §6.4 (how the playbook reaches Claude);
+  - ARCHITECTURE §2 (the stale `templates/`), §4.8, §4.10 (`render.py`) and §8 (`conditions`, and matches on vet candidates only);
+  - PLAN: P5.3 ticked; STATUS.
+- **Tests** (`tests/unit/test_playbook.py`):
+  - the ranking, the cap, and what's left out (not promoted, no numbers, an invalid query);
+  - the vet's matches (a model field skipped, an unknown field refusing, nothing checked refusing);
+  - the vet's and the brief's packs through `LivePacks`: the playbook in both, the matches on the vet's alone, an injected statement under `untrusted`;
+  - a full playbook within the pack's size;
+  - the Markdown kept inert;
+  - `lessons evaluate --promote` writing the file.
+  - **5 mutations, all caught:** ranking by n alone; no cap; the model's fields treated as unknown; unknown fields ignored; a match with nothing checked.
+
+---
+
+## D-078 — P5.4: the weekly report, its equity curves, and SPY's missing closes
+- **Date:** 2026-11-22 · **Status:** Accepted (the Phase 5 plan: decision 14; decisions 7–8, 13).
+- **`reports/weekly.py`:** `build_weekly` reads one ISO week and the epoch to date in one journal read. It renders through `reports/render.py` (D-077):
+  - **Curves:** equity for Book A, Book B and SPY, each indexed to 100 at the epoch's start (SPY at the close before its first session). The HTML draws them as an inline SVG, with no new dependency; the Markdown shows a table.
+  - **Each book,** the week's and the epoch's: `memory/stats.py`'s metrics (D-075), live R − shadow R and its n among them.
+  - **Book B's vetoes,** for the week and the epoch: V with its interval, each side's n, the vetoed side's own mean shadow R with its interval, the triggered longs with no verdict, and Book B − Book A with its interval.
+  - **Lessons:** the count by status, and the promoted ones.
+  - **The factor tally** to the week's end, with S§6.5's caveat that factors are hindsight labels.
+  - **The rest:** the week's `bad_process` reviews; the open issues and notes, oldest and most recurring first; the week's incidents; each epoch's record with Book B − Book A in it; and the limitations footer.
+  - **Model text stays inert:** in the Markdown as a code span with its pipes escaped, and in the HTML escaped as every cell is. That covers Book B's notes, the issues and notes, the incidents' messages and the lessons' statements.
+- **SPY's missing closes** (decision 8):
+  - A session's `regime_daily` row, which holds SPY's close, is written at the next session's boot, so on a Saturday Friday's isn't there yet.
+  - `trader report weekly` first runs the boot job's own `ensure_regime` for each of the week's sessions without one: one SIP daily-bars request each.
+  - With `--offline`, or when a request fails, the report says how far SPY's closes reach instead of showing a partial return as whole.
+- **`trader report weekly [--week YYYY-Www] [--offline]`** defaults to the last complete ISO week: this week from Saturday, otherwise the one before. It writes `weekly-YYYY-WW.{md,html}` beside the daily reports. The Saturday job that runs it is P6.1's.
+- **Spec updates:**
+  - ARCHITECTURE §4.10 (the report's contents) and §4.11 (the command);
+  - CLAUDE.md's Commands;
+  - PLAN: P5.4 ticked; STATUS.
+- **Tests** (`tests/unit/test_weekly.py`, on a two-week journal):
+  - the weeks, across a year;
+  - everything a week gathers, its incidents only, and SPY's last close missing;
+  - a week without Book B, and an empty week;
+  - the model's text inert in both formats;
+  - the SVG: no line for a series with no points, a single session;
+  - the files' names;
+  - SPY's missing closes filled through `ensure_regime` with a fake market, and left missing in an outage;
+  - the command, and a malformed `--week`.
+
+  The daily report's tests pass unchanged after `render.py` took its helpers.
+
+---
+
+## D-079 — P5.5: the evaluation memo, S§8's inconclusive row, and how each line is computed
+- **Date:** 2026-11-22 · **Status:** Accepted (the Phase 5 plan: decision 15; the human's decision 3 of 2026-11-21 pre-registered the inconclusive row). One reading, the "keep running" of outcome 2 below, is for the human to confirm or overrule.
+- **`reports/evaluation.py`:** `build_memo` judges one epoch, through a given session, by STRATEGY §8 as registered. Each line is pass, fail or insufficient data, with its numbers.
+  - **The minimum data:**
+    - trading days are the epoch's sessions with a `daily_stats` row;
+    - triggered longs are the epoch's longs whose shadow triggered, including a trigger seen on SIP bars alone (D-075's population). The research-only shadow shorts never count: no book can trade them and no verdict covers them. §8 says "triggered signals", and this reading is now written there;
+    - vetoes are triggered longs with a standing veto, H1's population. So the inconclusive row's "H1 has fewer than 20 vetoes" is part of "the minimum data isn't reached", and the code checks it once.
+  - **The hypotheses:**
+    - H1 passes when V's interval lies above 0.
+    - H2 passes when Book B's mean R per trade minus Book A's is at least 0. §8 states H2 as "≥", so the estimate decides; its interval is shown beside it.
+    - H3: on Book B's `reduced` and `no_trade` days (its `day_modes` row), the triggered longs' mean shadow R minus that on its `normal` days must have an interval below 0.
+    - H4: ranks 1–5 minus ranks 16–20 must have an interval above 0. A Spearman correlation of rank against shadow R is shown beside it, ties averaged, computed with numpy (no scipy).
+    - H1, H2 and criteria 1–3 read insufficient data until the minimum data is met. H3 and H4, which are secondary, need `min_n_per_side` (20) longs on each side instead.
+  - **The criteria:**
+    1. V's interval's lower bound is above 0.
+    2. Book B's trades' mean R after fees is above 0, each trade's being (P&L − estimated fees) / (qty × (entry − stop)).
+    3. Book B's max drawdown, from `daily_stats`, is at most 15%.
+    4. Insufficient data until Phase 6 marks runs as unattended. Meanwhile it shows the longest run of sessions with no P1 incident.
+    5. Always "for the human".
+  - **The outcome,** in this order (written into §8):
+    1. inconclusive, as the row says, from the 90th trading day;
+    2. keep running while the minimum data isn't reached, or while V's interval spans 0 by more than 0.5 R. This is the reading for the human to confirm: the row calls that case inconclusive at 90 days, so an earlier look shouldn't call it a fail;
+    3. both books negative, or H1 fails with Book A positive, by each book's net P&L;
+    4. the criteria code can check pass, when criteria 1–3 do, and the go/no-go stays the human's (G7);
+    5. criteria not met.
+- **`trader report evaluation [--epoch N] [--through YYYY-MM-DD]`** judges the current epoch through today by default. It writes `evaluation-epoch-N.{md,html}` beside the other reports and prints the outcome with its counts. It is offline: it reads only the journal. A malformed `--through` gets a usage line.
+- **An epoch-0 memo says it is a dry run.** Epoch 0 is the build and its shakedown (S§9), and some of its data, G3's and G4b's days, predates the inconclusive row. So the memo claims only that its rules were pre-registered, not that they came before the epoch's data.
+- **On G4b's real journal:** 1 trading day, 11 triggered longs (10 live, and VNT's on SIP bars alone) and 0 vetoes, so "keep running". There is no V, since BILL's veto never triggered (D-072). Claude's review counted 10 triggered longs, the live ones.
+  - The G4b golden test now renders the weekly report and the memo from its replay's journal, as P5.4's plan said it would. Until now the reports were tested only on hand-written rows.
+- **Spec updates:**
+  - STRATEGY §8: the inconclusive row as the human approved it, "How the memo computes each line", and which longs count;
+  - ARCHITECTURE §4.10 and §4.11;
+  - CLAUDE.md's Commands;
+  - PLAN: P5.5 ticked; STATUS.
+- **Tests** (`tests/unit/test_evaluation.py`, 25; and the G4b golden test):
+  - the minimum data exactly at 60 days, 150 longs and 20 vetoes, and one short of each;
+  - each hypothesis's and criterion's pass, fail and insufficient data, edges included:
+    - a V of exactly 0 fails;
+    - Book B level with Book A passes H2;
+    - a drawdown of exactly 15% passes;
+    - H3 and H4 fail when their estimate points the predicted way but their interval reaches 0;
+  - H4's buckets: ranks 5 and 20 are in, ranks 6 and 15 out;
+  - every outcome:
+    - keep running, for each reason;
+    - the criteria code can check pass;
+    - H1 fails, Book A positive;
+    - criteria not met, including H1 failing while Book A is down;
+    - both books negative;
+    - inconclusive for each trigger, at exactly 90 days, while 89 days keeps running;
+    - a narrow interval around 0 at 90 days, which is an answer (H1 fails), not inconclusive;
+  - a P1 breaking the run of sessions; Spearman's ties; "n/a" where nothing can be computed; both renderings; the command, and a bad date.
+  - **30 mutations, all caught.** Each rewrites one site of the module's source and re-executes it:
+    - the minimum data: `>` for `≥`; `any` for `all`; H1 not waiting for it;
+    - H1 by `≥ 0`, and by its upper bound;
+    - H2 strict, and by its interval;
+    - H3 by the wrong bound, without `no_trade`, and its n by `≤`;
+    - H4: rank 6 in; rank 15 in; ranks 5 and 20 out; the wrong bound; its n by `≤`;
+    - Spearman's ties not averaged;
+    - criterion 1 by `≥ 0`; criterion 2 adding the fees, ignoring them, or counting Book A's trades; criterion 3 strict; criterion 4 passing on a P1-free run; a P1 ignored;
+    - the outcome: 90 days strict; the width ignored; a wide interval not inconclusive; a wide interval not kept running; both books negative when either is; H1 failing whatever Book A did; the criteria passing when any does.
+  - **Three survived the first pass,** and each gained a test. Every interval in the tests was a single point, so judging H3 or H4 by the wrong end changed nothing. And no test had H1 failing while Book A was down.
+  - **All 1,635 tests pass,** P5.4's (D-078) included; P5.3's run had passed 1,601 (D-077). Ruff, its formatter and mypy are clean.
+
+---
+
 ## Open questions to resolve during the build (record answers as new entries)
 
 - **Q1 (P1.2):** Is Alpaca's `movers` (top market movers) endpoint available on the free plan? If not, use the IEX snapshot gap scan. **Partly answered: D-024** (the 09:00 scan uses snapshots either way); doctor's `data.movers` check records availability once keys exist. **Answered by doctor on 2026-10-10: available** (`data.movers` PASS; the screener returned 10 gainers).
-- **Q2 (P1.5):** The concurrent market-data WebSocket connection limit on the free plan, and whether a trading-status/halts channel is available on the IEX feed.
+- **Q2 (P1.5):** The concurrent market-data WebSocket connection limit on the free plan, and whether a trading-status/halts channel is available on the IEX feed. **Partly answered: D-072.** The free plan allows two market-data sockets at once: the stock stream and the news stream ran together all of G4b's day. Still open: whether channels count toward the 30 symbols (15 symbols with trades and quotes drew no 405), and whether IEX sends `statuses`.
 - **Q3 (P2.1):** Exact alpaca-py request classes for OTO with a `stop_loss` leg; confirm that close-position cancels the related open orders. **Answered: D-030** (the trading client uses httpx, not alpaca-py; `DELETE /v2/positions/{symbol}` does not cancel open orders, so flattening cancels first).
 - **Q4 (G4a):** Does `--tools ""` work with `--json-schema`? What are the envelope fields and the exit codes on usage-limit or auth errors? **Answered: D-067.** Yes, under every isolation flag; D-067 lists the envelope's 27 keys. No call hit a usage-limit or auth error, so those exit codes are still unseen. The runner doesn't depend on them.
 - **Q5 (P0.2):** Current SEC Section 31 fee rate and FINRA TAF per share, for fee estimates (set in `fees:`). **Answered: D-019.** D-058 and D-060: the CAT fee, which D-019 judged negligible, costs a cent a trading day once Alpaca rounds it up; the estimates leave it out.

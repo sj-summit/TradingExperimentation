@@ -58,9 +58,9 @@ ai-day-trader/
 │   ├── risk/       caps.py gate.py ledger.py killswitch.py breakers.py
 │   ├── execution/  broker.py alpaca_broker.py sim_broker.py orders.py service.py reconcile.py
 │   ├── llm/        client.py claude_cli.py roles.py fake.py replay.py epoch.py candidates.py context.py schemas.py budget.py sanitize.py smoke.py smoke_packs.py smoke_data.json descendants.py
-│   ├── memory/     journal.py migrations/0001_init.sql stats.py shadow.py lessons.py regime.py playbook.py reviews.py
+│   ├── memory/     journal.py migrations/0001_init.sql stats.py epochs.py shadow.py lessons.py regime.py playbook.py reviews.py verdict_view.py
 │   ├── orchestrator/ day.py plan.py tasks.py eod.py inputs.py llm_jobs.py evidence.py packs.py ports.py live.py replay.py watchdog.py
-│   ├── reports/    daily.py weekly.py evaluation.py templates/
+│   ├── reports/    daily.py weekly.py evaluation.py render.py   (no templates: html.escape, D-046)
 │   └── notify.py
 ├── tests/       unit/ integration/ fixtures/ (calendars, bars, news, llm envelopes, recorded day)
 └── runtime/     (gitignored) trader.db logs/ recordings/ llm/ claude-config/ llm_sandbox/ llm_canary/ playbook.md heartbeat.json KILL
@@ -317,8 +317,23 @@ class LLMResult(Generic[T]):
   - `regime_vol_bucket` = `low`/`mid`/`high`, from SPY ATR% terciles over 1 year;
   - `day_of_week`;
   - `event_day`.
-- **`stats.py`:** the metrics in STRATEGY.md §7.3, plus the bootstrap (seeded) and epoch handling.
-- **`lessons.py`:** evaluates the evidence-query DSL, plus promotion and demotion (STRATEGY.md §6). **`playbook.py`** renders `runtime/playbook.md`.
+- **`stats.py`:** the metrics in STRATEGY.md §7.3 (D-075).
+  - `read_epoch` reads an epoch's trades, the books' days, the triggered longs with their standing verdicts, the sessions and SPY's closes in one read.
+  - Pure functions do the rest: `book_metrics`, `veto_value`, `b_minus_a`, `spy_buy_and_hold` and `summarize`.
+  - `day_bootstrap` gives the intervals. It resamples whole trading days, seeded, using `lessons:`'s resamples, seed and level.
+- **`epochs.py`:** the epoch record (`epochs`, migration 0010) and `start_epoch`. Only the human starts one, with `trader epoch start` (D-075).
+- **`lessons.py`:** the evidence-query DSL and promotion and demotion (STRATEGY.md §6.2–6.3, D-076).
+  - `validate` checks a query against the typed whitelist.
+  - `read_features` builds a row per triggered long, with the S§6.2 fields as the engine knew them.
+  - `evaluate` applies a query in Python, never as SQL.
+  - `judge` makes the one-look, forward-only promotion and the monthly demotion.
+  - `evaluate_lessons` backs `trader lessons evaluate [--promote]`.
+- **`playbook.py`** (D-077):
+  - `playbook` gives the promoted lessons, ranked by n × |effect| and capped at `lessons.max_playbook_lessons`;
+  - `matching` and `vet_features` give the vet candidates' `matching_lessons`;
+  - `render` and `write_playbook` give `runtime/playbook.md`.
+  - `LivePacks` puts the playbook in every pack (`Common.playbook`).
+- **`verdict_view.py`:** Book B's standing verdict on a symbol: the one its decision rests on, else the day's latest (D-073). The review, the daily report, and Phase 5's stats and lessons share it.
 - **`reviews.py`:** STRATEGY.md §6.5–6.6 (D-071). `DailyReviewWork` is the orchestrator's `ReviewWork`.
   - Picks the day's review targets (`select_targets`) and gathers their evidence for the pack: each target's decision time (`decision_point`), its shadow path with SPY's move over the same window, and its news stamped against the decision (`target_news`).
   - Builds the review pack's `history` section, including the factor tally, and the `stats` of the epoch.
@@ -352,14 +367,25 @@ class LLMResult(Generic[T]):
   - **Book B's part** (D-069): the header's attempts (ok, failed, abandoned), the budget used, the failed attempts toward `llm_degraded`, and the day mode; Book B's verdict per signal (the one its decision rests on); a table of the day's attempts; Claude's words (the day mode's reason, the review's summary and target reviews). A day Book B was kept off says why.
   - **The review's follow-ups** (D-071): each process issue and note the review raised, new or recurring (with its count), in today's words. A review that didn't come says why.
   - **The model's text** is escaped: in HTML like every cell. In Markdown it sits in a code span whose fence is longer than any run of backticks in it, so it opens no link (a bare URL included), image, HTML or emphasis; in a table its pipes are escaped too.
-- **Weekly report:**
-  - equity curves A vs B vs SPY;
-  - veto value V with CI;
-  - lessons status;
+- **Weekly report** (`reports/weekly.py`, D-078): an ISO week, beside the epoch to date.
+  - equity curves A vs B vs SPY, each indexed to 100 at the epoch's start; an inline SVG in the HTML, a table in the Markdown;
+  - each book's trades, the week's and the epoch's: `memory/stats.py`'s metrics, live R − shadow R among them;
+  - veto value V with CI, each side's n, the vetoed side's own mean shadow R, and Book B − Book A;
+  - lessons status, and the promoted lessons;
   - the factor tally (wins and losses per factor, with the hindsight caveat from STRATEGY.md §6.5);
   - Book B `bad_process` reviews from the week;
   - open process issues and notes, oldest and most-recurring first;
-  - epoch info.
+  - the week's incidents;
+  - epoch info: each epoch's record, with Book B − Book A in it;
+  - the limitations footer.
+  - `trader report weekly` first fills the week's missing SPY closes through the boot job's `ensure_regime`, since a Friday's otherwise waits for Monday's boot. With `--offline`, or if the request fails, the report says how far SPY's closes reach.
+- **Evaluation memo** (`reports/evaluation.py`, D-079): one epoch through a given session, judged by STRATEGY.md §8 as registered, to `evaluation-epoch-N.{md,html}`.
+  - **Each line** is pass, fail or insufficient data, with its numbers: the minimum data (days, triggered longs, vetoes), H1–H4, and criteria 1–5. §8's "How the memo computes each line" is the rule for each.
+  - **The outcome** follows §8's table, with the inconclusive row the human pre-registered on 2026-11-21.
+  - **Offline:** it reads the journal only. It holds no SPY line, so it fetches nothing.
+  - **It decides nothing:** criterion 5 always reads "for the human", and going live stays the human's G7.
+  - **Epoch 0's memo says it is a dry run:** that epoch is the build and its shakedown (STRATEGY §9).
+- **`render.py`** (D-077): STRATEGY §10's limitations, `ModelText`, and the Markdown escaping that keeps the model's text inert. The daily report, the playbook and P5.4–P5.5's reports share it.
 - **`notify.py`:** providers `none | ntfy | discord`. Messages carry no secrets and no account numbers.
 
 ### 4.11 CLI (`typer`)
@@ -372,9 +398,10 @@ class LLMResult(Generic[T]):
 | `run-day [--books A\|B\|A,B] [--sim] [--dry-run] [--no-llm]` | The full day; `--no-llm` keeps Book B off for the day | HUMAN GATE until Phase 6 |
 | `replay --date D [--speed N]` | Recorded day through the real engine on SimClock, with recorded market data and broker answers; compares with the journal (D-049). `--speed` is deferred | — |
 | `backtest --start --end [--tape]` | Rules-only ORB on historical SIP; `--tape` fetches the SIP tape of each ambiguous trigger minute not yet cached (D-057) | — |
-| `report daily\|weekly\|evaluation` | Reports | — |
-| `lessons evaluate [--promote]` | Weekly job | — |
+| `report daily\|weekly\|evaluation` | Reports. `weekly [--week YYYY-Www] [--offline]`: the last complete week by default; it fetches the week's missing SPY closes unless `--offline` (D-078). `evaluation [--epoch N] [--through YYYY-MM-DD]`: the current epoch through today by default; offline (D-079) | — |
+| `lessons evaluate [--promote]` / `lessons list` | The weekly job: tests every proposed and promoted lesson on later signals; only `--promote` stores the outcomes (D-076). `list` shows every lesson with its numbers | — |
 | `followups list [--all]` / `followups set issue\|note ID --status S [--response TEXT]` | Claude's open process issues and notes; only the human closes them (issue: `fixed`/`wontfix`; note: `accepted`/`rejected`/`done`) | — |
+| `epoch show` / `epoch start N --decision D-xxx --reason TEXT [--note ID]` | The current evaluation epoch and every epoch's record. `start` records the next one with the hashes of the config files and the LLM fingerprint, never while a run-day runs (D-075) | `start`: the human only |
 | `fees [--book A\|B\|all] [--days N]` | Read-only: the FEE activities Alpaca charged a book's account, then its cash (D-055) | — |
 | `halt`, `resume`, `flatten` | Kill switch | `resume` requires typed confirmation |
 | `watchdog` | Independent safety check | — |
@@ -555,7 +582,11 @@ CREATE TABLE lessons (id TEXT PRIMARY KEY, created_at TEXT, source_call_id TEXT,
   rationale TEXT, evidence_query_json TEXT, claimed_direction TEXT, suggested_use TEXT, status TEXT,
   n_subset INTEGER, n_complement INTEGER, effect_r REAL, ci_low REAL, ci_high REAL,
   evaluated_at TEXT, promoted_at TEXT, demoted_at TEXT,
-  source_date TEXT);   -- from 0009: the review day that proposed it (D-071)
+  source_date TEXT,   -- from 0009: the review day that proposed it (D-071)
+  status_reason TEXT);   -- from 0010: why it stands where it does (an invalid query, a failed test)
+CREATE TABLE epochs (epoch INTEGER PRIMARY KEY, started_at TEXT, reason TEXT NOT NULL,   -- from 0010 (D-075)
+  decision TEXT, note_id INTEGER REFERENCES review_notes(id),   -- the DECISIONS entry, the note that led to it
+  settings_sha256 TEXT, risk_sha256 TEXT, events_sha256 TEXT, llm_fingerprint TEXT);   -- what it froze; only the human starts one
 CREATE TABLE daily_reviews (date TEXT PRIMARY KEY, status TEXT, summary TEXT,   -- status: ok | missing | invalid
   llm_call_id TEXT REFERENCES llm_calls(id), eval_epoch INTEGER, created_at TEXT,
   failure TEXT, targets_json TEXT);   -- from 0009: why it's missing or invalid; the targets asked about (D-071)
@@ -729,10 +760,17 @@ The JSON is built by `llm/context.py` (D-063). Every free-text field a third par
 - A candidate (in the review, a target) carries `suspicious_news: true` when one of its items does, or its items read together do. Code then puts `suspicious_content` in its risk flags after validation.
 - Names, sources, forms and event names are cleaned the same way and stay outside `untrusted`.
 - `news_unavailable: true` says the news feed was down or its last read failed, so every candidate's empty `news` list means unknown, not quiet. Version 2 of the pack added it (D-069).
+- **`market`** gives the index ETFs against the previous session's close, from one snapshot (`index_market` in `orchestrator/packs.py`; version 3, D-073):
+  - before the open (the brief), `{sym}_gap_pct` is the pre-market move;
+  - from the open (the vet, the review), `{sym}_gap_pct` is the opening gap (today's daily bar's open), and `{sym}_change_pct` the change since that close, to the last regular-hours print, else to today's bar's close. A 16:15 snapshot's latest trade can be an after-hours print.
+  - A review target's `spy_move_pct` is something else: SPY over that target's window.
+- **The review's money** (version 3, D-073): a trade's `gross_pnl_usd` and `fees_est_usd`; a book's `net_pnl_usd`, after the estimated fees.
+- **The review's veto counts** (`stats`, D-073): `b_vetoed_triggers` counts Book B's `vetoed` decisions, which only a live trigger brings; `b_veto_verdicts` counts the epoch's longs whose standing verdict is a veto, triggered or not.
+- **The review's veto value** (`stats`, D-075): `v_r` with `v_ci_low` and `v_ci_high`, `v_n_allowed`, `v_n_vetoed` and `v_vetoed_mean_r`, from `memory/stats.py` (STRATEGY §7.3).
 
 ```json
 {
-  "pack_version": 2,
+  "pack_version": 3,
   "pack_id": "vet-20261103-3f9c2a7d41b0e6c5",
   "role": "vet",
   "as_of": "2026-11-03T09:35:05-05:00",
@@ -747,6 +785,7 @@ The JSON is built by `llm/context.py` (D-063). Every free-text field a third par
   "events_today": [{"time": "14:00", "name": "FOMC decision", "impact": "high"}],
   "news_unavailable": false,
   "market": {"iwm_gap_pct": 0.1, "qqq_gap_pct": -0.6, "spy_gap_pct": -0.4,
+             "iwm_change_pct": 0.2, "qqq_change_pct": -0.7, "spy_change_pct": -0.3,
              "regime_as_of": "2026-11-02", "regime_spy_trend": "up", "regime_vol_bucket": "mid"},
   "book_b": {"equity_usd": 996.08, "day_mode": "normal", "day_mode_source": "premarket",
              "recent": {"last_trades": 10, "mean_r": 0.12, "win_rate": 0.4}},
@@ -774,7 +813,7 @@ The JSON is built by `llm/context.py` (D-063). Every free-text field a third par
 }
 ```
 
-The playbook entry shows the shape P5.3 is to use: a lesson is weighed by its numbers, and its statement, which a model wrote, sits under `untrusted`.
+The playbook entry shows its shape: a lesson is weighed by its numbers, and its statement, which a model wrote, sits under `untrusted`. Each entry also carries `conditions`: its validated filters (`field`, `op`, `value`), outside `untrusted` since code checked every one. Only vet candidates carry `matching_lessons` (STRATEGY §6.4, D-077).
 
 Per-role contents:
 

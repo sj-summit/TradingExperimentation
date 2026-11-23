@@ -145,7 +145,8 @@ class SmokeData(_Data):
     about: str
     session: date
     events: tuple[SmokeEvent, ...]
-    market_gaps: dict[str, float]
+    market_gaps: dict[str, float]  # before the open, the pre-market move; after it, the open's
+    market_changes: dict[str, float]  # from the open: the change since the previous close (D-073)
     sources: tuple[str, ...]
     issuers: tuple[Issuer, ...]
     stories: dict[str, tuple[Story, ...]]
@@ -198,25 +199,26 @@ def smoke_packs(settings: Settings, risk: RiskConfig, data: SmokeData | None = N
     )
     experiment = experiment_section(settings, risk)
 
-    def common(book_b: BookB) -> Common:
-        market = Market(gaps=d.market_gaps, regime=regime)
+    def common(book_b: BookB, *, opened: bool) -> Common:
+        changes = d.market_changes if opened else None
+        market = Market(gaps=d.market_gaps, regime=regime, changes=changes)
         return Common(session, times, events, market, book_b, experiment)
 
     morning = BookB(equity=EQUITY, recent_r=RECENT_R)
     later = BookB(equity=EQUITY, recent_r=RECENT_R, day_mode="normal", day_mode_source="premarket")
     vet_at, vet_limits = _at(day, 9, 35, 5), role_limits(settings, "vet")
     return SmokePacks(
-        premarket=_premarket(d, settings, common(morning)),
+        premarket=_premarket(d, settings, common(morning, opened=False)),
         vet=vet_pack(
             as_of=vet_at,
-            common=common(later),
+            common=common(later, opened=True),
             candidates=_vet_candidates(d, VET_MAX_CANDIDATES, VET_NEWS),
             limits=vet_limits,
         ),
-        review=_review(d, settings, common(later)),
+        review=_review(d, settings, common(later, opened=True)),
         canary=vet_pack(
             as_of=vet_at,
-            common=common(later),
+            common=common(later, opened=True),
             candidates=_vet_candidates(d, CANARY_CANDIDATES, 1),
             limits=vet_limits,
         ),
@@ -300,16 +302,16 @@ def _review(d: SmokeData, settings: Settings, common: Common) -> Pack:
         signals.append(row)
         targets.append(target)
     earlier = d.issuers[5]
-    # The books and the stats come from the pack's own trades and shadow outcomes (D-067)
+    # The books and the stats come from the pack's own trades and shadow outcomes (D-067):
+    # a trade's P&L is gross, a book's net of the estimated fees (D-073)
     trades = {book: [t for s in signals for b, t in s.trades.items() if b == book]
               for book in ("A", "B")}  # fmt: skip
+    nets = {
+        book: sum(((t.pnl or Decimal(0)) - t.fees_est for t in rows), Decimal(0))
+        for book, rows in trades.items()
+    }
     books = {
-        book: BookResult(
-            Decimal(1000),
-            Decimal(1000) + sum((t.pnl or Decimal(0) for t in rows), Decimal(0)),
-            sum((t.pnl or Decimal(0) for t in rows), Decimal(0)),
-            len(rows),
-        )
+        book: BookResult(Decimal(1000), Decimal(1000) + nets[book], nets[book], len(rows))
         for book, rows in trades.items()
     }
     shadows = [s.shadow.shadow_r for s in signals if s.shadow and s.shadow.shadow_r is not None]
@@ -322,7 +324,8 @@ def _review(d: SmokeData, settings: Settings, common: Common) -> Pack:
         b_r=[t.r_multiple for t in trades["B"] if t.r_multiple is not None],
         shadow_r=shadows,
         vetoed_r=vetoed,
-        b_vetoes=sum(s.decisions.get("B") == "vetoed" for s in signals),
+        b_vetoed_triggers=sum(s.decisions.get("B") == "vetoed" for s in signals),
+        b_veto_verdicts=sum(s.verdict is not None and s.verdict.verdict == "veto" for s in signals),
     )
     return review_pack(
         as_of=_at(day, 16, 15),
@@ -607,7 +610,7 @@ def _trade(book: BookName, signal: Signal, r: float) -> TradeRow:
         exit_ts=_exited(signal, signal.triggered_at, r),
         exit_price=exit_price,
         exit_reason="stop" if r < 0 else "flatten",
-        pnl=((exit_price - entry) * qty - CENT).quantize(CENT),
+        pnl=((exit_price - entry) * qty).quantize(CENT),  # gross: the fees are apart
         r_multiple=r,
         fees_est=CENT,
         entry_slippage=CENT,

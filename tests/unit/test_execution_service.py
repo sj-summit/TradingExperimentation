@@ -8,6 +8,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from structlog.testing import capture_logs
+
 from tests.fixtures.exec_harness import NEXT_OPEN, TIMES, Harness
 from trader.core.clock import ET, SimClock, parse_et_iso
 from trader.core.models import OrderIntent, Quote, Trade
@@ -968,3 +970,116 @@ async def test_a_difference_seen_twice_halts_both_books(tmp_path: Path) -> None:
         assert await reasons(h, "B") == ["reconcile_mismatch"]
         assert ("P1", "reconcile_mismatch") in await h.incidents()
         assert await h.held() == {}  # a P1 flattens the affected book
+
+
+# ---------------------------------------------------------------- whose order (D-037, D-074)
+
+
+class Looks:
+    """Wraps ``Records.is_ours``: every answer, in order, by client order id."""
+
+    def __init__(self, h: Harness) -> None:
+        self.inner, self.answers = h.records.is_ours, []  # type: list[tuple[str, bool]]
+        h.records.is_ours = self  # type: ignore[method-assign]
+
+    async def __call__(self, order: Order) -> bool:
+        found = await self.inner(order)
+        self.answers.append((order.client_order_id, found))
+        return found
+
+    async def wait_for(self, client_order_id: str) -> None:
+        for _ in range(5000):
+            if any(cid == client_order_id for cid, _ in self.answers):
+                return
+            await asyncio.sleep(0.001)
+        raise AssertionError(f"the service never looked {client_order_id} up")
+
+
+class LegFirst(SimBroker):
+    """G4b's order of things (D-074): Alpaca sends an OTO's ``held`` stop leg before the entry's
+    own event, and ROST's leg reached the service before the submit's answer was journaled. The
+    sim sends the leg's event first and answers only once the service has looked the leg up."""
+
+    looks: Looks | None = None
+
+    async def submit_entry_oto(self, intent: OrderIntent) -> Order:
+        self.pause_stream()
+        order = await super().submit_entry_oto(intent)  # the entry's own event, held back
+        leg = self._orders[order.legs[0].id]
+        self._emit("held", leg)
+        self.resume_stream(reverse=True)  # the leg's event first
+        assert self.looks is not None
+        await self.looks.wait_for(leg.client_order_id)
+        return order
+
+
+class ForeignDuringSubmit(SimBroker):
+    """Someone places an OTO by hand, on another symbol, while our submit is in flight."""
+
+    looks: Looks | None = None
+
+    async def submit_entry_oto(self, intent: OrderIntent) -> Order:
+        if intent.client_order_id.startswith("A-"):
+            self.feed(Quote(symbol="ZZZ", ts=self._clock.now(), bid=D("50.00"), bid_size=5,
+                            ask=D("50.02"), ask_size=5))  # fmt: skip
+            await super().submit_entry_oto(intent.model_copy(update={
+                "symbol": "ZZZ", "qty": 2, "entry_limit": D("50.05"), "stop_price": D("49.50"),
+                "client_order_id": "manual-1"}))  # fmt: skip
+            assert self.looks is not None
+            await self.looks.wait_for("manual-1")
+        return await super().submit_entry_oto(intent)
+
+
+def said(logs: list[dict[str, Any]], event: str) -> list[str]:
+    return [e["order"] for e in logs if e["event"] == event]
+
+
+AHEAD = "stop leg ahead of its entry's answer"
+
+
+async def test_a_stop_leg_ahead_of_its_entry_s_answer_is_not_called_foreign(
+    tmp_path: Path,
+) -> None:
+    """D-074, G4b's ROST: the leg's update came before the entry's answer was journaled. It is
+    logged as our leg ahead of its answer, not as someone else's order. The resync still runs,
+    and the leg ends up under its entry."""
+    async with running(tmp_path, sim_class=LegFirst) as h:
+        assert isinstance(h.sim, LegFirst)
+        looks = h.sim.looks = Looks(h)
+        h.quote("12.40", "12.50")  # not marketable: the leg stays held
+        with capture_logs() as logs:
+            await h.enter()
+            await h.advance(1)
+        leg = next(cid for cid, _ in looks.answers if not cid.startswith("A-"))
+        assert looks.answers[0] == (leg, False)  # the race: the leg first, and unknown
+        assert said(logs, AHEAD) == [leg]
+        assert said(logs, "foreign order") == []
+        row = await h.records.order(leg)
+        assert row is not None
+        assert row.parent_client_order_id == ENTRY
+        assert await h.incidents() == []
+
+
+async def test_another_symbol_s_order_during_a_submit_is_still_foreign(tmp_path: Path) -> None:
+    async with running(tmp_path, sim_class=ForeignDuringSubmit) as h:
+        assert isinstance(h.sim, ForeignDuringSubmit)
+        looks = h.sim.looks = Looks(h)
+        h.quote("12.40", "12.50")
+        with capture_logs() as logs:
+            await h.enter()
+            await h.settle()
+        assert {found for cid, found in looks.answers if not cid.startswith("A-")} == {False}
+        assert "manual-1" in said(logs, "foreign order")
+        assert said(logs, AHEAD) == []  # its leg is on ZZZ; our waiting entry is XYZ's
+
+
+async def test_an_unknown_order_with_no_entry_waiting_is_foreign(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        looks = Looks(h)
+        h.service._resync = False
+        with capture_logs() as logs:
+            await place_by_hand(h)
+            await h.settle()
+        assert {found for cid, found in looks.answers if cid == "manual-1"} == {False}
+        assert "manual-1" in said(logs, "foreign order")
+        assert said(logs, AHEAD) == []

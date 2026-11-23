@@ -1,4 +1,4 @@
-# HANDOFF: Phase 4's code done (P4.0a–P4.0c, P4.1–P4.10, 🛑 G4a); next 🛑 G4b, your gate (updated 2026-11-19)
+# HANDOFF: Phase 5 done (plan `docs/PHASE5_PLAN.md`; P5.0a–P5.5, D-073 to D-079); next Phase 6's plan (updated 2026-11-22)
 
 **Latest:**
 - **Phase 4's plan is approved** (2026-10-14), now at `docs/PHASE4_PLAN.md`. Its file under `~\.claude\plans` was removed by Claude Code's cleanup of old files; the copy in the repository is its unchanged text (D-068). Order: P4.0a, P4.0b, P4.0c, P4.1–P4.6, 🛑 G4a, P4.7–P4.10, 🛑 G4b.
@@ -151,19 +151,82 @@
   - **Replay** runs the review only for a day recorded with the new capability `review_v1`. The A+B golden day gained its review.
   - **The smoke's review pack** is now self-consistent (D-067): its books and stats come from its own trades, and the capacity codes are right.
   - **Checks:** 30 mutations of the review's rules, all caught. 1,534 tests pass.
-- **Commits:** HEAD is `7461a8a` ("P4.10 Done", the human's commit), which holds everything through D-071 except two things, both uncommitted: the `review done` and `no review today` log lines in `orchestrator/llm_jobs.py` (D-071's last bullet), and this runbook. Commit them before the session, so `boot.json`'s git SHA names the code that ran. Commit only if asked.
+- **🛑 G4b passed (D-072).** The human ran one supervised A+B session on 2026-11-20, on commit `acea04f`.
+  - **All five criteria held:**
+    1. `DONE`;
+    2. no P1 (one P3, a partial fill protected in 0.7 s);
+    3. both books flat (`doctor --quick` on 11-21);
+    4. the report complete;
+    5. `trader replay` matches the recorded day.
+  - **Claude's calls:** three, each ok on its first attempt: the brief in 70.9 s (day mode normal), the vet in 8.4 s, and the review in 81.5 s (7 targets, 7 process issues, 2 notes).
+  - **The day:** SPY fell 3.51%. Both books took ROST and FNDA, and both stopped out. Book A ended −$6.03 and Book B −$5.22: B's ROST waited 6.3 s for the vet and filled lower.
+  - **The day is now a golden replay:**
+    - the recording is in `tests/golden/recordings/2026-11-20/`, rebuilt by `tests/fixtures/g4b_day.py`;
+    - the test is `test_the_g4b_day_replays_as_it_was_recorded`, about 35 s;
+    - the pin is `tests/golden/g4b_2026-11-20.json`.
+  - **Findings, all in D-072:**
+    - Alpaca paper took 9.5–13 s to accept entries in the 09:35 rush;
+    - the shadow fills stops too kindly when the price gaps through them;
+    - three labels in the review's pack misled the model (the day's move called a gap, gross trades against net books, the veto count);
+    - the `foreign order` warning was our own stop leg, racing the journal;
+    - the brief and the review used their spare turn.
+- **Commits:** the human's `acea04f` ("Review recorded") holds everything through the G4b runbook. D-072, the G4b fixture and its test, and these doc updates are uncommitted. Commit only if asked.
 - **Waiting on the human:**
-  - **The PC clock is fixed** (2026-11-17 20:54; D-067). The machine that runs the bot (H0.4) must keep the Windows Time service running. Doctor's `alpaca.clock` and the bot's hourly skew check will catch it if the service stops again.
+  - **The Phase 5 plan.** Claude presents it in plan mode. D-072's fixes come first (P5.0), then P5.1–P5.5.
+  - **Questions from D-072**, for the plan or for later:
+    - `max_turns: 4`, to keep a spare turn?
+    - Should leveraged and inverse ETFs stay in the universe?
+    - Re-vet a premarket verdict when the open's gap is much larger?
+    - The stop's width and a take-profit, decided with Phase 7's data.
+  - **The review's follow-ups:** only you close them, with `uv run trader followups set issue ID --status fixed|wontfix --response "…"` (or a note's `accepted`, `rejected` or `done`). D-072 gives Claude's reading of each.
+  - **The PC clock is fixed** (2026-11-17 20:54; D-067). It drifts about 35 ms an hour between the Windows Time service's syncs (D-072). The machine that runs the bot (H0.4) must keep that service running. Doctor's `alpaca.clock` and the bot's hourly skew check will catch it if the service stops again.
   - **Checks before G4b, done 2026-11-19 at about 10:00. All passed.**
-    - **news:** 2 AAPL articles in 24 h, both from `fiscal.ai`. Alpaca's docs now say articles can come from several feeds, with `source` naming the feed; no code reads `source`. The feed looks thin: the `*` news stream stored none in 2 minutes. Book B's packs may carry little news.
+    - **news:** 2 AAPL articles in 24 h, both from `fiscal.ai`. Alpaca's docs now say articles can come from several feeds, with `source` naming the feed; no code reads `source`. The feed looked thin, since the `*` news stream stored none in 2 minutes. **That was wrong (D-072):** on G4b's day the stream and the backfill stored 2,394 articles, every one from `fiscal.ai`.
     - **filings:** 5 flagged AAPL filings in 30 days.
     - **stream --news:** 4 bars, 315 trades, 1 connection, and `news: stream mode`, so the news socket may run beside the stock socket (part of Q2).
     - **`ALPACA_DATA_*`:** not set, so market data uses Book B's keys and its 200 requests a minute. The runbook allows this.
     - **doctor:** 0 FAIL, 1 WARN. The WARN is `events`: nothing is listed in the 14 days before the 12-04 jobs report. The file runs to 2027-01-08, and the WARN clears at 2026-11-20 08:30.
-    - **For the G4b record in DECISIONS:** Q2's partial answer and the news feed's source.
+    - **Recorded in D-072:** Q2's partial answer and the news feed's source.
   - `run-day` isn't needed between gates: it stays a human gate until Phase 6.
-- **Next: 🛑 G4b, your gate.** Phase 4's code is complete. G4b is one supervised paper session with both books; its runbook is below ("🛑 G4b"). Claude doesn't run it.
-- **New since G3, for the G4b runbook:**
+- **Phase 5's plan is approved** (2026-11-21): `docs/PHASE5_PLAN.md`, in the order P5.0a, P5.0b, P5.1–P5.5.
+  - **Your four decisions:** lessons count only later signals; the bootstrap resamples whole trading days; S§8 gains an "inconclusive" row; `max_turns` goes to 4.
+  - **P5.0a is done (D-073):**
+    - from the open, the packs' market gives each index its opening gap and its change since the previous close (`{sym}_change_pct`);
+    - the review's trades show `gross_pnl_usd` and `fees_est_usd`, its books `net_pnl_usd`;
+    - its stats split `b_vetoed_triggers` from `b_veto_verdicts`;
+    - one standing-verdict rule;
+    - pack version 3, and `max_turns: 4`.
+  - **Your next `run-day`** will log a P3 `llm_fingerprint_changed` (pack version and turns). That one is expected.
+  - **P5.0b is done (D-074).**
+    - Our own OTO stop leg, arriving ahead of its entry's answer, is now logged at info level as `stop leg ahead of its entry's answer`, not as a `foreign order` warning. The resync runs either way.
+    - The plan's wait-and-look-again was dropped: it stalled the stream and deadlocked the simulated drivers.
+  - **P5.1 is done (D-075):**
+    - `memory/stats.py` computes each book's metrics, V with the vetoed side's own mean, live R − shadow R, Book B − Book A, and SPY held;
+    - its intervals resample whole days, as you chose;
+    - the review's stats gain V;
+    - the epoch record is migration 0010.
+  - **`trader epoch show|start` is new, and `start` is yours.** P7.1 uses it: `uv run trader epoch start 1 --decision D-xxx --reason "the freeze"`. It refuses while a run-day runs.
+  - **P5.2 is done (D-076):**
+    - `memory/lessons.py` checks the DSL against a typed whitelist and applies it in Python, never as SQL;
+    - promotion counts only signals after the proposal's day, with one look per lesson;
+    - demotion runs on the month's first evaluation;
+    - the commands are `trader lessons evaluate [--promote]` and `trader lessons list`.
+  - **P5.3 is done (D-077):**
+    - the promoted lessons now appear in every pack's `playbook`;
+    - the vet's candidates get `matching_lessons`, and the brief's don't, since its gap is pre-market;
+    - `lessons evaluate --promote` writes `runtime/playbook.md`;
+    - `reports/render.py` holds the shared escaping.
+  - **P5.4 is done (D-078):**
+    - `trader report weekly [--week YYYY-Www]` writes `runtime/reports/weekly-YYYY-WW.{md,html}`: curves, each book, V, lessons, the factor tally, follow-ups, incidents and epochs;
+    - it fetches the week's missing SPY closes first, unless `--offline`.
+  - **P5.5 is done (D-079), and with it Phase 5:**
+    - `trader report evaluation [--epoch N] [--through YYYY-MM-DD]` writes `runtime/reports/evaluation-epoch-N.{md,html}`. Each line of S§8 reads pass, fail or insufficient data, then the outcome, with your inconclusive row. It's offline;
+    - on G4b's day it reads "keep running": 1 trading day, 11 triggered longs, 0 vetoes;
+    - **one reading is yours to confirm:** before 90 days, a V interval spanning 0 by more than 0.5 R keeps the epoch running instead of failing H1. Your row calls that case inconclusive at 90 days, so an earlier look shouldn't call it a fail;
+    - Phase 5's "Done when" holds: both reports render from a multi-day fixture journal and from G4b's replayed one; the DSL and promotion are fully tested; a full playbook fits the packs' size caps.
+  - **Next: Phase 6's plan,** in plan mode: the scheduler (P6.1), the watchdog (P6.2), retention and backups (P6.3), the RUNBOOK (P6.4), then gates G6a and G6b.
+  - **Nothing from Phase 5 is committed;** commit when you're ready.
+- **New since G3, for the G4b runbook** (kept for reference):
   - **Book B's milestones** (D-069):
     - `book B ready` at boot, and `news started`;
     - `pre-market scan` at 09:00;
@@ -189,9 +252,11 @@
   - **`--dry-run` prints the ledger's E before the fees are booked,** so it can differ by a few cents from the E boot uses.
   - **A size skip reads `capacity_positions` or `capacity_entries`** when R-006 or R-007 also binds (D-056), where it used to read `insufficient_settled_cash`.
 
-To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, the Phase 4 plan (`docs/PHASE4_PLAN.md`), and D-069 to D-071. The G4b runbook below is the current one. The G4a runbook after it is done (D-067); keep it for rerunning the smoke test after a Claude Code update. The G3 runbook further down served both of its runs. Everything below the line further down is the older G2 handoff, kept for its environment notes and the Phase 2 code map.
+To resume: read this block, the STATUS block in `docs/PLAN.md`, `CLAUDE.md`, D-072, D-079, and PLAN's Phase 6. The G4b runbook below is done (D-072); keep it for the next supervised session. The G4a runbook after it is done (D-067); keep it for rerunning the smoke test after a Claude Code update. The G3 runbook further down served both of its runs. Everything below the line further down is the older G2 handoff, kept for its environment notes and the Phase 2 code map.
 
 ## 🛑 G4b: the supervised A+B paper session (the human)
+
+**Passed 2026-11-20 (D-072).** Its steps still serve any supervised session before Phase 6 automates the day.
 
 **What it proves** (PLAN's Phase 4 "Done when"):
 - a whole session with both books;
