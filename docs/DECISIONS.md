@@ -3049,6 +3049,379 @@ Append-only. Each entry records context, the decision, its consequences, and sou
 
 ---
 
+## D-080 — P6.1a: Windows Task Scheduler under S4U, the scheduled-job wrapper, `trader schedule`, and `trader weekly-job`
+- **Date:** 2026-11-23 · **Status:** Accepted. The Phase 6 plan (`docs/PHASE6_PLAN.md`, decisions 1–5) was approved the same day, with the human's four decisions.
+- **The human's Phase 6 decisions (2026-11-23):**
+  1. **The watchdog runs every minute,** 09:25–16:05 ET, where RISK §6 said every 5 min.
+     - A dead engine is noticed within about 2.5 min, not 6.
+     - The runs at 15:58 and 15:59 can still sell for the late check (close − 2 min).
+     - RISK §6's text changes with P6.2a.
+  2. **Task Scheduler runs the tasks under S4U,** whether or not anyone is logged on.
+     - Microsoft's docs say S4U has "no access to the network or encrypted files". We expect that to mean network logons, not outbound HTTPS, and `trader schedule check` proves it at G6a.
+     - `--logon interactive` is the fallback.
+  3. **Windows only:** no cron or launchd until the bot moves.
+  4. **Retention keeps recordings and LLM artifacts through the current epoch** (P6.3).
+
+  Approving the plan also approved its computation of S§8 criterion 4 (P6.1b).
+- **`src/trader/ops/` replaces A§2's `scripts/install_scheduler_{cron,launchd,windows}.py`.** Code under `src/` is type-checked and tested, and the CLI is the one entry point.
+- **The tasks** (`ops/scheduler.py`, in the folder `\ai-day-trader\`), in ET:
+
+  | Task | Trigger | Command | Settings |
+  |---|---|---|---|
+  | `run-day` | Mon–Fri at `schedule.boot` − 5 min (08:25) | `run-day --books A,B --scheduled` | 10 h limit, wakes the PC, priority 4 |
+  | `watchdog` | Mon–Fri 09:25, repeated PT1M for PT6H40M (through 16:05) | `watchdog` | 4 min limit, wakes the PC, priority 4 |
+  | `weekly-job` | Sat 10:00 | `weekly-job` | 1 h, priority 7 |
+  | `universe` (with `--with-universe` only) | Mon–Fri 20:00 | `universe build` | 1 h, priority 7 |
+
+  - **Every task:**
+    - IgnoreNew;
+    - StartWhenAvailable;
+    - DisallowStartIfOnBatteries and StopIfGoingOnBatteries false (both default to true);
+    - RunOnlyIfNetworkAvailable false;
+    - LeastPrivilege.
+  - **Priority:** 4 is Windows' normal process priority. Task Scheduler's default of 7 is below normal, which is too low for the engine and the watchdog.
+  - **Each job reads the trading calendar itself,** so holidays and early closes need no entries:
+    - run-day exits on a holiday;
+    - the watchdog (P6.2a) checks its window against the day's session.
+  - **Time zones.**
+    - Task Scheduler fires on the local wall clock, so a `StartBoundary` without an offset follows DST.
+    - Install accepts the Windows zones that change their clocks on US Eastern's dates (Eastern, Central, Mountain, Pacific, Alaskan), shifted by their constant offset.
+    - It refuses any other zone, and a zone with DST switched off, which `tzutil /g` reports as `…_dstoff`.
+    - This PC is on Eastern time.
+  - **The first trigger is the next day,** so nothing fires on the day of installing.
+- **Checked against Task Scheduler itself.** I used the COM API's validate-only flag (`TASK_VALIDATE_ONLY` = 0x1), which registers nothing; the folder was checked afterwards.
+  - All ten definitions are valid: five tasks (the probe included), under both logons.
+  - A priority of 42, a PT30S interval and an unknown element are each rejected, so the check isn't vacuous. This also confirms the 1-minute minimum.
+  - **What the tools write when redirected:**
+    - schtasks writes the console's code page with `\r\r\n` line ends, and a missing task exits 1. So tasks are read back with `/Query /XML`, which isn't localized, and compared field by field. An element left out counts as Task Scheduler's default.
+    - `tzutil /g` printed `Eastern Standard Time`.
+- **The wrapper** (`ops/scheduled.py`, `python -m trader.ops.scheduled --root <root> <command>`).
+  - **Output goes to the log first:** file descriptors 1 and 2, Windows' standard handles and `sys.stdout`/`stderr` all go to `runtime/logs/scheduled/<job>-<date>.log`.
+    - This happens before trader's CLI is imported, because `configure_logging` binds `sys.stderr` when its module loads.
+    - A test asserts that importing the wrapper loads neither module.
+    - The log gets a start line (pid, arguments) and an `exit N` line.
+  - **pythonw** (the interactive fallback) first gets a hidden console. Console children then don't each open a window, and CTRL_BREAK can still reach them.
+  - **Typer 0.27 vendors click.** Without standalone mode it returns an `Exit`'s code instead of raising it. `cli._run` turns most failures into `Exit(1)`, so a failure here is:
+    - a non-zero code;
+    - an exception;
+    - `typer.Abort`;
+    - or a `TyperException`, such as a usage error (code 2).
+  - **A failure is journaled once per job per day** as a P2 `scheduled_job_failed` (component `scheduler`).
+    - The message names the log and gives its last error line, redacted.
+    - It is pushed at once, unless a fresh heartbeat shows an engine running. That engine's pump then sends it, so two pumps never race.
+  - **run-day's special cases:**
+    - A session already DONE, or another engine holding the run lock, is a quiet skip.
+    - A failure before BOOT is retried every 2 min until 09:20 ET.
+    - A failure after BOOT isn't retried: a crashed engine isn't restarted automatically.
+- **`orchestrator/heartbeat.py`** is the plan's decision 12, built now for the wrapper; the watchdog uses it in P6.2a.
+  - A read is tried three times, 200 ms apart, which tells absent from unreadable.
+  - A timestamp up to 5 s in the future counts as fresh; further ahead counts as unreadable.
+  - It is stale after 60 s.
+- **`trader schedule`** (`ops/schedule_cmds.py`):
+  - **`show`** changes nothing. It prints:
+    - the tasks in ET, and on the PC's clock when that differs;
+    - the command lines and the logon;
+    - whether each task is installed as shown;
+    - every reason install would refuse.
+  - **`install` (G6a) refuses** when:
+    - the zone can't be followed;
+    - notifications are off: `notify.provider: none`, or its secret missing in `.env`. A P1 at night must reach someone (H0.5);
+    - the virtual environment is missing.
+
+    Otherwise it prints everything, asks for `INSTALL`, then:
+    - writes `runtime/schedule/<task>.xml` in UTF-16, as Task Scheduler exports;
+    - registers each task with `schtasks /Create /XML /F`;
+    - removes a task an earlier install made and this one doesn't;
+    - records `runtime/schedule.json`: the logon, the account, the zone, and each task's hash.
+    - A refusal from schtasks stops it, with the hint to run elevated.
+  - **`uninstall`** deletes only the tasks it knows by name, after a yes.
+  - **`check` (G6a):**
+    - registers a one-off `\ai-day-trader\probe` with the installed logon and the same action, and starts it;
+    - waits up to 3 min for its log's `exit` line, then prints the log;
+    - always deletes the task.
+
+    The probe runs `trader schedule probe`: doctor, then a test push.
+- **`trader weekly-job`** runs `lessons evaluate --promote`, then `report weekly`. Each runs even if the other fails, and the job exits 1 if either did.
+- **`run-day --scheduled`** (hidden) is what the run-day task passes. P6.1b journals it.
+- **Tests:**
+  - `tests/unit/test_scheduler.py` (50):
+    - the entries;
+    - the zones;
+    - the watchdog's XML, golden;
+    - quoting;
+    - escaping;
+    - the probe;
+    - fingerprints with Task Scheduler's defaults;
+    - schtasks' command lines;
+    - decoding;
+    - show, install's refusals and its run, reinstalling, uninstall, and check (passing, failing, silent, unable to start);
+    - the CLI.
+  - `tests/unit/test_scheduled.py` (24):
+    - the run's rules;
+    - the CLI in-process;
+    - run-day's state;
+    - the alert: once a day, redacted, and left to a running engine to pump;
+    - the real process: imports, a job into its log, a failure journaled once.
+  - conftest now refuses any real schtasks, tzutil or powercfg, as it refuses the real claude.
+- **Spec updates:**
+  - ARCHITECTURE: §1 (every minute; the wrapper), §2 (`ops/`; `scripts/`), §4.11 and §11;
+  - CLAUDE.md's Commands;
+  - PLAN: Phase 6 rewritten per the plan, P6.1a ticked, and STATUS.
+- **Verified:** all 1,709 tests pass (1,635 before P6.1a); ruff, its formatter and mypy are clean.
+
+## D-081 — P6.1b: unattended sessions and S§8 criterion 4, keeping the PC awake, and doctor's sleep and notification checks
+- **Date:** 2026-11-23 · **Status:** Accepted (the Phase 6 plan's decisions 6–10). §8 is pre-registered, and the human approved criterion 4's computation with the plan.
+- **What the journal now records:**
+  - **`run-day --scheduled`** (the task's command, D-080) writes a `day_runs` note `scheduled` holding the books asked for.
+  - **These commands each write a `day_runs` row** of kind `human`, named for the command and dated the day it ran: a run-day started by hand, `trader halt`, `trader flatten`, `trader resume` (only once it lifts a halt) and `trader smoke paper` (even one refused for the day).
+  - **Neither reaches a replay:** `live.run_day`'s paper path and the CLI write them, never `DayOrchestrator`. A session already DONE gets neither: run-day then does nothing, so it touches nothing.
+- **`memory/unattended.py`:**
+  - **A session is unattended when all of these hold:**
+    - the `scheduled` note is there;
+    - `run_status` is DONE;
+    - there was exactly one BOOT (no restart);
+    - there is no `human` row;
+    - no `kill_switch` halt was created (the KILL file is a person's act);
+    - there is no `scheduled_job_failed` for run-day;
+    - both books have `daily_stats` rows, and there is no `book_b_off` note.
+  - **Weekends and holidays:** a `human` row, a kill-switch halt or a P1 dated on one counts against the next session.
+  - **`session_runs`** gives each session's verdict and the first reason it fails, with its P1 count.
+  - **`longest_clean_run`** gives the most consecutive sessions that were unattended and free of P1s.
+  - **`epoch_sessions`** gives the epoch's calendar sessions (`trading_days`), from its first with `daily_stats` through the given day. A session that never ran is in it, so it breaks the streak.
+  - **Strict by design:** a run-day retried after a failure isn't unattended, though no one stepped in. Criterion 4 measures whether the system runs without help.
+- **S§8 criterion 4:**
+  - **It passes** when some 20 consecutive sessions in the epoch are clean.
+  - **Otherwise** it reads insufficient data while the epoch has fewer than 60 sessions, and fail after that. The P1-only count from P5.5 (D-079) is gone.
+  - **Its numbers:** "longest unattended run without a P1: N sessions; U of S sessions unattended".
+  - **The outcome:** "the criteria code can check pass" now needs criteria 1–4, and its next step reads "Criteria 1-4 pass; the go/no-go is the human's (G7)".
+- **Where it shows:**
+  - the weekly report's Operations table: each session of the week, unattended or why not, and its P1s;
+  - the epoch's longest clean run, among the report's notes;
+  - `trader schedule show`'s last five sessions, read with sqlite3 alone, since an engine may hold the journal.
+- **Keeping the PC awake** (`ops/power.py`, RISK §9):
+  - `keep_awake()` wraps `run-day`'s day, paper or sim but not a dry run. It calls `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)` and clears it with `ES_CONTINUOUS` alone, even when the day raises. Nothing is cleared when Windows refuses.
+  - **Microsoft's docs:**
+    - the flags are 0x80000000 and 0x1;
+    - it returns NULL on failure;
+    - it "cannot be used to prevent the user from putting the computer to sleep" (the lid, the power button).
+  - This PC sleeps in S3, per `powercfg /a`. Modern Standby, which the docs don't cover, isn't a concern here.
+- **Doctor's two new checks:**
+  - **`machine.sleep`** reads the active scheme's AC standby timeout and wake-timer setting through powrprof: `PowerGetActiveScheme`, then `PowerReadACValueIndex` into an `LPDWORD`, then `LocalFree`, all signatures from Microsoft's docs.
+    - The GUIDs match `powercfg /aliases`: SUB_SLEEP, STANDBYIDLE and RTCWAKE.
+    - On this PC it read standby 0 (never) and wake timers 1 (on), as `powercfg /query` shows.
+    - It passes when the PC never sleeps on AC power, or when wake timers are on, so the 08:25 task can wake it. It warns otherwise, and when the settings can't be read.
+  - **`notify`** warns while `notify.provider` is `none` or its secret is missing.
+- **Tests:**
+  - `test_unattended.py` (15): every disqualifier, another job's failure, a P1, weekend events, a session with no run, the epoch's sessions, `note_human`;
+  - `test_power.py` (4);
+  - `test_doctor.py`: `machine.sleep`'s five cases and `notify`'s three. The `green` fixture now has ntfy, so "everything green" includes both;
+  - `test_evaluation.py`: criterion 4's pass, insufficient data and fail; the outcome needing 1–4; a session with no run;
+  - who started the session, and keep-awake around the day (`test_run_day_cli.py`);
+  - the CLI's `human` rows (`test_cli_kill.py`, `test_smoke.py`);
+  - the weekly Operations table;
+  - `schedule show`'s recent sessions.
+  - conftest now stubs `set_execution_state` for every test (`power_calls`).
+- **Spec updates:**
+  - STRATEGY §8: criterion 4 and the outcome's criteria 1–4;
+  - RISK §9;
+  - ARCHITECTURE: §2, §4.10 (the weekly report, unattended sessions), §4.11 (doctor);
+  - PLAN: P6.1b ticked; STATUS.
+- **Verified:** all 1,742 tests pass (1,709 after P6.1a); ruff, its formatter and mypy are clean.
+
+## D-082 — P6.2a: the watchdog (every minute), its rules, and the shared flatten
+- **Date:** 2026-11-23 · **Status:** Accepted (the Phase 6 plan's decisions 11–14). RISK §6 is rewritten to match; its every-minute schedule is the human's decision of 2026-11-23 (D-080).
+- **`orchestrator/watchdog.py`, one run per process:**
+  - **The window:** a trading day from the open − 5 min to the close + 5 min, early closes included. Outside it, or on a holiday, a run exits without a broker call.
+  - **The heartbeat** (`orchestrator/heartbeat.py`, D-080) is fresh while younger than 60 s.
+    - One that is absent, unreadable or stale is read again 25 s later before anything is done. A beat can be skipped, a read can collide with the engine's replace on Windows, and the clock can step.
+    - A heartbeat that comes back inside those 25 s is left alone.
+  - **Coverage is the engine's own code.**
+    - `service.stop_works` is the engine's R-020 rule, moved out of the service unchanged. `exit_at_work` and `overnight_stop` are now public too.
+    - Shares are covered by working stops or a market sell at work. A held leg counts only once its entry is final.
+    - After the close, only a working GTC sell stop covers them.
+    - A short is never the watchdog's: R-002, and reconcile reports it.
+  - **The rules** (`assess`, pure; RISK §6):
+    - **Heartbeat stale:**
+      - in the session, each book with anything open (positions or orders) is flattened, with a P1 `engine_down_flattened`; with nothing open, a P2 `engine_down`;
+      - before the open, a P2, and bare shares get GTC stops (P1);
+      - after the close, shares without a GTC stop get one (P1 `watchdog_overnight`), else a P2, since the day's EOD waits.
+    - **Heartbeat fresh, before close − 2 min:**
+      - bare shares in a book the engine runs get `partial_fill_cancel_max_s` + 10 s (30 s), then a fresh read, then a flatten (P1 `watchdog_unprotected`);
+      - this stands aside within 40 s of the flatten time, while the engine says it is flattening the book, and under someone's `flattening` marker;
+      - a book missing from the heartbeat (no engine runs it) is flattened without waiting;
+      - before the open, GTC stops are placed instead of selling.
+    - **From close − 2 min, either way:** every book holding shares is flattened (P1 `watchdog_late`). There is no P1 when `not_flat` was already raised for the book that day, but the flatten runs anyway: two flatteners are benign (below).
+    - **The KILL file with the heartbeat stale:** every open book is flattened under a `kill_switch` halt (P2 `watchdog_kill_file`).
+  - **Alerts:**
+    - Each incident (component `watchdog`) carries a `key` in `detail_json`. One with a key already journaled today isn't journaled again.
+    - The keys are an engine-down episode (the stale heartbeat's timestamp) per book, or a book per day. A P1 for an episode stops that episode's P2.
+    - The watchdog pumps alerts only while the heartbeat is stale, so it never races a live engine's pump.
+    - A broker that can't be read is a P2 `watchdog_blind`, once per book per day. The other book is still checked.
+  - **`runtime/watchdog.json`** records each run: the verdict, the phase, the heartbeat, the books, the actions and how each flatten ended.
+- **`execution/flatten.py`, `flatten_books`,** shared by `trader flatten`, `trader halt --flatten` and the watchdog:
+  - it halts each book with the caller's reason (`manual`, `p1_incident`, `kill_switch`);
+  - it renews the `flattening` marker on every pass and clears it at the end;
+  - it flattens the books concurrently;
+  - a book whose flatten raised maps to None and is reported;
+  - first it settles any sell still `submitting` or `uncertain` 30 s after it was sent: adopted if the broker has it, marked lost if not. Otherwise a flatten killed mid-submit (the watchdog's 4-minute limit) would leave a row the engine's reconcile skips as in flight all day.
+  - `trader flatten`'s output and its `not_flat` P1 are unchanged.
+- **`trader watchdog`:**
+  - **Its own log file,** `runtime/logs/watchdog-<date>.jsonl`, through `configure_logging`'s new `prefix`. About 390 runs a day appending to the engine's file from another process could tear its lines.
+  - **Its own OS lock,** `runtime/watchdog.lock` (`RunLock`'s message names its holder now). A run that finds it held stands down.
+  - **The calendar** comes from the journal, synced from Alpaca (one request) only when it doesn't cover today.
+  - **The books** are each book with Alpaca keys.
+  - **It prints one line** for the scheduled log.
+- **Two flatteners at once are benign,** as the plan review found and the tests confirm:
+  - cancels are quiet;
+  - a market sell at work is never cancelled;
+  - a second sell of the same shares is rejected for insufficient quantity (D-033), and its row is marked rejected;
+  - fills and ledger rows are booked once.
+- **A known limitation** (the plan's "not in this plan"): a halt set by another process doesn't set the engine's `_closing`. An entry whose submit lands after the watchdog's cancel pass can rest; R-020 then protects it, and the late check flattens it.
+- **Tests** (`tests/unit/test_watchdog.py`, 42):
+  - the window's edges, and an early close;
+  - coverage, case by case;
+  - every rule above;
+  - on SimBroker:
+    - a dead engine's book flattened and alerted once, with fills booked once and the marker cleared;
+    - one P2 per episode, and a new one when the engine dies again;
+    - a P1 stopping its episode's P2;
+    - a heartbeat back within 25 s;
+    - bare shares flattened after the wait, or left when covered during it;
+    - a book no engine runs flattened without waiting;
+    - the late check, with and without the engine's `not_flat`;
+    - GTC stops after the close;
+    - the KILL file;
+    - a blind broker;
+    - a stuck sell settled;
+  - beside a live ExecutionService on the same broker and journal:
+    - the watchdog flattening while the service runs: no stop after the marker, no mismatch, one sale;
+    - both flattening at once: one sale, at most one refused, one ledger row;
+  - the command: its own log, and its lock.
+  - The watchdog tests use the journal inline: `run_on_clock` moves time as soon as anything waits on the clock, and a second coroutine's write on the journal's thread could still be pending (D-047).
+- **Spec updates:**
+  - RISK §6 (rewritten) and §11 (the codes);
+  - ARCHITECTURE §2, §4.9 and §4.11;
+  - CLAUDE.md's Commands;
+  - PLAN: P6.2a ticked; STATUS.
+- **Verified:** all 1,784 tests pass (1,742 after P6.1b); ruff, its formatter and mypy are clean. The two tests beside a live engine passed five runs in a row.
+
+## D-083 — P6.2b: the engine's side: the heartbeat's pid and flattening, watchdog_silent, claude children in a job object, smoke paper --hold, and the review's fixes
+- **Date:** 2026-11-24 · **Status:** Accepted (the Phase 6 plan's decisions 15–18).
+- **The heartbeat gains two fields:**
+  - **`pid`:** the engine's interpreter, the fire drill's `Stop-Process` target. uv's launcher is its parent and dies with it.
+  - **Per book, `flattening`:** the new `service.flattening`, true while a flatten pass works on the book.
+  - **Why:** the engine's own flattens set no `flattening` marker (only `trader flatten` and the watchdog do). Without the flag, the watchdog's stop check would catch the engine's 15:55 flatten mid-cancel, raise a false P1 and become a second flattener.
+  - Replays write the heartbeat too, but no golden snapshots it.
+- **The heartbeat is also written once as BOOT begins** (`tasks.boot_beat`), with each book unhalted, holding nothing and not flattening.
+  - **Why:** the 10 s heartbeat starts only once every book has started. Until then, a restart mid-session looked dead to the watchdog. Its flatten and `engine_down` P1 would then hit books the new engine was adopting.
+  - The review below found this.
+- **The engine watches the watchdog back.**
+  - With the schedule installed, a watchdog that hasn't run for 10 minutes between open + 10 min and the close is a P2 `watchdog_silent`, once per silence. "Installed" means `runtime/schedule.json` lists `\ai-day-trader\watchdog`.
+  - The engine reads `runtime/watchdog.json`'s `ts` once a minute. A file that is missing or half-written reads as "never".
+  - **Where it runs:** `DayDeps.watchdog_status` is set on the live paper path only, and only after G6a. It is None in replays, sims, dry runs and tests, so their journals never change.
+- **`claude` children join a kill-on-close job object** (`ops/containment.py`).
+  - **The problem:** uv's launcher lets the interpreter's own children break away from its job (the plan review read uv's source). So a killed engine (the fire drill, or Task Scheduler's time limit) left its `claude` call running, which could still write into the sandbox the next call needs empty.
+  - **The fix:** each `ClaudeCliTransport` holds a job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and assigns each child to it as it starts. The handle isn't inheritable, so when the engine's process ends, however it ends, Windows closes it and the children die.
+  - **Checked against Microsoft's docs:**
+    - `CreateJobObjectW` returns NULL on failure;
+    - `SetInformationJobObject` takes class 9, `JobObjectExtendedLimitInformation`;
+    - the struct members follow the docs' order;
+    - the flag is 0x2000;
+    - `AssignProcessToJobObject` needs a process handle with `PROCESS_SET_QUOTA` (0x0100) and `PROCESS_TERMINATE` (0x0001). Since Windows 8, a process already in a job can join another.
+  - **Checked for real on this PC:** a test puts a sleeping child in a job and closes it, and the child dies at once; a child never put in a job outlives it.
+  - **Best effort:**
+    - a failed assignment is logged, not raised;
+    - a grandchild started before its parent's assignment can stay outside the job;
+    - on other systems, nothing happens.
+  - The existing stop path (CTRL_BREAK, then `taskkill /T /F`) is unchanged.
+- **`smoke paper` beside a running engine.**
+  - **The problem:** the smoke starts a full ExecutionService on Book A, with its own monitor, reconcile and trade stream. During a session it would compete with the engine for the book, and without `--hold` it even flattens the book.
+  - **So it refuses while an engine's heartbeat is fresh.**
+  - **The exception is `--marketable --hold`,** the fire drill's step 1. It needs a fresh heartbeat that lists Book A: beside `run-day --books B`, no engine would sell the share at 15:55. Then:
+    - its service runs `recover()` for the gate's start-of-day equity but starts no loops;
+    - one OTO goes through the gate;
+    - its own order is read until it fills;
+    - it prints the stop leg and exits holding the share.
+  - **The running engine then owns the share:** it protects it, and its 15:55 flatten, the watchdog or `trader flatten` sells it. `--hold` without `--marketable` is refused, since a resting order never fills.
+  - **Its `human` row is written only after the refusals,** so a refused smoke doesn't disqualify the session.
+- **Amends D-082's rules after a mutation check** (48 mutants of the watchdog's rules, the shared flatten, the unattended rule and criterion 4):
+  - Three survived at first. Two only lacked tests: the KILL file in the last two minutes, and a heartbeat going stale during the 30 s wait. The second is left to the next run, which reads it twice before acting.
+  - The third exposed a gap. After the close, with the heartbeat fresh, D-082 left every book to the engine's after-close pass, but that pass protects only the engine's own books.
+    - Shares in a book it doesn't run (Book B on a `--books A` day) whose day stop expired at 16:00 would have had no stop overnight.
+    - Such a book now gets GTC stops, with a P1 `watchdog_overnight`.
+  - All 48 were then caught, and the identity control survived.
+- **An adversarial review of P6.2's diff** found 3 major and 10 minor defects. All are fixed except the known limitations below.
+  - **Major:**
+    1. **`trader flatten` and `trader halt --flatten` no longer halted first,** a regression in P6.2a.
+       - **The cause:** they fetched the calendar and built every book's broker before the halt. A failed calendar request, or Book B without keys, left no `manual` halt, and a running engine kept entering.
+       - **Now:** each book is halted before any network call.
+       - Each book's broker is built on its own. Missing B keys print "halted, but not flattened", and Book A is still flattened.
+       - The calendar comes from the journal, where run-day caches it, and every broker is closed whatever fails.
+    2. **After the close, with the heartbeat fresh, a book no engine runs got no stop.** This is the gap the mutation check found, fixed above.
+       - A book the engine runs stays with its after-close pass.
+       - That pass retries, then raises a P1 `not_flat` naming any shares with no stop (D-051), so its failure is never silent.
+    3. **Reconcile's in-flight skip became permanent.**
+       - **The cause:** it counted `lost` orders, and orders from every day. A stuck sell that a flatten settled as `lost` hid its symbol from reconcile for good.
+       - **Now:** only today's `submitting` and `uncertain` orders put a symbol in flight (`reconcile.IN_FLIGHT`).
+       - This also covers the engine's own lost orders, which had the same effect before this phase. A lost order that surfaces later is still recognized by its client order id.
+  - **Minor:**
+    - **Alerts are keyed tighter:**
+      - a flatten's alert by its halt, so a new incident after a `trader resume` alerts again;
+      - the late check is silenced only by a `not_flat` raised at or after the flatten time, not by a morning `trader flatten`'s;
+      - an `engine_down` P2 is dropped when any alert already carries its episode, the P1s before the open and after the close included.
+    - **The `engine_down` P2** names any book it couldn't read, rather than saying nothing is open.
+    - **A book no engine runs** is read a second time 2 s later. Its positions and its orders are read separately, so a stop filling between the two looks like bare shares. Actions that need no second read are taken at once, without waiting for the other books' reads.
+    - **A failed stuck-sell lookup** is logged, and the flatten goes on.
+    - **The KILL file's sells** carry the `kill_switch` purpose.
+      - The rule still applies only in regular hours and the late check. Before the open and after the close, a market sell can't fill, and the engine's own kill switch halts the books when it starts.
+      - With the file there, a dead engine's flatten is a P2, not a P1: a person asked for it.
+      - RISK §6 now says both.
+    - **Coverage:** the watchdog counts a market sell at work for as long as it works, and the engine for a limited time after it was sent. RISK §6 and ARCHITECTURE §4.9 no longer call the rules identical.
+    - **Shorting.** Two flatteners' sells racing for the same shares could open a short where the account allows one. SimBroker can't short, so no test can show it.
+      - Doctor now warns when an account's `shorting_enabled` is true.
+      - Alpaca's docs (checked 2026-11-24): `shorting_enabled` is the "Flag to denote whether or not the account is permitted to short".
+      - The `no_shorting` account configuration: "If true, account becomes long-only mode".
+      - Margin and shorting need $2,000 of equity. The docs don't say whether that holds on paper.
+    - **The BOOT heartbeat,** and **`--hold`'s Book A and its `human` row** (above).
+    - **A test** wrote `"\ai-day-trader\run-day"` without `r`. So `\a` and `\r` became control characters, and the test never used the real task names.
+    - **The plan's copy** says "open orders only: cancel, P2", while RISK §6 and D-082 flatten and send a P1. The copy's header already says that DECISIONS govern.
+  - **Known limitations** (now in RISK §6):
+    - **Two flatteners on one book.** The first to finish clears the `flattening` marker, and the other renews it on its next pass. A running engine may place a stop in that gap; the flatten's next pass cancels it.
+    - **`--hold`'s share passes the gate in its own process.** D-035's atomicity holds only within one process, so the engine can count the same capacity for R-006 and R-009 at that moment. The drill's R-020 sees only its own bare shares. It is one share, on a day that doesn't count.
+    - **A halt set by another process doesn't set the engine's `_closing`** (D-082).
+- **The mutation check, again after the fixes:** 59 mutants, plus the identity control.
+  - Six of the first 48 were retargeted, where the fixes had rewritten their sites.
+  - Eleven are new, one or two for each fix: the alert keys, the late check's window, the KILL file's purpose, the unread books, the second read of a book no engine runs and its 2 s wait, the failed lookup, reconcile's in-flight view (two), the BOOT beat and doctor's shorting warning.
+  - All 59 are caught, and the identity control survives.
+  - Removing the alert dedup was caught by only one test. A second test now covers it: a flatten that keeps failing is tried again on each run but alerts once.
+- **Tests:**
+  - the heartbeat's `pid` and `flattening`, and the beat written as BOOT begins;
+  - `watchdog_silent` over a whole simulated day: heard from 11:00 to 13:00 only, it gives two P2s, at 09:40 and 13:00. A watchdog heard all day gives none;
+  - the live wiring: no reader before a watchdog task is installed, and an unreadable status reads as never;
+  - the job object, for real: closing kills, and an unassigned child lives on. Also each child of the transport is assigned;
+  - `--hold` beside a running engine (the Harness's service): the share stays under its leg for 30 s of the engine's loops, with no incident;
+  - the smoke's refusals, including an engine that doesn't run Book A;
+  - **the review's fixes:**
+    - a failed calendar still leaves both books halted and closes their brokers;
+    - missing B keys still flatten A;
+    - reconcile counts only today's unconfirmed orders as in flight;
+    - **the watchdog:**
+      - shares sold between an unmanaged book's two reads;
+      - a new incident after a resume;
+      - a morning `not_flat`;
+      - a P1 after the close silencing its episode's P2;
+      - the KILL file's purpose;
+      - unread books named in the P2;
+      - a failed lookup;
+      - a flatten that keeps failing, tried each run and alerted once;
+    - doctor's shorting warning.
+- **Spec updates:**
+  - **RISK §6:** the engine watches back, the second reads, the alert keys, the KILL file's hours and purpose, coverage, and the known limitations;
+  - **RISK §11:** `watchdog_silent`;
+  - **ARCHITECTURE:** §4.6 (reconcile's in-flight orders), §4.9 (coverage, the shared flatten, alert keys), §4.11 (`smoke paper --hold`, doctor's shorting check), §7's stop path and §11's heartbeat;
+  - **PLAN:** P6.2b ticked; STATUS.
+- **Verified:** 1,811 tests pass (1,810 in the full run, and one added during it, run with its file); ruff, its formatter and mypy are clean. The goldens (A+B, Book A, G3, G4b) and the daily report are unchanged.
+
 ## Open questions to resolve during the build (record answers as new entries)
 
 - **Q1 (P1.2):** Is Alpaca's `movers` (top market movers) endpoint available on the free plan? If not, use the IEX snapshot gap scan. **Partly answered: D-024** (the 09:00 scan uses snapshots either way); doctor's `data.movers` check records availability once keys exist. **Answered by doctor on 2026-10-10: available** (`data.movers` PASS; the screener returned 10 gainers).

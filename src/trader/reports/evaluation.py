@@ -21,8 +21,10 @@ shakedown (S§9), so its memo says it is a dry run.
   1. V's interval's lower bound is above 0.
   2. Book B's mean R per trade after its estimated fees is above 0.
   3. Book B's max drawdown is at most 15%.
-  4. 20 consecutive unattended sessions without a P1. Until Phase 6 marks a run unattended,
-     this reads "insufficient data", with the longest P1-free run shown.
+  4. 20 consecutive unattended sessions without a P1 (``memory/unattended.py``, D-081): some
+     run of 20 of the epoch's calendar sessions, each unattended and P1-free, passes;
+     otherwise insufficient data while the epoch has fewer than 60 sessions, then fail. A
+     session with no run breaks the streak.
   5. The human signs off: always "for the human".
 - **The outcome** (S§8's table, with the inconclusive row the human approved on 2026-11-21):
   - **inconclusive** when, by 90 trading days, the minimum data isn't reached, or H1 has fewer
@@ -31,7 +33,7 @@ shakedown (S§9), so its memo says it is a dry run.
     than 0.5 R (the 90th day would call that inconclusive, so an earlier look doesn't call it
     a fail);
   - else **both books negative** or **H1 fails, Book A positive**, by each book's net P&L;
-  - else **the criteria code can check pass** when criteria 1-3 do, and the decision is the
+  - else **the criteria code can check pass** when criteria 1-4 do, and the decision is the
     human's (G7);
   - else **criteria not met**.
 """
@@ -59,6 +61,7 @@ from trader.memory.stats import (
     read_epoch,
     summarize,
 )
+from trader.memory.unattended import epoch_sessions, longest_clean_run, session_runs
 from trader.reports.render import LIMITATIONS, md_row
 
 Verdict = Literal["pass", "fail", "insufficient data", "for the human"]
@@ -316,7 +319,13 @@ def _criteria(
         if not enough or dd is None
         else ("pass" if dd <= MAX_DRAWDOWN_PCT else "fail")
     )
-    streak = _p1_free_run(conn, epoch, through)
+    runs = session_runs(conn, epoch_sessions(conn, epoch, through))
+    longest, unattended = longest_clean_run(runs), sum(r.unattended for r in runs)
+    c4: Verdict = (
+        "pass"
+        if longest >= UNATTENDED_SESSIONS
+        else ("insufficient data" if len(runs) < MIN_DAYS else "fail")
+    )
     return (
         Line(
             "1",
@@ -339,9 +348,9 @@ def _criteria(
         Line(
             "4",
             f"{UNATTENDED_SESSIONS} consecutive unattended sessions without a P1",
-            "insufficient data",
-            f"no record of unattended runs before Phase 6; the longest P1-free run of "
-            f"sessions is {streak}",
+            c4,
+            f"longest unattended run without a P1: {_n(longest, 'session', 'sessions')}; "
+            f"{unattended} of {_n(len(runs), 'session', 'sessions')} unattended",
         ),
         Line("5", "The human signs off", "for the human", "G7"),
     )
@@ -349,23 +358,6 @@ def _criteria(
 
 def _d(value: str | None) -> Decimal | None:
     return None if value is None else Decimal(value)
-
-
-def _p1_free_run(conn: sqlite3.Connection, epoch: int, through: date) -> int:
-    days = [
-        r[0]
-        for r in conn.execute(
-            "SELECT DISTINCT date FROM daily_stats WHERE eval_epoch = ? AND date <= ? "
-            "ORDER BY date",
-            (epoch, through.isoformat()),
-        )
-    ]
-    bad = {r[0][:10] for r in conn.execute("SELECT ts FROM incidents WHERE severity = 'P1'")}
-    best = run = 0
-    for day in days:
-        run = 0 if day in bad else run + 1
-        best = max(best, run)
-    return best
 
 
 def _outcome(
@@ -398,11 +390,11 @@ def _outcome(
             "The LLM adds nothing measurable. Consider running the rules alone, or continuing "
             "paper.",
         )
-    checked = [c for c in criteria if c.name in ("1", "2", "3")]
+    checked = [c for c in criteria if c.name in ("1", "2", "3", "4")]
     if all(c.verdict == "pass" for c in checked):
         return (
             "the criteria code can check pass",
-            "Criterion 4 needs Phase 6's unattended runs; the go/no-go is the human's (G7).",
+            "Criteria 1-4 pass; the go/no-go is the human's (G7).",
         )
     return ("criteria not met", "Live trading isn't recommended. The human decides what next.")
 

@@ -189,7 +189,7 @@ async def _protect_overnight(
     cancelled = False
     for order in _with_legs(open_orders):
         await records.apply(order)
-        if _overnight_stop(order):
+        if overnight_stop(order):
             covered[order.symbol] = covered.get(order.symbol, 0) + order.qty - order.filled_qty
             if order.stop_price is not None:
                 protected[order.symbol] = order.stop_price
@@ -201,7 +201,7 @@ async def _protect_overnight(
     for _ in range(CANCEL_SETTLE_POLLS if cancelled else 0):
         await clock.sleep_until(clock.now() + poll)
         still = [o for o in _with_legs(await broker.open_orders()) if not o.final]
-        if all(_overnight_stop(o) for o in still):
+        if all(overnight_stop(o) for o in still):
             break
     held = await _held_positions(broker)
     unprotected: dict[str, int] = {}
@@ -288,9 +288,22 @@ def _with_legs(orders: list[Order]) -> list[Order]:
     return [o for order in orders for o in (order, *order.legs)]
 
 
-def _overnight_stop(order: Order) -> bool:
+def overnight_stop(order: Order) -> bool:
     """A working GTC sell stop: what keeps a position protected after the close."""
     return order.side == "sell" and order.time_in_force == "gtc" and stop_is_working(order)
+
+
+def stop_works(order: Order, open_orders: Iterable[Order]) -> bool:
+    """A sell stop at work, by R-020's rule (the engine's and the watchdog's). A held leg works
+    only once its entry is final, which for a leg still open means filled: a cancelled entry
+    takes its legs with it."""
+    if order.side != "sell" or order.type not in ("stop", "stop_limit"):
+        return False
+    if order.status in WORKING_STOP_STATUSES:
+        return True
+    if order.status != "held" or order.group_id is None:
+        return False
+    return not any(o.group_id == order.group_id and o.side == "buy" for o in open_orders)
 
 
 def exit_at_work(order: Order) -> bool:
@@ -681,6 +694,12 @@ class ExecutionService:
     def accepting(self) -> bool:
         """False once a flatten began: the book takes no more entries today (D-044)."""
         return not (self._closing or self._flattening)
+
+    @property
+    def flattening(self) -> bool:
+        """A flatten pass is at work on this book: the heartbeat says so, and the watchdog's
+        stop check stands aside meanwhile (D-083)."""
+        return self._flattening
 
     @property
     def held(self) -> dict[str, int]:
@@ -1161,15 +1180,7 @@ class ExecutionService:
 
     @staticmethod
     def _stop_works(order: Order, view: _View) -> bool:
-        """A sell stop at work. A held leg works only once its entry is final, which for a
-        leg still open means filled: a cancelled entry takes its legs with it."""
-        if order.side != "sell" or order.type not in ("stop", "stop_limit"):
-            return False
-        if order.status in WORKING_STOP_STATUSES:
-            return True
-        if order.status != "held" or order.group_id is None:
-            return False
-        return not any(o.group_id == order.group_id and o.side == "buy" for o in view.open_orders)
+        return stop_works(order, view.open_orders)
 
     async def _bare_since(self, symbol: str, now: datetime) -> datetime:
         """When the shares lost (or never had) a stop. Shares never seen covered count from

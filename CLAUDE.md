@@ -72,6 +72,9 @@ This is paper trading only until the human completes the go-live gate in `docs/P
 | Test the review's lesson proposals on later signals (`--promote` stores the outcomes) | `uv run trader lessons evaluate [--promote]` / `uv run trader lessons list` |
 | The weekly report (the last complete week; `--offline` skips fetching SPY's missing closes) | `uv run trader report weekly [--week YYYY-Www]` |
 | The evaluation memo: an epoch judged by STRATEGY.md §8 (offline; deciding to go live stays the human's) | `uv run trader report evaluation [--epoch N] [--through YYYY-MM-DD]` |
+| The OS schedule (Windows Task Scheduler): `show` changes nothing; `install` and `check` are HUMAN GATE G6a | `uv run trader schedule show` / `install` / `check` / `uninstall` |
+| The Saturday job: `lessons evaluate --promote`, then `report weekly` | `uv run trader weekly-job` |
+| The watchdog, once: the scheduler runs it every minute from 09:25 to 16:05 ET | `uv run trader watchdog` |
 | Emergency stop | `uv run trader halt --flatten --book all` |
 
 ## Repo map (target; details in ARCHITECTURE.md §2)

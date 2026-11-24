@@ -1,12 +1,13 @@
 """`trader smoke paper` (P2.7) against SimBroker. The real run is HUMAN GATE G2."""
 
 import asyncio
+import sqlite3
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 from typer.testing import CliRunner
@@ -39,16 +40,23 @@ class Market:
         return {
             s: Snapshot(
                 symbol=s,
-                latest_quote=Quote(symbol=s, ts=now, bid=self.bid, bid_size=3, ask=self.ask,
-                                   ask_size=3),
+                latest_quote=Quote(
+                    symbol=s, ts=now, bid=self.bid, bid_size=3, ask=self.ask, ask_size=3
+                ),
                 latest_trade=Trade(symbol=s, ts=now, price=self.last, size=100),
             )
             for s in symbols
-        }  # fmt: skip
+        }
 
     async def asset(self, symbol: str) -> Asset | None:
-        return Asset(symbol=symbol, name=symbol, exchange="NYSE", asset_class="us_equity",
-                     status="active", tradable=True)  # fmt: skip
+        return Asset(
+            symbol=symbol,
+            name=symbol,
+            exchange="NYSE",
+            asset_class="us_equity",
+            status="active",
+            tradable=True,
+        )
 
 
 @asynccontextmanager
@@ -79,8 +87,9 @@ async def smoke_rig(
 
 async def smoke(h: Harness, deps: SmokeDeps, *, marketable: bool) -> tuple[bool, list[str]]:
     lines: list[str] = []
-    task = asyncio.create_task(run_smoke(deps, symbol="XYZ", marketable=marketable,
-                                         echo=lines.append))  # fmt: skip
+    task = asyncio.create_task(
+        run_smoke(deps, symbol="XYZ", marketable=marketable, echo=lines.append)
+    )
     while not task.done():
         await h.advance(0.25)
     return task.result(), lines
@@ -168,13 +177,21 @@ async def test_first_use_seeds_the_ledger_from_a_flat_account(journal: Journal) 
 async def test_seeding_refuses_an_account_that_is_not_flat(journal: Journal) -> None:
     clock = SimClock(datetime(2026, 10, 9, 10, 0, tzinfo=ET))
     sim = SimBroker(clock=clock)
-    sim.feed(Quote(symbol="XYZ", ts=clock.now(), bid=D("12.30"), bid_size=1, ask=D("12.32"),
-                   ask_size=1))  # fmt: skip
+    sim.feed(
+        Quote(symbol="XYZ", ts=clock.now(), bid=D("12.30"), bid_size=1, ask=D("12.32"), ask_size=1)
+    )
     await sim.submit_entry_oto(  # one share held under a working stop leg
-        OrderIntent(book="A", signal_id="x", symbol="XYZ", qty=1, entry_limit=D("12.35"),
-                    stop_price=D("12.21"), client_order_id="manual-1",
-                    day_size_multiplier=D(1))
-    )  # fmt: skip
+        OrderIntent(
+            book="A",
+            signal_id="x",
+            symbol="XYZ",
+            qty=1,
+            entry_limit=D("12.35"),
+            stop_price=D("12.21"),
+            client_order_id="manual-1",
+            day_size_multiplier=D(1),
+        )
+    )
     with pytest.raises(LedgerError, match="flatten the account first"):
         await ensure_seeded(SettlementLedger(journal, "A", clock), sim, lambda _line: None)
 
@@ -196,3 +213,104 @@ def test_cli_refuses_a_day_without_a_session(repo: Path, monkeypatch: pytest.Mon
     result = CliRunner().invoke(app, ["--root", str(repo), "smoke", "paper"])
     assert result.exit_code == 1
     assert "not a trading day" in result.output
+    # refused before acting, so it touched no session (D-081, D-083)
+    conn = sqlite3.connect(repo / "runtime" / "trader.db")
+    rows = conn.execute("SELECT date, name FROM day_runs WHERE kind = 'human'").fetchall()
+    conn.close()
+    assert rows == []
+
+
+# ---------------------------------------------------------------- --hold beside an engine (G6b)
+
+
+async def test_hold_keeps_the_share_beside_a_running_engine(tmp_path: Path) -> None:
+    """P6.2b (D-083): the Harness's service runs as the engine; the smoke's own service starts
+    no loops, so nothing of it competes for the book."""
+    import dataclasses
+
+    from tests.fixtures.exec_harness import RISK
+    from trader.execution.service import ExecutionService
+    from trader.execution.smoke import NoPrices
+
+    async with smoke_rig(tmp_path) as (h, deps):
+        smoke_service = ExecutionService(
+            book="A",
+            broker=h.sim,
+            journal=h.journal,
+            records=h.records,
+            halts=h.halts,
+            gate=h.gate,
+            prices=NoPrices(),
+            clock=h.clock,
+            risk=RISK,
+            day=TradingDay(times=TIMES, next_open=NEXT_OPEN),
+        )
+        await smoke_service.recover()
+        lines: list[str] = []
+        task = asyncio.create_task(
+            run_smoke(
+                dataclasses.replace(deps, service=smoke_service),
+                symbol="XYZ",
+                marketable=True,
+                echo=lines.append,
+                hold=True,
+            )
+        )
+        while not task.done():
+            await h.advance(0.25)
+        assert task.result(), lines
+        assert "holding 1 x XYZ at 12.33; its stop leg is new at 12.10" in lines
+        assert await h.held() == {"XYZ": 1}
+        await h.advance(30)  # the engine's loops run on: the share stays, under its leg
+        assert await h.held() == {"XYZ": 1}
+        assert len(await h.working_stops()) == 1
+        assert await h.incidents() == []
+
+
+def _cli_at(repo: Path, monkeypatch: pytest.MonkeyPatch, *args: str, beat: bool) -> Any:
+    class FakeRest:
+        async def calendar(self, start: date, end: date) -> list[dict[str, str]]:
+            return nyse.calendar_rows(max(start, nyse.FIRST), min(end, nyse.LAST))
+
+        async def __aenter__(self) -> "FakeRest":
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+    morning = SimClock(datetime(2026, 10, 9, 10, 0, tzinfo=ET))
+    monkeypatch.setattr(runtime, "RealClock", lambda: morning)
+    monkeypatch.setattr(runtime.AlpacaRest, "from_config", lambda _cfg, _clock: FakeRest())
+    if beat:
+        path = repo / "runtime" / "heartbeat.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"ts": "2026-10-09T09:59:55-04:00", "books": {"A": {}}}', "utf-8")
+    return CliRunner().invoke(app, ["--root", str(repo), "smoke", "paper", *args])
+
+
+def test_the_smoke_refuses_to_compete_with_a_running_engine(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _cli_at(repo, monkeypatch, "--marketable", beat=True)
+    assert result.exit_code == 1
+    assert "an engine is running" in result.output
+
+
+def test_hold_needs_marketable_and_a_running_engine(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = CliRunner().invoke(app, ["--root", str(repo), "smoke", "paper", "--hold"])
+    assert result.exit_code == 1
+    assert "--hold needs --marketable" in result.output
+    result = _cli_at(repo, monkeypatch, "--marketable", "--hold", beat=False)
+    assert result.exit_code == 1
+    assert "start run-day --books A,B first" in result.output
+
+
+def test_hold_needs_an_engine_that_runs_book_a(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = repo / "runtime" / "heartbeat.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"ts": "2026-10-09T09:59:55-04:00", "books": {"B": {}}}', "utf-8")
+    result = _cli_at(repo, monkeypatch, "--marketable", "--hold", beat=False)
+    assert result.exit_code == 1
+    assert "runs Book A" in result.output

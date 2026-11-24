@@ -477,13 +477,25 @@ Every line is pass, fail, or insufficient data, with its numbers. Intervals are 
 - **The vetoes** counted for the minimum data are triggered longs with a standing veto: H1's population.
 - **H1, H2 and criteria 1–3** read insufficient data until the minimum data is met. H3 and H4 wait only for their own n per side.
 - **Criterion 2's** R after fees is each trade's net P&L over its dollar risk, qty × (entry − stop).
-- **Criterion 4** reads "insufficient data" until Phase 6 marks runs as unattended. The memo shows the longest P1-free run of sessions meanwhile.
+- **Criterion 4** (D-081; the human approved this computation with the Phase 6 plan on 2026-11-23):
+  - **A session is unattended** when the OS scheduler started it (`run-day --scheduled`) and nobody touched it. That means all of:
+    - it ran to DONE with exactly one BOOT, so it never restarted;
+    - no `trader halt`, `flatten`, `resume`, `smoke paper` or hand-started `run-day` touched it;
+    - no KILL file;
+    - run-day logged no failure;
+    - both books ran.
+
+    A person's command or a P1 on a weekend or holiday counts against the next session.
+  - **The memo walks the epoch's calendar sessions,** from its first with stats through its last day, so a session with no run breaks the streak.
+  - **The verdict:**
+    - it passes when some 20 consecutive sessions are each unattended and free of P1s;
+    - otherwise it reads "insufficient data" while the epoch has fewer than 60 sessions, and fail after that.
 - **Criterion 5** always reads "for the human".
 - **The outcome:**
   1. inconclusive, as the row above says;
   2. else "keep running" while the minimum data isn't reached, or while V's interval spans 0 by more than 0.5 R;
   3. else "both books negative" or "H1 fails, Book A positive", by net P&L;
-  4. else "the criteria code can check pass" when criteria 1–3 hold, and the go/no-go is the human's (G7);
+  4. else "the criteria code can check pass" when criteria 1–4 hold, and the go/no-go is the human's (G7);
   5. else "criteria not met".
 
 ---

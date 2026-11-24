@@ -29,6 +29,7 @@ from trader.doctor import (
     format_report,
     run_doctor,
 )
+from trader.ops.power import SleepSettings
 
 NOW = datetime(2026, 10, 9, 10, 0, tzinfo=ET)
 KEY_A = FAKE_SECRETS["ALPACA_PAPER_A_KEY_ID"]
@@ -54,8 +55,10 @@ class FakeProbe:
         orders: int = 0,
         server_time: datetime = NOW,
         error: Exception | None = None,
+        shorting: bool = False,
     ) -> None:
         self.status, self.equity, self.error = status, equity, error
+        self.shorting = shorting
         self.positions, self.orders, self.time = positions, orders, server_time
 
     def account(self) -> AccountInfo:
@@ -63,7 +66,11 @@ class FakeProbe:
             raise self.error
         equity = Decimal(self.equity) if self.equity is not None else None
         return AccountInfo(
-            status=self.status, equity=equity, trading_blocked=False, account_blocked=False
+            status=self.status,
+            equity=equity,
+            trading_blocked=False,
+            account_blocked=False,
+            shorting_enabled=self.shorting,
         )
 
     def position_count(self) -> int:
@@ -148,6 +155,9 @@ class FakeMarketData:
         self.closed = True
 
 
+NEVER_SLEEPS = SleepSettings(standby_s=0, wake_timers=1)  # this PC's own settings
+
+
 def make_deps(
     *,
     probes: Mapping[str, FakeProbe] | None = None,
@@ -156,6 +166,7 @@ def make_deps(
     which: Callable[[str], str | None] | None = None,
     free_bytes: int = 100 * 1024**3,
     environ: Mapping[str, str] | None = None,
+    sleep: SleepSettings | None = NEVER_SLEEPS,
 ) -> DoctorDeps:
     known = dict(probes or {})
     data = market_data or FakeMarketData()
@@ -167,6 +178,7 @@ def make_deps(
         which=which or (lambda name: f"C:/fake/bin/{name}.exe"),
         free_bytes=lambda _path: free_bytes,
         environ=environ if environ is not None else {"PATH": "C:/fake/bin", "SYSTEMROOT": "C:/W"},
+        sleep=lambda: sleep,
     )
 
 
@@ -184,8 +196,10 @@ def check(checks: list[Check], name: str) -> Check:
 
 @pytest.fixture
 def green(repo: Path) -> Path:
-    """The `repo` fixture with a verified high-impact event next week."""
+    """The `repo` fixture with a verified high-impact event next week, and ntfy for alerts."""
     (repo / "config" / "events.yaml").write_text(EVENTS_NEXT_WEEK, encoding="utf-8")
+    set_yaml(repo / "config" / "settings.yaml", "notify.provider", "ntfy")
+    write_secrets(repo, NTFY_TOPIC="t0p1c")
     return repo
 
 
@@ -209,6 +223,8 @@ def test_everything_green(green: Path) -> None:
         "runtime.dirs": "PASS",
         "journal": "PASS",
         "disk": "PASS",
+        "machine.sleep": "PASS",
+        "notify": "PASS",
         "claude.version": "PASS",
         "claude.auth": "PASS",
         "claude.token": "PASS",
@@ -312,6 +328,16 @@ def test_inactive_account_fails(green: Path) -> None:
 )
 def test_account_not_fresh_and_flat_warns(green: Path, probe: FakeProbe) -> None:
     assert check(run_doctor(green, make_deps(probes={KEY_B: probe})), "alpaca.B").status == "WARN"
+
+
+def test_an_account_that_may_short_warns_with_every_other_warning(green: Path) -> None:
+    """Two flatteners' sells racing could open a short where the account allows one (D-083)."""
+    probes = {KEY_A: FakeProbe(shorting=True, positions=1)}
+    found = check(run_doctor(green, make_deps(probes=probes)), "alpaca.A")
+    assert found.status == "WARN"
+    assert found.detail.endswith(
+        "; expected flat; shorting is enabled: set the account's no_shorting configuration"
+    )
 
 
 @pytest.mark.parametrize(("offset_s", "expected"), [(1.5, "PASS"), (-1.9, "PASS"), (2.5, "FAIL")])
@@ -503,3 +529,42 @@ def test_format_report_indents_multiline_details() -> None:
     lines = format_report([Check(name="config", status="FAIL", detail="first\nsecond")])
     assert lines[0] == "FAIL  config  first"
     assert lines[1] == " " * len("FAIL  config  ") + "second"
+
+
+# ---------------------------------------------------------------- sleep and alerts (P6.1b)
+
+
+SLEEPS = [
+    (SleepSettings(0, 0), "PASS", "never sleeps on AC power; wake timers off"),
+    (SleepSettings(1800, 1), "PASS", "after 30 min idle on AC power; wake timers are on, so the"),
+    (SleepSettings(1800, 0), "WARN", "wake timers off: the 08:25 run-day may not start"),
+    (SleepSettings(600, 2), "WARN", "wake timers important ones only"),
+    (None, "WARN", "couldn't be read"),
+]
+
+
+@pytest.mark.parametrize(
+    ("settings", "status", "says"),
+    SLEEPS,
+    ids=["never sleeps", "sleeps, wakes", "sleeps, no wake timers", "important only", "unreadable"],
+)
+def test_machine_sleep(green: Path, settings: SleepSettings | None, status: str, says: str) -> None:
+    found = check(run_doctor(green, make_deps(sleep=settings)), "machine.sleep")
+    assert found.status == status
+    assert says in found.detail
+
+
+def test_notify_warns_while_alerts_reach_nobody(green: Path) -> None:
+    assert check(run_doctor(green, make_deps()), "notify").detail.startswith("ntfy; ")
+    write_secrets(green)  # no NTFY_TOPIC
+    found = check(run_doctor(green, make_deps()), "notify")
+    assert (found.status, found.detail) == (
+        "WARN",
+        "notify.provider is ntfy, but NTFY_TOPIC isn't set in .env",
+    )
+    set_yaml(green / "config" / "settings.yaml", "notify.provider", "none")
+    found = check(run_doctor(green, make_deps()), "notify")
+    assert (found.status, found.detail) == (
+        "WARN",
+        "notify.provider is none: alerts reach nobody (PLAN H0.5)",
+    )

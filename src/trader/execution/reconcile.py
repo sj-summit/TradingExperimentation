@@ -15,8 +15,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from trader.config import BookName
+from trader.core.clock import fmt_iso
 from trader.execution.broker import BrokerAdapter, Order
-from trader.execution.records import OWN_STATUSES, Records
+from trader.execution.records import SUBMITTING, UNCERTAIN, Records
 from trader.memory.journal import Journal
 
 
@@ -76,8 +77,15 @@ class JournalView:
     in_flight: frozenset[str]  # symbols with an order we sent but the broker hasn't confirmed
 
 
-def journal_view(conn: sqlite3.Connection, book: str) -> JournalView:
-    """The journal's side, read inside one transaction."""
+# Sent and not yet confirmed. Not ``lost``: that one never reached the broker, and skipping its
+# symbol would blind reconcile to it for good (D-083).
+IN_FLIGHT = frozenset({SUBMITTING, UNCERTAIN})
+
+
+def journal_view(conn: sqlite3.Connection, book: str, since: str | None = None) -> JournalView:
+    """The journal's side, read inside one transaction. Only orders sent from ``since`` (the
+    day's start) count as in flight: an earlier one stuck unconfirmed is long settled at the
+    broker, whatever the journal says."""
     positions: dict[str, int] = {}
     for row in conn.execute(
         "SELECT symbol, SUM(CASE side WHEN 'buy' THEN qty ELSE -qty END) AS held FROM fills "
@@ -87,13 +95,19 @@ def journal_view(conn: sqlite3.Connection, book: str) -> JournalView:
         if row["held"]:
             positions[row["symbol"]] = int(row["held"])
     orders = conn.execute(
-        "SELECT client_order_id, group_id, symbol, status FROM orders WHERE book = ?", (book,)
+        "SELECT client_order_id, group_id, symbol, status, submitted_at FROM orders WHERE book = ?",
+        (book,),
     ).fetchall()
     return JournalView(
         positions=positions,
         client_ids=frozenset(row["client_order_id"] for row in orders),
         groups=frozenset(row["group_id"] for row in orders if row["group_id"]),
-        in_flight=frozenset(row["symbol"] for row in orders if row["status"] in OWN_STATUSES),
+        in_flight=frozenset(
+            row["symbol"]
+            for row in orders
+            if row["status"] in IN_FLIGHT
+            and (since is None or (row["submitted_at"] or "") >= since)
+        ),
     )
 
 
@@ -110,7 +124,7 @@ class Reconciler:
         Only orders the journal already knows (by id, or as a leg by group) are journaled: an
         order someone else placed must stay a stranger, or the diff could never see it.
         """
-        known = await self._view()
+        known = await self._view(since)
         for order in await self._broker.orders_since(since):
             if _ours(order, known):
                 await self._records.apply(order)
@@ -119,7 +133,7 @@ class Reconciler:
         for order in open_orders:
             if _ours(order, known):
                 await self._records.apply(order)
-        view = await self._view()
+        view = await self._view(since)
         return diff(
             broker_positions=positions,
             journal_positions=view.positions,
@@ -129,8 +143,9 @@ class Reconciler:
             skip=set(skip) | view.in_flight,
         )
 
-    async def _view(self) -> JournalView:
-        return await self._journal.read(lambda conn: journal_view(conn, self.book))
+    async def _view(self, since: datetime) -> JournalView:
+        start = fmt_iso(since)
+        return await self._journal.read(lambda conn: journal_view(conn, self.book, start))
 
 
 def _ours(order: Order, view: JournalView) -> bool:

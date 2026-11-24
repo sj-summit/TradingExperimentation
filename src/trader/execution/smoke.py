@@ -5,6 +5,10 @@ It goes through the real risk gate and ExecutionService, so it tests the whole o
   its stop leg ``held``, cancel it, and confirm the entry and the leg are cancelled.
 - **--marketable:** a limit at the ask + 0.2%. Confirm the fill, record the stop leg's status
   after the fill (it decides how D-032 treats ``held``), then flatten and confirm flat.
+- **--marketable --hold** (G6b's fire drill, D-083): the same buy, kept under its stop leg. It
+  runs beside a live engine, which owns the book: the service here starts no loops, so the
+  order is read here until it fills, and the engine's 15:55 flatten, the watchdog or
+  ``trader flatten`` sells the share.
 
 Smoke entries carry ``smoke-`` signal ids and ``smoke`` client order ids, so they never count as
 strategy entries (D-035). The journal rows of the run are printed at the end.
@@ -87,7 +91,9 @@ async def ensure_seeded(ledger: SettlementLedger, broker: BrokerAdapter, echo: E
     echo(f"seeded Book {ledger.book}'s ledger with ${account.cash} (first use)")
 
 
-async def run_smoke(d: SmokeDeps, *, symbol: str, marketable: bool, echo: Echo) -> bool:
+async def run_smoke(
+    d: SmokeDeps, *, symbol: str, marketable: bool, echo: Echo, hold: bool = False
+) -> bool:
     """Run one smoke round trip; returns True when every check passed."""
     started = d.clock.now()
     times = d.day.times
@@ -163,7 +169,12 @@ async def run_smoke(d: SmokeDeps, *, symbol: str, marketable: bool, echo: Echo) 
         echo(f"not submitted: {result.outcome} {result.reason}".rstrip())
         await _show_journal(d, started, echo)
         return False
-    ok = await (_fill_and_flatten(d, cid, echo) if marketable else _rest_and_cancel(d, cid, echo))
+    if hold:
+        ok = await _fill_and_hold(d, cid, echo)
+    elif marketable:
+        ok = await _fill_and_flatten(d, cid, echo)
+    else:
+        ok = await _rest_and_cancel(d, cid, echo)
     await _show_journal(d, started, echo)
     echo("SMOKE PASSED" if ok else "SMOKE FAILED")
     return ok
@@ -204,6 +215,35 @@ async def _fill_and_flatten(d: SmokeDeps, cid: str, echo: Echo) -> bool:
     held = ", ".join(f"{s} {q}" for s, q in sorted(result.remaining.items()))
     echo("flattened: flat" if result.flat else f"FAIL: still held after flatten: {held}")
     return result.flat and leg is not None and leg_status in ("new", "accepted", "held")
+
+
+async def _fill_and_hold(d: SmokeDeps, cid: str, echo: Echo) -> bool:
+    """G6b's first step: buy one share and keep it under its stop leg. No loop of this
+    service runs (the engine owns the book), so the order is read here until it fills."""
+    row = await d.records.order(cid)
+    if row is None or row.broker_order_id is None:
+        echo("FAIL: the entry has no broker order")
+        return False
+    deadline = d.clock.now() + CONFIRM_WAIT + timedelta(seconds=2)
+    order = await d.broker.get_order(row.broker_order_id)
+    while order.status != "filled":
+        if d.clock.now() >= deadline:
+            await d.service.cancel_entry(cid)
+            echo("FAIL: no fill within the entry timeout; the entry was cancelled")
+            return False
+        await d.clock.sleep_until(d.clock.now() + POLL)
+        order = await d.broker.get_order(row.broker_order_id)
+    await d.records.apply(order)
+    await d.clock.sleep_until(d.clock.now() + LEG_SETTLE)
+    order = await d.broker.get_order(order.id)
+    await d.records.apply(order)
+    leg = order.stop_leg
+    leg_status = leg.status if leg else "MISSING"
+    stop = leg.stop_price if leg else None
+    price = order.filled_avg_price
+    echo(f"holding 1 x {order.symbol} at {price}; its stop leg is {leg_status} at {stop}")
+    echo("It stays until the engine's 15:55 flatten, the watchdog, or `trader flatten --book A`.")
+    return leg is not None and leg_status in ("new", "accepted", "held")
 
 
 async def _wait_for(

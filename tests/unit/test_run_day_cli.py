@@ -433,3 +433,71 @@ def test_a_replay_says_when_the_code_changed_since_the_recording(tmp_path: Path)
     notes = replay_module._notes(tmp_path, recorded, tmp_path)
     assert notes == ["the code changed since the recording"]
     assert replay_module._notes(tmp_path, {}, tmp_path) == []  # recorded before D-055
+
+
+# ---------------------------------------------------------------- who started it (P6.1b, D-081)
+
+
+async def _starts(repo: Path) -> list[tuple[str, str, str | None]]:
+    journal = await Journal.open(repo / "runtime" / "trader.db")
+    rows = await journal.fetch_all(
+        "SELECT kind, name, detail FROM day_runs WHERE kind IN ('note', 'human') ORDER BY id"
+    )
+    await journal.aclose()
+    return [(r["kind"], r["name"], r["detail"]) for r in rows]
+
+
+async def test_the_session_records_who_started_it(
+    repo: Path, offline: SimClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(live, "DayOrchestrator", Orchestrators())
+    await run_day(repo, RunOptions(books=("A",), scheduled=True), print, clock=offline)
+    await run_day(repo, RunOptions(books=("A",)), print, clock=offline)  # by hand
+    await run_day(repo, RunOptions(books=("A",), dry_run=True), print, clock=offline)
+    assert await _starts(repo) == [
+        ("note", "scheduled", "A"),
+        ("human", "trader run-day", None),
+    ]
+    journal = await Journal.open(repo / "runtime" / "trader.db")
+    await journal.execute(
+        "UPDATE trading_days SET run_status = 'DONE' WHERE date = ?", (MORNING.date().isoformat(),)
+    )
+    await journal.aclose()
+    await run_day(repo, RunOptions(books=("A",)), print, clock=offline)  # a finished day: nothing
+    await run_day(repo, RunOptions(books=("A",), scheduled=True), print, clock=offline)
+    assert len(await _starts(repo)) == 2
+
+
+async def test_run_day_keeps_the_pc_awake_while_the_day_runs(
+    repo: Path,
+    offline: SimClock,
+    monkeypatch: pytest.MonkeyPatch,
+    power_calls: list[int],
+) -> None:
+    monkeypatch.setattr(live, "DayOrchestrator", Orchestrators())
+    await run_day(repo, RunOptions(books=("A",), dry_run=True), print, clock=offline)
+    assert power_calls == []  # a dry run only looks
+    await run_day(repo, RunOptions(books=("A",)), print, clock=offline)
+    assert power_calls == [0x80000001, 0x80000000]  # held, then cleared
+
+
+def test_the_engine_reads_the_watchdog_once_the_schedule_runs_one(repo: Path) -> None:
+    """D-083: no watchdog_silent before G6a installs a watchdog task."""
+    import json
+
+    cfg = load_config(repo)
+    where = folders(cfg, MORNING.date(), sim=False)
+    runtime = repo / "runtime"
+    runtime.mkdir(exist_ok=True)
+    assert live._watchdog_status(repo, where) is None  # no schedule.json
+    record = runtime / "schedule.json"
+    record.write_text(json.dumps({"tasks": {r"\ai-day-trader\run-day": "h"}}), encoding="utf-8")
+    assert live._watchdog_status(repo, where) is None  # a schedule without a watchdog
+    record.write_text(json.dumps({"tasks": {r"\ai-day-trader\watchdog": "h"}}), encoding="utf-8")
+    last_run = live._watchdog_status(repo, where)
+    assert last_run is not None
+    assert last_run() is None  # never ran
+    (runtime / "watchdog.json").write_text('{"ts": "2026-10-13T10:01:00-04:00"}', "utf-8")
+    assert last_run() == datetime(2026, 10, 13, 10, 1, tzinfo=ET)
+    (runtime / "watchdog.json").write_text("{", "utf-8")  # mid-write: unreadable reads as never
+    assert last_run() is None

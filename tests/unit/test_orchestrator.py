@@ -686,3 +686,65 @@ async def test_a_405_falls_back_to_trades_only(tmp_path: Path) -> None:
     assert run.hub.acked == {"trades": sorted(run.hub.symbols)}
     assert (await run.trades())["WIN"][3] == "eod_flatten"
     await run.close()
+
+
+# ---------------------------------------------------------------- the watchdog watched (P6.2b)
+
+
+async def test_the_engine_raises_one_p2_per_silence_of_the_watchdog(tmp_path: Path) -> None:
+    """D-083: heard from 11:00 to 13:00 only, the watchdog is silent from 09:40 (open + 10 min)
+    and again from 13:00: two P2s, not one a minute."""
+    run = await DayRun(tmp_path, standard_day()).open()
+    try:
+
+        def last_run() -> datetime | None:
+            now = run.clock.now()
+            return now if time(11, 0) <= now.time() < time(13, 0) else None
+
+        outcome = await run.run(run.deps(watchdog_status=last_run))
+        assert outcome is not None
+        assert outcome.state == "DONE"
+        silent = [i for i in await run.incidents() if i[1] == "watchdog_silent"]
+        assert silent == [("P2", "watchdog_silent")] * 2
+        times = await run.rows(
+            "SELECT substr(ts, 12, 5) AS at FROM incidents WHERE code = 'watchdog_silent'"
+        )
+        assert [r["at"] for r in times] == ["09:40", "13:00"]
+    finally:
+        await run.close()
+
+
+async def test_a_watchdog_that_runs_raises_nothing(tmp_path: Path) -> None:
+    run = await DayRun(tmp_path, standard_day()).open()
+    try:
+        await run.run(run.deps(watchdog_status=run.clock.now))
+        assert [i for i in await run.incidents() if i[1] == "watchdog_silent"] == []
+        beat = json.loads((tmp_path / "runtime" / "heartbeat.json").read_text(encoding="utf-8"))
+        assert beat["pid"] == __import__("os").getpid()  # the fire drill's Stop-Process target
+        assert beat["books"]["A"]["flattening"] is False
+    finally:
+        await run.close()
+
+
+async def test_boot_beats_as_it_begins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """D-083: a restart mid-session mustn't look dead to the watchdog while its books start."""
+    seen: list[dict[str, Any]] = []
+    real = day_module.write_heartbeat
+
+    def spy(path: Path, record: dict[str, Any]) -> None:
+        seen.append(record)
+        real(path, record)
+
+    monkeypatch.setattr(day_module, "write_heartbeat", spy)
+    run = await DayRun(tmp_path, standard_day()).open()
+    try:
+        await run.run()
+    finally:
+        await run.close()
+    (first,) = seen  # the later beats are the Heartbeat's own
+    assert (first["state"], sorted(first["books"]), first["books"]["A"]["flattening"]) == (
+        "BOOT",
+        ["A"],
+        False,
+    )
+    assert first["pid"] == __import__("os").getpid()

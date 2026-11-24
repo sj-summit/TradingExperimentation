@@ -27,6 +27,18 @@ def names_claude(part: object) -> bool:
     return name.split(".")[0] == "claude"
 
 
+OS_TOOLS = frozenset({"schtasks", "tzutil", "powercfg"})
+
+
+def names_os_tool(part: object) -> bool:
+    """Whether ``part`` names a Windows tool that changes or reads the machine's scheduling or
+    power setup (Phase 6): tests use fakes, never the real one."""
+    if not isinstance(part, str | bytes | os.PathLike):
+        return False
+    name = Path(os.fsdecode(part)).name.rstrip(" .").lower()
+    return name.split(".")[0] in OS_TOOLS
+
+
 def _parts(args: Any) -> list[Any]:
     if isinstance(args, str | bytes):  # a command line: its words, unquoted
         return [word.strip('"') for word in os.fsdecode(args).split()]
@@ -36,15 +48,33 @@ def _parts(args: Any) -> list[Any]:
 
 
 @pytest.fixture(autouse=True)
+def power_calls(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """run-day keeps the PC awake (P6.1b); no test touches the real power state. The flags each
+    SetThreadExecutionState call would have passed."""
+    calls: list[int] = []
+
+    def fake(flags: int) -> int:
+        calls.append(flags)
+        return 0x80000000  # the previous state: success
+
+    monkeypatch.setattr("trader.ops.power.set_execution_state", fake)
+    return calls
+
+
+@pytest.fixture(autouse=True)
 def _never_the_real_claude(monkeypatch: pytest.MonkeyPatch) -> None:
     """CLAUDE.md invariant 9: no test runs the real claude CLI, by any path (the transport,
     doctor's probes, a wrapper such as ``cmd /c claude``): every process starts through
-    ``subprocess.Popen``, asyncio's too. scripts/fake_claude.py stands in for it (D-064)."""
+    ``subprocess.Popen``, asyncio's too. scripts/fake_claude.py stands in for it (D-064).
+    Neither do schtasks, tzutil or powercfg (Phase 6): no test may touch the PC's schedule."""
     init = subprocess.Popen.__init__
 
     def guarded(self: subprocess.Popen[Any], args: Any, *rest: Any, **kw: Any) -> None:
-        if any(names_claude(part) for part in [*_parts(args), kw.get("executable")]):
+        parts = [*_parts(args), kw.get("executable")]
+        if any(names_claude(part) for part in parts):
             raise RealClaudeError("a test tried to run the real claude CLI (CLAUDE.md invariant 9)")
+        if any(names_os_tool(part) for part in parts):
+            raise RealClaudeError(f"a test tried to run a real Windows tool: {parts[0]!r}")
         init(self, args, *rest, **kw)
 
     monkeypatch.setattr(subprocess.Popen, "__init__", guarded)

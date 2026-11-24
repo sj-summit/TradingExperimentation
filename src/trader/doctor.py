@@ -51,6 +51,7 @@ from trader.llm.claude_cli import (
     resolve_claude,
 )
 from trader.memory.journal import open_database
+from trader.ops.power import SleepSettings, sleep_settings
 
 Status = Literal["PASS", "WARN", "FAIL", "SKIP"]
 Result = tuple[Status, str]
@@ -85,6 +86,7 @@ class AccountInfo(BaseModel):
     equity: Decimal | None
     trading_blocked: bool
     account_blocked: bool
+    shorting_enabled: bool = False
 
 
 class ProbeError(Exception):
@@ -140,6 +142,7 @@ class DoctorDeps:
     which: Callable[[str], str | None]
     free_bytes: Callable[[Path], int]
     environ: Mapping[str, str]
+    sleep: Callable[[], SleepSettings | None]  # the PC's AC sleep settings (RISK.md section 9)
 
 
 # ---------------------------------------------------------------- report
@@ -181,6 +184,8 @@ def run_doctor(root: Path, deps: DoctorDeps, *, quick: bool = False) -> list[Che
     add("runtime.dirs", lambda: _runtime_dirs(cfg))
     add("journal", lambda: _journal(cfg))
     add("disk", lambda: _disk(root, deps))
+    add("machine.sleep", lambda: _sleep(deps))
+    add("notify", lambda: _notify(cfg))
     if not cfg.settings.llm.enabled:
         checks.append(_skip("claude", "llm.enabled is false"))
     elif quick:
@@ -343,11 +348,16 @@ def _alpaca_book(
         return "FAIL", f"{exc.kind} error: {exc}"
     probes[book] = probe
     detail = f"paper, ACTIVE, equity {_usd(acct.equity)}, {positions} positions, {orders} orders"
+    warnings: list[str] = []
     band = cfg.risk.account_equity_band_pct / 100 * EXPECTED_START_EQUITY
     if acct.equity is None or abs(acct.equity - EXPECTED_START_EQUITY) > band:
-        return "WARN", f"{detail}; expected about {_usd(EXPECTED_START_EQUITY)}"
+        warnings.append(f"expected about {_usd(EXPECTED_START_EQUITY)}")
     if positions or orders:
-        return "WARN", f"{detail}; expected flat"
+        warnings.append("expected flat")
+    if acct.shorting_enabled:  # a long-only account turns an oversell into a reject (D-083)
+        warnings.append("shorting is enabled: set the account's no_shorting configuration")
+    if warnings:
+        return "WARN", "; ".join([detail, *warnings])
     return "PASS", detail
 
 
@@ -454,6 +464,43 @@ def _disk(root: Path, deps: DoctorDeps) -> Result:
     free = deps.free_bytes(root)
     detail = f"{free / 1024**3:.1f} GB free"
     return ("PASS", detail) if free >= MIN_FREE_DISK_BYTES else ("WARN", f"only {detail}")
+
+
+WAKE_TIMERS = {0: "off", 1: "on", 2: "important ones only"}
+
+
+def _sleep(deps: DoctorDeps) -> Result:
+    """RISK.md section 9: the PC mustn't sleep on weekdays from 08:15 to 16:45 ET. run-day keeps
+    it awake while it runs (D-081); between sessions it may sleep if a wake timer can start
+    the 08:25 task."""
+    found = deps.sleep()
+    if found is None:
+        return "WARN", (
+            "the PC's sleep settings couldn't be read: make sure it doesn't sleep on weekdays "
+            "from 08:15 to 16:45 ET"
+        )
+    wake = WAKE_TIMERS.get(found.wake_timers, str(found.wake_timers))
+    if not found.sleeps:
+        return "PASS", f"never sleeps on AC power; wake timers {wake}"
+    idle = f"sleeps after {found.standby_s // 60} min idle on AC power"
+    if found.wakes:
+        return "PASS", f"{idle}; wake timers are on, so the 08:25 task wakes it"
+    return "WARN", (
+        f"{idle} with wake timers {wake}: the 08:25 run-day may not start. Set sleep to never, "
+        "or allow wake timers (Power Options)"
+    )
+
+
+def _notify(cfg: AppConfig) -> Result:
+    """Alerts need a channel (PLAN H0.5): without one, a P1 at night reaches nobody, and
+    `trader schedule install` refuses."""
+    notify = cfg.settings.notify
+    if notify.provider == "none":
+        return "WARN", "notify.provider is none: alerts reach nobody (PLAN H0.5)"
+    env = notify.ntfy_topic_env if notify.provider == "ntfy" else notify.discord_webhook_env
+    if not cfg.secrets.is_set(env):
+        return "WARN", f"notify.provider is {notify.provider}, but {env} isn't set in .env"
+    return "PASS", f"{notify.provider}; `trader notify test` sends a test message"
 
 
 def _claude_env(cfg: AppConfig, deps: DoctorDeps) -> dict[str, str]:
@@ -609,6 +656,7 @@ class AlpacaAccountProbe:
             equity=Decimal(acct.equity) if acct.equity is not None else None,
             trading_blocked=bool(acct.trading_blocked),
             account_blocked=bool(acct.account_blocked),
+            shorting_enabled=bool(acct.shorting_enabled),
         )
 
     def position_count(self) -> int:
@@ -681,4 +729,5 @@ def default_deps() -> DoctorDeps:
         which=shutil.which,
         free_bytes=lambda path: shutil.disk_usage(path).free,
         environ=dict(os.environ),
+        sleep=sleep_settings,
     )

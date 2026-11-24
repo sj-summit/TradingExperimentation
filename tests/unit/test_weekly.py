@@ -19,6 +19,7 @@ from tests.fixtures.journal_days import (
     add_session,
     add_spy,
     add_trade,
+    add_unattended_run,
     journal,
     sessions,
 )
@@ -130,6 +131,30 @@ def test_a_week_with_its_epoch_to_date(conn: sqlite3.Connection) -> None:
     assert [code for _, _, _, code, _ in r.incidents] == ["llm_call_failed"]  # W45's left out
     ((epoch0, diff),) = r.epochs
     assert (epoch0.epoch, epoch0.decision, diff.value) == (0, "D-075", pytest.approx(1.0 - 0.0))
+
+
+def test_operations_show_each_session_unattended_or_why_not(conn: sqlite3.Connection) -> None:
+    """P6.1b (D-081): the week's sessions for S§8 criterion 4, and the epoch's longest clean run."""
+    fill(conn)
+    for day in W45 + W46[:4]:  # every session ran from the scheduler but W46's Friday
+        add_unattended_run(conn, day)
+    conn.execute(
+        "INSERT INTO day_runs (date, kind, name, at) VALUES (?, 'human', 'trader halt', ?)",
+        (W46[1].isoformat(), f"{W46[1]}T12:00:00-05:00"),
+    )
+    report = build_weekly(conn, year=2026, week=46, boot=BOOT)
+    assert [(r.day, r.unattended, r.why_not) for r in report.sessions] == [
+        (W46[0], True, ""),
+        (W46[1], False, "touched by hand: trader halt"),
+        (W46[2], True, ""),
+        (W46[3], True, ""),
+        (W46[4], False, "not started by the scheduler"),
+    ]
+    assert report.longest_clean == 6  # W45 and W46's Monday
+    md = render_markdown(report)
+    assert "## Operations: this week's sessions" in md
+    assert "| 2026-11-10 | no | touched by hand: trader halt | 0 |" in md
+    assert "the epoch's longest run of unattended sessions without a P1: 6 " in md
 
 
 def test_a_missing_last_close_is_said(conn: sqlite3.Connection) -> None:

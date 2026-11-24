@@ -147,16 +147,48 @@ Property tests (`hypothesis`) must show:
   - `trader halt [--book A|B|all] [--flatten]`
   - `trader flatten --book all` (works without the engine running; talks to the broker directly)
   - `trader resume --book X` (typed confirmation)
+- **`halt --flatten` and `flatten` halt each book before any network call,** so a running engine stops entering first. A book whose keys are missing is halted but not flattened, and the other book is still flattened (D-083).
 
 ### Watchdog
 
-`trader watchdog` is a separate process, run by the OS scheduler every 5 min from 09:25 to 16:05 on trading days.
+`trader watchdog` is a separate process. The OS scheduler runs it every minute from 09:25 to 16:05 ET on weekdays. It was every 5 min until the human's decision of 2026-11-23 (D-080): with a 60 s heartbeat limit, that let a dead engine go about 6 min unnoticed and missed the last 2 minutes before the close.
 
-- **Heartbeat:** the engine writes `runtime/heartbeat.json` every 10 s. If the heartbeat is older than 60 s during regular hours:
-  - with open positions at the broker → flatten those accounts and send a P1 alert;
-  - with no positions → P2 alert.
-- **Stop check:** independently checks that every open position has an active stop order. If not, it flattens.
-- **Late check:** after close − 2 min, any open position → flatten and send a P1 alert.
+Each run checks its own window: a trading day from the open − 5 min to the close + 5 min, early closes included (D-082). Its rules are below.
+
+- **Heartbeat.** The engine writes `runtime/heartbeat.json` every 10 s, and once as BOOT begins, so a restart mid-session isn't taken for dead while its books start (D-083). A heartbeat that is absent, unreadable or older than 60 s is read again 25 s later before anything is done. If it still isn't fresh:
+  - **during regular hours,** with positions or open orders at the broker: flatten those accounts (a `p1_incident` halt) and send a P1 alert (`engine_down_flattened`);
+  - **during regular hours, with nothing open:** a P2 alert (`engine_down`), once per episode;
+  - **before the open:** a P2 alert;
+  - **after the close:** shares without a working GTC stop get one, with a P1 (`watchdog_overnight`).
+- **Stop check.** Independently, every open position must be covered (R-020's rule, the engine's own code):
+  - by a working sell stop;
+  - by a stop leg held behind its buy, once that buy is final;
+  - or by a market sell at work. That covers for as long as it works: in regular hours one fills in seconds.
+
+  Shares found bare are read a second time before anything is done (D-083):
+  - **in a book the engine runs,** after `partial_fill_cancel_max_s` + 10 s, so the engine can cover them first;
+  - **in a book no engine runs today,** after 2 s, since a stop filling between two reads looks like bare shares.
+
+  What needs no second read is done at once, then come the 2 s reads, then the 30 s ones.
+  - **The check stands aside** within 40 s of the flatten time, while the engine says it is flattening the book, and under someone's `flattening` marker.
+  - **The result:** a P1 (`watchdog_unprotected`) and a flatten. Before the open, GTC stops are placed instead.
+- **Late check.** From close − 2 min, any open position: flatten and send a P1 alert (`watchdog_late`). There is no second P1 when the engine's own flatten already raised `not_flat` for that book, at or after its flatten time. An earlier `not_flat` that day doesn't count (D-083).
+- **After the close, with the heartbeat fresh:** a book the engine doesn't run gets GTC stops for any shares without one, with a P1 (`watchdog_overnight`). The engine's own books are left to its after-close pass (D-083).
+- **KILL file.** With the heartbeat stale, during regular hours and the late check, the watchdog flattens every book with anything open under a `kill_switch` halt, as the engine would have. That is a P2 (`watchdog_kill_file`), not a P1: a person asked for it. Its sells carry the `kill_switch` purpose. Before the open and after the close, the file changes nothing the watchdog does: a market sell can't fill then, and the usual GTC stops still go on.
+- **Alerts.**
+  - **A flatten's alert** is journaled once per halt: the same halt never alerts twice, and a new incident after a `trader resume` alerts again (D-083).
+  - **The others** are journaled once per episode (the stale heartbeat's last `ts`), or once per book per day.
+  - **A P2 `engine_down`** is dropped when another alert already spoke for that episode. It names any book whose account couldn't be read.
+  - The watchdog pushes alerts itself only while the heartbeat is stale, so its pump never races a live engine's.
+  - A broker it can't read is a P2 (`watchdog_blind`) once a day.
+- **The engine watches the watchdog back** (D-083). Once the schedule runs a watchdog, a watchdog that hasn't run for 10 min between open + 10 min and the close is a P2 (`watchdog_silent`), once per silence.
+- **Known limitations** (D-082, D-083):
+  - **A halt set by another process doesn't stop an entry already on its way.** It doesn't set the engine's `_closing`, so an entry whose submit lands after the watchdog's cancel pass can rest. R-020 then protects it, and the late check flattens it.
+  - **Two flatteners on one book at once** (say, the watchdog and a person's `trader flatten`). The first to finish clears the `flattening` marker, and the other renews it on its next pass. A running engine may place a stop in that gap, and the flatten's next pass cancels it.
+  - **Shorting.** A sell racing another for the same shares could only open a short where the account may short.
+    - Alpaca allows shorting only from $2,000 of equity. Its docs don't say whether that holds on paper.
+    - Doctor warns when an account's `shorting_enabled` is true.
+    - Alpaca's `no_shorting` account configuration makes an account long-only.
 
 ## 7. Live-mode gate (Phase 7, human only)
 
@@ -198,7 +230,9 @@ Stop live trading and return to paper if either happens:
   - The `claude setup-token` token lasts about one year. `doctor` warns from 30 days before the one-year expiry, computed from `CLAUDE_TOKEN_CREATED=YYYY-MM-DD` in `.env`.
 - **Clock.** At boot, system time must be within 2 s of Alpaca's clock; otherwise P2 incident and refuse to arm signals. The skew is read again every hour (D-055): past 2 s that is a P2 alert, once per episode, and arms or disarms nothing.
 - **Calendar.** Holidays and early closes come from the Alpaca calendar (cached). DST is handled by `zoneinfo`. Test the March/November transition days and the day after Thanksgiving.
-- **Machine.** It must not sleep from 08:15 to 16:45 ET on weekdays. `doctor` warns if the platform's sleep settings can't be verified.
+- **Machine.** It must not sleep from 08:15 to 16:45 ET on weekdays.
+  - `run-day` keeps the PC awake for its whole run, with `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)`; the display may still sleep (D-081).
+  - `doctor`'s `machine.sleep` reads the active power scheme's AC standby timeout and wake timers. It passes if the PC never sleeps on AC power, or if wake timers are on so the 08:25 task wakes it. It warns otherwise, and when the settings can't be read.
 - **Outages.** If Alpaca, the network, or Anthropic is down:
   - the engine retries idempotent reads only;
   - order submission is never blindly retried; query by `client_order_id` first;
@@ -216,6 +250,6 @@ Stop live trading and return to paper if either happens:
 
 | Severity | Examples | Response |
 |---|---|---|
-| P1 | Unprotected position; not flat by close − 2 min; reconciliation mismatch with positions; daily loss limit breached beyond the configured value | Immediate push alert; auto-flatten the affected book; halt until the human acknowledges |
-| P2 | Engine heartbeat stale with no positions; data stale > 120 s; LLM degraded (`llm_degraded`: Book B halted until the next open); clock skew; an LLM call refused for a cause a human must fix (`llm_refused`: a dirty sandbox, a missing prompt, a pack over its cap); a Book B job that failed in the engine (`llm_job_failed`); Book B off because the CLI or its credential is missing (`llm_unavailable`); a book kept off today whose account holds positions or open orders that nothing watches (`idle_book_not_flat`) | Push alert; halt new entries as the rule requires (the hourly clock reading only alerts) |
+| P1 | Unprotected position; not flat by close − 2 min; reconciliation mismatch with positions; daily loss limit breached beyond the configured value; the watchdog's flattens (`engine_down_flattened`, `watchdog_unprotected`, `watchdog_late`, `watchdog_overnight`) | Immediate push alert; auto-flatten the affected book; halt until the human acknowledges |
+| P2 | Engine heartbeat stale with no positions (`engine_down`); the KILL file acted on by the watchdog (`watchdog_kill_file`); a broker the watchdog can't read (`watchdog_blind`); a scheduled job that failed (`scheduled_job_failed`, D-080); a silent watchdog (`watchdog_silent`, D-083); data stale > 120 s; LLM degraded (`llm_degraded`: Book B halted until the next open); clock skew; an LLM call refused for a cause a human must fix (`llm_refused`: a dirty sandbox, a missing prompt, a pack over its cap); a Book B job that failed in the engine (`llm_job_failed`); Book B off because the CLI or its credential is missing (`llm_unavailable`); a book kept off today whose account holds positions or open orders that nothing watches (`idle_book_not_flat`) | Push alert; halt new entries as the rule requires (the hourly clock reading only alerts) |
 | P3 | A single LLM failure (`llm_call_failed`, one per failed attempt; `llm_call_refused` for a call refused for time or the day's cap); no brief today (`brief_missed`); a failed pre-market scan (`premarket_scan_failed`) or news feed (`news_unavailable`); scan slow; a minor data gap; fees not readable; a cash residual over half the tolerance; a changed LLM setup (`llm_fingerprint_changed`); a `claude` CLI newer than the last one tested (`llm_cli_untested`); EDGAR unusable for the day, so every pack's filings are unknown (`edgar_unavailable`) | Log; show in the daily report |

@@ -422,3 +422,23 @@ def test_no_other_path_runs_it_either(sandbox: Path) -> None:
             subprocess.run(args, check=False, capture_output=True)
     with pytest.raises(RealClaudeError):  # doctor's probes
         doctor.run_subprocess(["claude", "--version"], env={}, cwd=sandbox, timeout_s=1)
+
+
+# ---------------------------------------------------------------- the job object (P6.2b, D-083)
+
+
+class RecordingJob:
+    def __init__(self) -> None:
+        self.assigned: list[int] = []
+
+    def assign(self, pid: int) -> bool:
+        self.assigned.append(pid)
+        return True
+
+
+async def test_each_child_joins_the_transports_job(sandbox: Path, env: dict[str, str]) -> None:
+    job, spawned = RecordingJob(), []
+    t = ClaudeCliTransport(on_spawn=spawned.append, job=job)  # type: ignore[arg-type]
+    result = await run("valid", sandbox, env, transport=t)
+    assert result.exit_code == 0
+    assert job.assigned == [spawned[0].pid]

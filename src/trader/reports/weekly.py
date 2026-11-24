@@ -10,6 +10,8 @@ One ISO week, read in one go (``build_weekly``), with the epoch's numbers to dat
 - **the factor tally** for the epoch, with S§6.5's caveat: factors are hindsight labels;
 - **the week's ``bad_process`` reviews;**
 - **open process issues and notes,** oldest and most recurring first (``followups``);
+- **operations:** each of the week's sessions, unattended or why not, with its P1s, and the
+  epoch's longest run of unattended sessions without a P1 (S§8 criterion 4, D-081);
 - **the week's incidents;**
 - **the epochs,** with Book B minus Book A in each;
 - **the limitations footer.**
@@ -43,6 +45,13 @@ from trader.memory.stats import (
     read_epoch,
     spy_path,
     summarize,
+)
+from trader.memory.unattended import (
+    SessionRun,
+    calendar_sessions,
+    epoch_sessions,
+    longest_clean_run,
+    session_runs,
 )
 from trader.reports.render import LIMITATIONS, ModelText, md_row
 
@@ -81,6 +90,8 @@ class WeeklyReport:
     incidents: tuple[tuple[str, str, str, str, str], ...]  # time, severity, component, code, msg
     epochs: tuple[tuple[EpochRow, Difference], ...]
     spy_note: str | None  # when SPY's closes don't reach the books' last session
+    sessions: tuple[SessionRun, ...] = ()  # the week's: unattended, or why not (D-081)
+    longest_clean: int = 0  # the epoch's longest unattended run without a P1, to date
 
 
 def iso_week(year: int, week: int) -> tuple[date, date]:
@@ -172,6 +183,8 @@ def build_weekly(
             (e, b_minus_a(read_epoch(conn, e.epoch, last=last).trades, boot)) for e in epochs(conn)
         ),
         spy_note=spy_note,
+        sessions=tuple(session_runs(conn, calendar_sessions(conn, first, last))),
+        longest_clean=longest_clean_run(session_runs(conn, epoch_sessions(conn, epoch, last))),
     )
 
 
@@ -344,6 +357,16 @@ def _tables(r: WeeklyReport) -> list[tuple[str, list[str], list[list[str]]]]:
     )
     out.append(
         (
+            "Operations: this week's sessions",
+            ["session", "unattended", "why not", "P1s"],
+            [
+                [run.day.isoformat(), "yes" if run.unattended else "no", run.why_not, str(run.p1)]
+                for run in r.sessions
+            ],
+        )
+    )
+    out.append(
+        (
             "This week's incidents",
             ["time", "severity", "component", "code", "message"],
             [[t, sev, comp, code, ModelText(msg)] for t, sev, comp, code, msg in r.incidents],
@@ -383,6 +406,10 @@ def _notes(r: WeeklyReport) -> list[str]:
         )
     if r.spy_note:
         out.append(r.spy_note)
+    out.append(
+        f"the epoch's longest run of unattended sessions without a P1: {r.longest_clean} "
+        "(STRATEGY.md 8, criterion 4, needs 20)"
+    )
     out.append(HINDSIGHT)
     return out
 

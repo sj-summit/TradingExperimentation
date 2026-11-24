@@ -13,15 +13,16 @@ from types import TracebackType
 from typing import Self
 
 LOCK_NAME = "run-day.lock"  # beside the journal; `smoke llm` takes it too, for the sandbox
+WATCHDOG_LOCK_NAME = "watchdog.lock"  # one watchdog run at a time (D-082)
 
 
 class RunLockError(RuntimeError):
-    """Another engine holds the lock."""
+    """Another process holds the lock."""
 
 
 class RunLock:
-    def __init__(self, path: Path) -> None:
-        self.path = path
+    def __init__(self, path: Path, *, holder: str = "`trader run-day`") -> None:
+        self.path, self.holder = path, holder
         self._fd: int | None = None
 
     def acquire(self) -> None:
@@ -31,9 +32,8 @@ class RunLock:
             _lock(fd)
         except OSError:
             os.close(fd)
-            raise RunLockError(
-                f"another `trader run-day` is running ({self.path} is locked)"
-            ) from None
+            busy = f"another {self.holder} is running ({self.path} is locked)"
+            raise RunLockError(busy) from None
         self._fd = fd
 
     def release(self) -> None:

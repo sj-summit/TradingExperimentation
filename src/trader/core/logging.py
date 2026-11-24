@@ -78,11 +78,13 @@ def configure_logging(
     logs_dir: Path | None,
     console: TextIO | None = sys.stderr,
     level: int = logging.INFO,
+    prefix: str = "",
 ) -> Path | None:
     """Route structlog and stdlib logging through one redacting pipeline.
 
-    Returns the JSON log file, or None when ``logs_dir`` is None. Calling it again replaces the
-    handlers it installed earlier.
+    Returns the JSON log file, ``<logs_dir>/<prefix><date>.jsonl``, or None when ``logs_dir`` is
+    None. Calling it again replaces the handlers it installed earlier. The watchdog's prefix
+    keeps its every-minute runs out of the engine's file (D-082).
     """
 
     def add_timestamp(logger: WrappedLogger, method_name: str, event_dict: EventDict) -> EventDict:
@@ -120,7 +122,7 @@ def configure_logging(
     path: Path | None = None
     if logs_dir is not None:
         logs_dir.mkdir(parents=True, exist_ok=True)
-        path = logs_dir / f"{clock.now():%Y-%m-%d}.jsonl"
+        path = logs_dir / f"{prefix}{clock.now():%Y-%m-%d}.jsonl"
         file_handler = logging.FileHandler(path, encoding="utf-8")
         file_handler.set_name(f"{_HANDLER_PREFIX}json")
         file_handler.setFormatter(formatter(structlog.processors.JSONRenderer()))

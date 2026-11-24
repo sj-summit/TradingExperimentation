@@ -19,6 +19,7 @@ from tests.fixtures.journal_days import (
     add_long,
     add_session,
     add_trade,
+    add_unattended_run,
     journal,
     sessions,
 )
@@ -55,17 +56,21 @@ def epoch_days(
     a_day: str = "0.50",
     b_day: str = "0.60",
     modes: Sequence[str] | None = None,
+    unattended: bool = False,
 ) -> list[date]:
     """``n`` sessions of triggered longs, ``allowed`` (ranks 1 up) and ``vetoed`` (ranks 16 up)
     by Book B, their shadow Rs negated on every other day when ``alternate``.
 
     Both books trade the first allowed long at ``b_trade``'s R and P&L; Book A also trades the
-    first vetoed one, at ``a_vetoed``'s. The books' days move by ``a_day`` and ``b_day``."""
+    first vetoed one, at ``a_vetoed``'s. The books' days move by ``a_day`` and ``b_day``.
+    With ``unattended``, each session ran from the scheduler and nobody touched it."""
     days = sessions(date(2026, 1, 5), n)
     equity = {"A": Decimal(1000), "B": Decimal(1000)}
     for k, day in enumerate(days):
         sign = -1.0 if alternate and k % 2 else 1.0
         add_session(conn, day)
+        if unattended:
+            add_unattended_run(conn, day)
         for j, r in enumerate(allowed):
             add_long(conn, day, f"AL{j}", shadow_r=sign * r, verdict="allow", rank=j + 1)
         for j, r in enumerate(vetoed):
@@ -135,11 +140,11 @@ def test_the_minimum_data_is_met_exactly_at_60_days_150_longs_and_20_vetoes(
 def test_enough_data_with_vetoes_that_help_passes_what_code_can_check(
     conn: sqlite3.Connection,
 ) -> None:
-    days = epoch_days(conn, 62)
+    days = epoch_days(conn, 62, unattended=True)
     m = build_memo(conn, through=days[-1], cfg=CFG)
     v = verdicts(m)
     assert (m.days, m.triggered, m.vetoes, m.minimum_met) == (62, 248, 62, True)
-    assert (v["H1"], v["H2"], v["1"], v["2"], v["3"]) == ("pass",) * 5
+    assert (v["H1"], v["H2"], v["1"], v["2"], v["3"], v["4"]) == ("pass",) * 6
     assert m.hypotheses[0].numbers.startswith("V +2.000 R, 90% interval [")
     assert m.hypotheses[1].numbers == (
         "B - A +1.000 R per trade, 90% interval [+1.000, +1.000]; B n 62, A n 124"
@@ -147,7 +152,9 @@ def test_enough_data_with_vetoes_that_help_passes_what_code_can_check(
     assert m.criteria[1].numbers == "+1.650 R over 62 trades"  # (2.00 - 0.02) / (10 x 0.12)
     assert m.criteria[2].numbers == "0.00%"
     assert m.outcome == "the criteria code can check pass"
-    assert m.criteria[3].numbers.endswith("the longest P1-free run of sessions is 62")
+    assert m.criteria[3].numbers == (
+        "longest unattended run without a P1: 62 sessions; 62 of 62 sessions unattended"
+    )
 
 
 @pytest.mark.parametrize(
@@ -234,16 +241,45 @@ def test_a_narrow_interval_around_zero_after_90_days_is_an_answer(
     assert m.outcome == "H1 fails, Book A positive"
 
 
-def test_a_p1_breaks_the_unattended_run(conn: sqlite3.Connection) -> None:
-    days = epoch_days(conn, 30)
+@pytest.mark.parametrize(
+    ("p1_on", "longest", "verdict"),
+    [(9, 20, "pass"), (10, 19, "insufficient data")],
+    ids=["20 clean after it", "19 clean, too few sessions to fail"],
+)
+def test_a_p1_breaks_the_unattended_run(
+    conn: sqlite3.Connection, p1_on: int, longest: int, verdict: str
+) -> None:
+    days = epoch_days(conn, 30, unattended=True)
     conn.execute(
         "INSERT INTO incidents (ts, severity, component, code, message) VALUES (?, 'P1', 'x', "
         "'p1', 'm')",
-        (f"{days[9].isoformat()}T10:00:00-05:00",),
+        (f"{days[p1_on].isoformat()}T10:00:00-05:00",),
     )
     m = build_memo(conn, through=days[-1], cfg=CFG)
-    assert m.criteria[3].numbers.endswith("the longest P1-free run of sessions is 20")
-    assert m.criteria[3].verdict == "insufficient data"  # never pass before Phase 6
+    assert m.criteria[3].numbers == (
+        f"longest unattended run without a P1: {longest} sessions; 30 of 30 sessions unattended"
+    )
+    assert m.criteria[3].verdict == verdict
+
+
+def test_criterion_4_fails_without_20_clean_sessions_in_60(conn: sqlite3.Connection) -> None:
+    days = epoch_days(conn, 62)  # run by hand: none counts as unattended
+    m = build_memo(conn, through=days[-1], cfg=CFG)
+    assert (m.criteria[3].verdict, m.criteria[3].numbers) == (
+        "fail",
+        "longest unattended run without a P1: 0 sessions; 0 of 62 sessions unattended",
+    )
+    assert m.outcome == "criteria not met"  # 1-3 pass, but the outcome needs 1-4
+
+
+def test_a_session_with_no_run_breaks_the_streak(conn: sqlite3.Connection) -> None:
+    days = epoch_days(conn, 25, unattended=True)
+    conn.execute("UPDATE trading_days SET run_status = NULL WHERE date = ?", (days[5].isoformat(),))
+    conn.execute("DELETE FROM day_runs WHERE date = ?", (days[5].isoformat(),))
+    m = build_memo(conn, through=days[-1], cfg=CFG)
+    assert m.criteria[3].numbers == (
+        "longest unattended run without a P1: 19 sessions; 24 of 25 sessions unattended"
+    )
 
 
 # ---------------------------------------------------------------- H3 and H4

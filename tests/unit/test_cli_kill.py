@@ -176,3 +176,71 @@ def test_flatten_after_hours_keeps_a_stop_and_raises_a_p1(
     incident = conn.execute("SELECT severity, code FROM incidents").fetchone()
     conn.close()
     assert incident == ("P1", "not_flat")
+
+
+def humans(repo: Path) -> list[tuple[str, str]]:
+    conn = sqlite3.connect(repo / "runtime" / "trader.db")
+    rows = conn.execute("SELECT date, name FROM day_runs WHERE kind = 'human' ORDER BY id")
+    out = [(r[0], r[1]) for r in rows.fetchall()]
+    conn.close()
+    return out
+
+
+def test_each_command_marks_the_session_as_touched(
+    setup: tuple[Path, JumpClock, SimBroker],
+) -> None:
+    """P6.1b (D-081): a session a person touched isn't unattended (S§8 criterion 4)."""
+    repo, _, _ = setup
+    assert trader(repo, "halt", "--book", "A")[0] == 0
+    assert trader(repo, "resume", "--book", "A", stdin="no\n")[0] == 1  # nothing lifted
+    assert trader(repo, "resume", "--book", "A", stdin="RESUME A\n")[0] == 0
+    assert trader(repo, "flatten", "--book", "A")[0] == 0
+    day = MARKET.date().isoformat()
+    assert humans(repo) == [(day, "trader halt"), (day, "trader resume"), (day, "trader flatten")]
+
+
+def test_flatten_halts_before_any_network(
+    setup: tuple[Path, JumpClock, SimBroker], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The emergency stop's halt lands even when the calendar can't be fetched (D-083)."""
+    from trader.data.alpaca_rest import AlpacaError
+
+    repo, _, sim = setup
+    closed: list[bool] = []
+    real_close = sim.aclose
+
+    async def close() -> None:
+        closed.append(True)
+        await real_close()
+
+    async def down(start: date, end: date) -> list[dict[str, str]]:
+        raise AlpacaError(503, "calendar unavailable", "/v2/calendar")
+
+    monkeypatch.setattr(sim, "aclose", close)
+    monkeypatch.setattr(FakeRest, "calendar", lambda self, start, end: down(start, end))
+    code, out = trader(repo, "flatten", "--book", "all")
+    assert code == 1
+    assert "calendar unavailable" in out
+    assert (active(repo, "A"), active(repo, "B")) == (["manual"], ["manual"])
+    assert len(closed) == 2  # each book's broker is closed, whatever failed
+
+
+def test_one_books_missing_keys_dont_stop_the_others_flatten(
+    setup: tuple[Path, JumpClock, SimBroker], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from trader.execution.broker import BrokerAuthError
+
+    repo, _, sim = setup
+
+    def broker(_cfg: object, book: str, _clock: object) -> SimBroker:
+        if book == "B":
+            raise BrokerAuthError("no keys for Book B in .env (ALPACA_PAPER_B_*)")
+        return sim
+
+    monkeypatch.setattr(alpaca_broker.AlpacaBroker, "from_config", broker)
+    code, out = trader(repo, "flatten", "--book", "all")
+    assert code == 1
+    assert "Book B: halted, but not flattened: no keys for Book B" in out
+    assert "Book A: flat and halted." in out
+    assert asyncio.run(sim.positions()) == []
+    assert (active(repo, "A"), active(repo, "B")) == (["manual"], ["manual"])

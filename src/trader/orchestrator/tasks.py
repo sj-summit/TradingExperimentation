@@ -60,8 +60,10 @@ class EquityTrack:
 
 
 class Heartbeat:
-    """Writes ``heartbeat.json`` (``{ts, state, books: {A: {halted, halts, positions}},
-    hub_age_s}``) for the watchdog, and samples each book's marked equity on every beat."""
+    """Writes ``heartbeat.json`` (``{ts, state, pid, books: {A: {halted, halts, positions,
+    flattening}}, hub_age_s}``) for the watchdog, and samples each book's marked equity on every
+    beat. ``pid`` names the process for the RUNBOOK's fire drill; ``flattening`` stands the
+    watchdog's stop check aside while a flatten pass works on the book (D-083)."""
 
     def __init__(
         self,
@@ -85,11 +87,17 @@ class Heartbeat:
             track = self.tracks.setdefault(name, EquityTrack(peak=exposure.equity_sod))
             track.sample(exposure.ledger_equity)
             lasting = [h.reason for h in await self._halts.active(name) if h.scope != "marker"]
-            books[name] = {"halted": bool(lasting), "halts": lasting, "positions": service.held}
+            books[name] = {
+                "halted": bool(lasting),
+                "halts": lasting,
+                "positions": service.held,
+                "flattening": service.flattening,
+            }
         age = self._hub_age()
         record = {
             "ts": fmt_iso(self._clock.now()),
             "state": self._state(),
+            "pid": os.getpid(),
             "books": books,
             "hub_age_s": None if math.isinf(age) else round(age, 1),
         }
@@ -97,13 +105,33 @@ class Heartbeat:
         return record
 
     def _write(self, record: Mapping[str, Any]) -> None:
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            partial = self._path.with_name(self._path.name + ".partial")
-            partial.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
-            os.replace(partial, self._path)  # readers never see half a file
-        except OSError as exc:  # e.g. the watchdog has it open on Windows: next beat
-            log.warning("heartbeat not written", error=str(exc))
+        write_heartbeat(self._path, record)
+
+
+def write_heartbeat(path: Path, record: Mapping[str, Any]) -> None:
+    """Replace ``heartbeat.json`` atomically; a failed write waits for the next beat."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        partial = path.with_name(path.name + ".partial")
+        partial.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+        os.replace(partial, path)  # readers never see half a file
+    except OSError as exc:  # e.g. the watchdog has it open on Windows: next beat
+        log.warning("heartbeat not written", error=str(exc))
+
+
+def boot_beat(clock: Clock, books: Iterable[BookName]) -> dict[str, Any]:
+    """The beat written as BOOT begins (D-083): a restart mid-session would otherwise look
+    dead to the watchdog until every book has started. Its books are the ones it will run."""
+    return {
+        "ts": fmt_iso(clock.now()),
+        "state": "BOOT",
+        "pid": os.getpid(),
+        "books": {
+            name: {"halted": False, "halts": [], "positions": {}, "flattening": False}
+            for name in sorted(books)
+        },
+        "hub_age_s": None,
+    }
 
 
 # ---------------------------------------------------------------- data staleness (R§5)

@@ -66,7 +66,14 @@ from trader.orchestrator.llm_jobs import BookBJobs, LlmDeps
 from trader.orchestrator.packs import PackContext
 from trader.orchestrator.plan import DayPlan, day_plan
 from trader.orchestrator.ports import DayMarket, Hub
-from trader.orchestrator.tasks import Heartbeat, StaleWatch, Subscriptions, every
+from trader.orchestrator.tasks import (
+    Heartbeat,
+    StaleWatch,
+    Subscriptions,
+    boot_beat,
+    every,
+    write_heartbeat,
+)
 from trader.reports.daily import build_daily, write_daily
 from trader.risk.breakers import BookStats, Halts
 from trader.risk.gate import RiskGate
@@ -90,6 +97,9 @@ MAX_CLOCK_SKEW_S = 2.0  # RISK.md §9
 CLOCK_TRIES = 3  # a reading out of tolerance is taken again; the shortest round trip counts
 FLATTEN_PASS = timedelta(seconds=60)
 AFTER_CLOSE_TRIES = 6  # the after-close pass, every flatten_retry_s, before a P1 not_flat
+WATCHDOG_CHECK_S = 60.0  # how often the engine looks for the watchdog's last run (D-083)
+WATCHDOG_GRACE = timedelta(minutes=10)  # from the open, before a silence counts
+WATCHDOG_SILENT = timedelta(minutes=10)  # the watchdog runs every minute
 EOD_RETRY = timedelta(seconds=30)  # a failed EOD is retried...
 EOD_RETRY_WINDOW = timedelta(minutes=7)  # ...until the shadow time, or this long on a rerun
 CALENDAR_SLICE = timedelta(days=45)  # boot.json keeps this much calendar around the day
@@ -139,6 +149,9 @@ class DayDeps:
     capabilities: frozenset[str] = CURRENT  # a replay grants only its recording's (D-055)
     llm: LlmDeps | None = None  # Book B's runner and packs: required when B is among the brokers
     book_b_off: str | None = None  # why Book B isn't running today (--no-llm, ...), for the report
+    # the watchdog's last run, read from its status file: live only, and only once the schedule
+    # runs a watchdog (D-083). None in replays and tests, so they never see watchdog_silent.
+    watchdog_status: Callable[[], datetime | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -184,6 +197,7 @@ class DayOrchestrator:
         self._assets: dict[str, Asset] = {}
         self._skew = False
         self._skew_alerted = False
+        self._watchdog_quiet = False  # watchdog_silent raised for this silence
         self._failed: list[State] = []  # states after the flatten that raised (D-051)
         self._inputs: LiveInputs | None = None
         self._jobs: BookBJobs | None = None  # Book B's LLM work, when it runs
@@ -254,6 +268,7 @@ class DayOrchestrator:
     async def _boot(self) -> None:
         await self._enter("BOOT")
         d, plan = self._d, self.plan
+        write_heartbeat(d.paths.heartbeat, boot_beat(self._clock, d.brokers))  # D-083
         last_chance = self._clock.now() >= plan.times.flatten  # no re-check before a scan
         self._skew = await self._clock_skewed(final=last_chance)
         if self._clock.now() < plan.times.flatten and d.ensure_universe is not None:
@@ -326,6 +341,8 @@ class DayOrchestrator:
         self._spawn(every(self._clock, cadence.heartbeat_s, self._heartbeat.beat, name="heartbeat"))
         self._spawn(every(self._clock, cadence.pump_s, self._pump, name="alerts"))
         self._spawn(every(self._clock, cadence.stale_check_s, stale.check, name="staleness"))
+        if d.watchdog_status is not None:
+            self._spawn(every(self._clock, WATCHDOG_CHECK_S, self._watch_watchdog, name="watchdog"))
         if SKEW_HOURLY in d.capabilities:
             self._spawn(self._hourly_skew())
         await d.hub.start()
@@ -1217,6 +1234,27 @@ class DayOrchestrator:
 
     def _spawn(self, job: Coroutine[Any, Any, None]) -> None:
         self._tasks.append(asyncio.create_task(job))
+
+    async def _watch_watchdog(self) -> None:
+        """The engine watches the watchdog back (D-083): with the schedule installed, a
+        watchdog that hasn't run for 10 minutes during the session is a P2, once per silence."""
+        read = self._d.watchdog_status
+        if read is None or self._plan is None:
+            return
+        now, times = self._clock.now(), self._plan.times
+        if not times.open + WATCHDOG_GRACE <= now < times.close:
+            return
+        last = read()
+        quiet = last is None or now - last > WATCHDOG_SILENT
+        if quiet and not self._watchdog_quiet:
+            since = "today" if last is None else f"since {last:%Y-%m-%d %H:%M}"
+            await self._incident(
+                "P2",
+                "watchdog_silent",
+                f"the watchdog hasn't run {since}: is its task still enabled? "
+                "(`trader schedule show`)",
+            )
+        self._watchdog_quiet = quiet
 
     async def _kill_flatten(self) -> bool:
         """The kill switch: flatten every book; True once all are flat."""

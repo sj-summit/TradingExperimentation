@@ -50,6 +50,21 @@ def add_session(conn: sqlite3.Connection, day: date, close: time = CLOSE) -> Non
     )  # fmt: skip
 
 
+def add_unattended_run(conn: sqlite3.Connection, day: date) -> None:
+    """What a scheduled run-day that nobody touched leaves (P6.1b): one BOOT, the ``scheduled``
+    note and DONE. Both books' ``daily_stats`` rows come from ``add_book_day``."""
+    conn.execute(
+        "INSERT INTO day_runs (date, kind, name, at) VALUES (?, 'state', 'BOOT', ?)",
+        (day.isoformat(), fmt_iso(at(day, "08:30"))),
+    )
+    conn.execute(
+        "INSERT INTO day_runs (date, kind, name, at, detail) VALUES (?, 'note', 'scheduled', ?, "
+        "'A,B')",
+        (day.isoformat(), fmt_iso(at(day, "08:25:01"))),
+    )
+    conn.execute("UPDATE trading_days SET run_status = 'DONE' WHERE date = ?", (day.isoformat(),))
+
+
 def add_long(
     conn: sqlite3.Connection,
     day: date,

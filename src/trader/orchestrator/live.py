@@ -23,6 +23,7 @@
 
 import asyncio
 import hashlib
+import json
 import os
 import sqlite3
 from collections.abc import Callable, Mapping
@@ -44,7 +45,7 @@ from trader.core.calendar import (
     default_sync_range,
     sync_calendar,
 )
-from trader.core.clock import ET, Clock, RealClock
+from trader.core.clock import ET, Clock, RealClock, fmt_iso, parse_et_iso
 from trader.core.events import EVENTS_FILE, load_events
 from trader.core.logging import configure_logging, shutdown_logging
 from trader.core.models import Quote, Trade
@@ -77,14 +78,20 @@ from trader.llm.smoke import cli_version
 from trader.memory.incidents import record_incident
 from trader.memory.journal import Journal
 from trader.memory.reviews import DailyReviewWork
+from trader.memory.unattended import note_human
 from trader.notify import notifier_from_config
+from trader.ops.power import keep_awake
+from trader.ops.schedule_cmds import installed
 from trader.orchestrator.day import DayDeps, DayOrchestrator, DayPaths
+from trader.orchestrator.eod import run_status
 from trader.orchestrator.evidence import EvidenceDesk
+from trader.orchestrator.heartbeat import heartbeat_path
 from trader.orchestrator.llm_jobs import LlmDeps
 from trader.orchestrator.lock import LOCK_NAME, RunLock
 from trader.orchestrator.packs import PackFactory, live_packs, recording_packs
 from trader.orchestrator.ports import DayMarket, FilingsPort
 from trader.orchestrator.provenance import source_sha256
+from trader.orchestrator.watchdog import STATUS_NAME
 from trader.risk.killswitch import KILL_FILE
 
 log = structlog.get_logger(__name__)
@@ -110,6 +117,7 @@ class RunOptions:
     sim: bool = False
     dry_run: bool = False
     no_llm: bool = False  # Book B off for the day (plan decision 9)
+    scheduled: bool = False  # started by the OS scheduler (Phase 6): the session may be unattended
 
 
 def book_b_off(cfg: AppConfig, opts: RunOptions) -> str | None:
@@ -148,7 +156,7 @@ def folders(cfg: AppConfig, day: date, *, sim: bool) -> Folders:
             recordings=cfg.path(storage.recordings_dir),
             reports=cfg.path(storage.reports_dir),
             backups=db.parent / "backups",
-            heartbeat=db.parent / "heartbeat.json",
+            heartbeat=heartbeat_path(db),
             lock=db.parent / LOCK_NAME,
             llm_sandbox=cfg.path(cfg.settings.llm.sandbox_dir),
             llm_artifacts=cfg.path(storage.llm_artifacts_dir),
@@ -193,6 +201,8 @@ async def run_day(root: Path, opts: RunOptions, echo: Echo, *, clock: Clock | No
         if not calendar.is_trading_day(today):
             echo(f"{today} is not a trading day: nothing to do")
             return
+        if not (opts.sim or opts.dry_run):
+            await _note_start(journal, clock, today, scheduled=opts.scheduled, books=books)
         if opts.sim:
             await _copy_universe(cfg.path(cfg.settings.storage.db_path), where.db, today, journal)
         recorder = None if opts.dry_run else Recorder(where.recordings, today)
@@ -262,6 +272,7 @@ async def run_day(root: Path, opts: RunOptions, echo: Echo, *, clock: Clock | No
             boot_info=_boot_info(root, opts),
             llm=llm,
             book_b_off=off,
+            watchdog_status=None if (opts.sim or opts.dry_run) else _watchdog_status(root, where),
         )
         orchestrator = DayOrchestrator(deps)
         if opts.dry_run:
@@ -272,10 +283,45 @@ async def run_day(root: Path, opts: RunOptions, echo: Echo, *, clock: Clock | No
             f"run-day {today}: Book {', '.join(books)}{' (sim)' if opts.sim else ''}; "
             f"logs in {where.logs}"
         )
-        outcome = await orchestrator.run()
+        with keep_awake():  # the PC mustn't sleep while a session runs (RISK.md section 9)
+            outcome = await orchestrator.run()
         echo(
             f"run-day {outcome.day}: {outcome.state}{' - ' + outcome.note if outcome.note else ''}"
         )
+
+
+def _watchdog_status(root: Path, where: Folders) -> Callable[[], datetime | None] | None:
+    """The watchdog's last run, read from ``runtime/watchdog.json``, when the installed schedule
+    runs one (D-083); None otherwise, so no watchdog_silent before G6a."""
+    tasks = (installed(root) or {}).get("tasks")
+    if not isinstance(tasks, dict) or not any(str(t).endswith(r"\watchdog") for t in tasks):
+        return None
+    status = where.db.parent / STATUS_NAME
+
+    def last_run() -> datetime | None:
+        try:
+            return parse_et_iso(str(json.loads(status.read_text(encoding="utf-8"))["ts"]))
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    return last_run
+
+
+async def _note_start(
+    journal: Journal, clock: Clock, day: date, *, scheduled: bool, books: tuple[BookName, ...]
+) -> None:
+    """Who started the session (P6.1b; DECISIONS D-081): the scheduler's run leaves a
+    ``scheduled`` note, a run started by hand a ``human`` row. A session already DONE gets
+    neither: run-day then does nothing, so it touches nothing."""
+    if await run_status(journal, day) == "DONE":
+        return
+    if not scheduled:
+        await note_human(journal, clock, "trader run-day")
+        return
+    await journal.execute(
+        "INSERT INTO day_runs (date, kind, name, at, detail) VALUES (?, 'note', 'scheduled', ?, ?)",
+        (day.isoformat(), fmt_iso(clock.now()), ",".join(books)),
+    )
 
 
 async def _brokers(

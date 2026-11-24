@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+from trader.ops.containment import KillOnCloseJob
+
 MAX_STDOUT_BYTES = 4 * 1024 * 1024  # a review's answer runs to tens of KB
 STDERR_TAIL_BYTES = 16 * 1024
 SHIMS = frozenset({".cmd", ".bat", ".ps1"})
@@ -206,10 +208,14 @@ class ClaudeCliTransport:
         max_stdout_bytes: int = MAX_STDOUT_BYTES,
         stderr_tail_bytes: int = STDERR_TAIL_BYTES,
         on_spawn: Callable[[asyncio.subprocess.Process], None] | None = None,
+        job: KillOnCloseJob | None = None,
     ) -> None:
         self._grace = kill_grace_s
         self._max_stdout, self._tail = max_stdout_bytes, stderr_tail_bytes
         self._on_spawn = on_spawn
+        # Each child joins a job that dies with this process, so a killed engine leaves no
+        # claude call running (D-083). Held for the transport's life, never closed by it.
+        self._job = job if job is not None else KillOnCloseJob()
 
     async def run(
         self,
@@ -222,6 +228,7 @@ class ClaudeCliTransport:
     ) -> TransportResult:
         started = time.monotonic()
         proc = await _spawn(argv, env=env, cwd=cwd)
+        self._job.assign(proc.pid)
         if self._on_spawn is not None:
             self._on_spawn(proc)
         assert proc.stdin is not None
