@@ -1290,6 +1290,96 @@ def schedule_probe(ctx: typer.Context) -> None:
     raise typer.Exit(schedule_cmds.probe(ctx.obj, typer.echo))
 
 
+@app.command()
+def backup(
+    ctx: typer.Context,
+    to: Annotated[
+        Path | None,
+        typer.Option(
+            "--to",
+            help="Write the copy into this folder instead, which must exist; nothing there is "
+            "pruned.",
+        ),
+    ] = None,
+) -> None:
+    """Back the journal up now: a checked, self-contained copy as today's in runtime/backups,
+    db_backups_keep kept, and copied to storage.backup_copy_dir if set. Exits 1 if the copy
+    failed."""
+    if to is not None and not to.is_dir():
+        typer.echo(f"error: --to: {to} doesn't exist", err=True)
+        raise typer.Exit(1)
+    _run(_backup(ctx.obj, to))
+
+
+async def _backup(root: Path, to: Path | None) -> None:
+    from trader.ops.backup import backup_name, backups_dir, take_backup
+    from trader.ops.disk import size_text
+    from trader.runtime import open_local
+
+    async with open_local(root) as local:
+        storage = local.cfg.settings.storage
+        today = local.clock.now().date()
+        if to is not None:  # checked to exist above
+            dest = to / backup_name(today)
+            await local.journal.backup(dest)
+            typer.echo(f"backup: {dest} ({size_text(dest.stat().st_size)})")
+            return
+        copy_dir = storage.backup_copy_dir
+        taken = await take_backup(
+            local.journal,
+            folder=backups_dir(local.cfg.path(storage.db_path)),
+            day=today,
+            keep=storage.db_backups_keep,
+            copy_dir=None if copy_dir is None else local.cfg.path(copy_dir),
+        )
+        typer.echo(f"backup: {taken.path} ({size_text(taken.size)})")
+        for old in (*taken.pruned.removed, *taken.copy_pruned.removed):
+            typer.echo(f"pruned: {old}")
+        for problem in (*taken.pruned.problems, *taken.copy_pruned.problems):
+            typer.echo(f"not pruned: {problem}")
+        if taken.copy is not None:
+            typer.echo(f"copied to {taken.copy}")
+        if taken.copy_error is not None:
+            typer.echo(f"not copied to storage.backup_copy_dir: {taken.copy_error}")
+            raise typer.Exit(1)
+
+
+@app.command()
+def retention(
+    ctx: typer.Context,
+    apply: Annotated[
+        bool, typer.Option("--apply", help="Delete them; without it, only list them.")
+    ] = False,
+) -> None:
+    """List the logs, simulated and replayed days, recordings and LLM artifacts that retention
+    deletes (storage.retention_days; recordings and LLM artifacts also stay through the current
+    epoch). run-day applies it after each finished day. Exits 1 if any could not be deleted."""
+    _run(_retention(ctx.obj, apply=apply))
+
+
+async def _retention(root: Path, *, apply: bool) -> None:
+    from trader.ops import retention as rules
+    from trader.ops.disk import size_text
+    from trader.runtime import open_local
+
+    async with open_local(root) as local:
+        plan = await rules.plan_retention(local.cfg, local.journal, local.clock.now().date())
+        for line in rules.describe(plan, local.cfg.root):
+            typer.echo(line)
+        if not plan.expired:
+            return
+        if not apply:
+            typer.echo("dry run: nothing deleted; `trader retention --apply` deletes them")
+            return
+        done = await asyncio.to_thread(rules.apply, plan)
+        typer.echo(f"deleted {len(done.removed)} ({size_text(done.freed)})")
+        failed = rules.failures(done, local.cfg.root)
+        for line in failed:
+            typer.echo(f"could not delete {line}")
+        if failed:
+            raise typer.Exit(1)
+
+
 @app.command("weekly-job")
 def weekly_job(ctx: typer.Context) -> None:
     """The Saturday job (A§1): `lessons evaluate --promote`, then `report weekly`. Each runs even

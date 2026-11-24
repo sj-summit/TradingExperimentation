@@ -3422,6 +3422,89 @@ Append-only. Each entry records context, the decision, its consequences, and sou
   - **PLAN:** P6.2b ticked; STATUS.
 - **Verified:** 1,811 tests pass (1,810 in the full run, and one added during it, run with its file); ruff, its formatter and mypy are clean. The goldens (A+B, Book A, G3, G4b) and the daily report are unchanged.
 
+## D-084 — P6.3: backups checked and self-contained, a copy folder, `trader backup`, retention, and `disk_low`
+- **Date:** 2026-11-24 · **Status:** Accepted (the Phase 6 plan's decisions 19–22).
+- **A backup kept the journal's WAL flag, and a stray `-wal` can rewrite a backup.**
+  - SQLite's online backup copies page 1 with its header, so a copy of a WAL database is a WAL database. Whoever opened one later got `-wal` and `-shm` files beside it: `runtime/backups/` holds them for the October backups.
+  - **An experiment on this PC** (SQLite 3.53.1, Python 3.12.15):
+    - a plain backup's header reads file format versions 2/2 (WAL). `PRAGMA journal_mode = DELETE` on the copy's own connection, right after the backup, makes them 1/1, and the copy then opens without making any file beside it;
+    - **SQLite applies a `-wal` it finds beside a database, whatever file left it there.** A `-wal` written by another database, put beside a copy in rollback mode, made the copy read the other database's table, and was checkpointed into it.
+  - So a new backup replacing an old one of the same name (a rerun the same day, or `trader backup`) could be turned into something else by the old copy's `-wal`.
+- **`Journal.backup` (`write_backup`) now:**
+  1. backs up into a uniquely named `.partial` beside the target;
+  2. switches the copy to `journal_mode = DELETE`, and closes it;
+  3. opens it again (`check_copy`): it must read `journal_mode` delete, pass `quick_check`, and leave no `-wal`, `-shm` or `-journal` beside it. A copy too broken to read at all fails as "unreadable" rather than raising;
+  4. deletes any `-wal`, `-shm` or `-journal` beside the target;
+  5. `os.replace`s the `.partial` onto the target.
+
+  Anything that fails removes the `.partial` and leaves the target as it was.
+- **Pruning** (`ops/backup.py`) keeps the newest `db_backups_keep` (30) by the date in the name.
+  - A pruned backup goes with the files beside it. Such a file whose backup is gone goes too, and so does a `.partial` an interrupted backup left (`trader-<date>.db.<12 hex>.partial`).
+  - A kept backup's side files stay: an old copy may need its `-wal`.
+  - Only those exact names are touched, never a link, nothing below the folder. A file that won't go is logged, and the rest still go.
+- **`storage.backup_copy_dir`** (optional, default null, so the human's `settings.yaml` needs no edit):
+  - **Each backup is copied there** byte for byte: to a `.partial`, flushed to the disk, read back and compared by SHA-256, then moved into place once an older copy's side files are deleted. The folder is pruned the same way.
+  - **The folder must exist; it is never made.** A missing folder is a drive not connected (a USB disk), and making it would put the copy wherever that drive letter now points.
+  - **A network share is refused** when the config loads (`\\server\share`, `//server/share`): the tasks run under S4U, which reaches none (D-080).
+  - **Doctor's new `backup.copy` line** fails a mapped network drive (`GetDriveTypeW` returns `DRIVE_REMOTE`), a missing folder or one it can't write to, and skips when the setting is unset. `schedule check`'s probe runs doctor as the task's account, so it is the P6.1a plan's "write test of `backup_copy_dir`".
+  - **Only a live paper day names the folder** (`DayPaths.backup_copy`), never `--sim` or a replay: their copies would take the real day's name (`trader-<date>.db`). The orchestrator never reads the setting itself, since a replay runs on the recorded settings.
+- **A failed backup is now a P2 `backup_failed`** (D-055 logged it only).
+  - The message is "the database backup failed (…): the previous backups are kept", or "the backup was taken, but not copied to storage.backup_copy_dir: …".
+  - It names the setting, never a path: alerts are pushed.
+  - A prune that fails is logged only.
+  - The test that asserted no incident now asserts the P2, as the plan said.
+- **After the orchestrator returns, `live.run_day`:**
+  - **applies retention** on a paper day that ended DONE (never `--sim`), in a worker thread. What won't go is a P3 `retention_failed` naming up to three entries.
+  - **pumps the alerts once more,** paper or `--sim`, whatever the outcome. The orchestrator's last pump is at 16:30, before DONE and the backup, so a Friday's `backup_failed` would otherwise wait for Monday's engine.
+- **`disk_low`:** a P2 in the paper path, right after the run's start is noted, when the disk holding the journal has under 2 GiB free (`ops/disk.MIN_FREE_BYTES`, doctor's threshold, now shared). Once a day; the day still runs.
+- **Retention** (`ops/retention.py`; `trader retention [--apply]`, a dry run without `--apply`):
+  - **The rule (`expired`) is pure,** over entries found by the date in their names:
+    - **logs** go once older than `retention_days` (60): `logs/<date>.jsonl`, `logs/watchdog-<date>.jsonl`, `logs/scheduled/<job>-<date>.log`, and the replays' `replay/logs/<date>.jsonl`, which the plan didn't list;
+    - **recordings and LLM artifacts** (`recordings/<date>/`, `llm/<date>/`) go only once that old *and* from before the current epoch began (the human's decision 4). Epoch 0 has no start, so all of them stay until P7.1. `llm/smoke/` is never touched;
+    - **simulated and replayed days** (`sim/<date>/`, `replay/<date>/`) go once that old, **counted from the later of the name and the folder's last change.** This departs from the plan's "date-named entries": a replay's folder is named after the day it replays, so a replay made today of a day 70 days gone would have gone at the next 16:30.
+  - **Safety:**
+    - names must match exactly and be real dates, and a file where a folder belongs (or the reverse) is skipped;
+    - a symlink or junction is never followed or deleted (listed as left alone);
+    - a folder that goes is walked, and a link inside it is removed as a link (`os.unlink`, which on Windows removes a junction or folder link itself), never what it points to;
+    - each entry is checked again just before it goes: its name, its folder, not a link;
+    - errors are collected per entry, and the rest still go.
+  - **What stays:** reports and backups (backups prune themselves). `backtest/`, `edgar/` and `llm_canary/` aren't dated, and are never touched.
+  - **Checked with a real junction on this PC** (`_winapi.CreateJunction`): a dated junction stays, a junction inside a dated folder goes as a link, and the files it pointed to stay. The symlink test skips here: this account may not make symlinks.
+- **`trader backup [--to DIR]`:** today's checked backup in `runtime/backups`, pruned and copied to `backup_copy_dir`; it exits 1 if the copy failed. `--to` writes into an existing folder instead, and prunes nothing there: a folder the human names may hold their own archive.
+  - Neither `trader backup` nor `trader retention` writes a `human` row: neither touches trading.
+- **Tests:**
+  - **the copy,** with the threaded and the inline journal: self-contained (header 1/1, `journal_mode` delete, nothing beside it while read); the journal itself stays in WAL; a failed check keeps the previous copy; files beside the old copy go before the replace; no `.partial` after a failure;
+  - **the check, on real files:** a copy left in WAL; one `quick_check` faults (a page nothing uses, counted in the header); one too broken to read (page 2's type byte); one with a file beside it;
+  - **pruning:** exact names, side files and partials, a file that won't go, a missing folder;
+  - **the copy folder:** filled and pruned; never made; a read-back that doesn't match is refused; an older copy's side files replaced;
+  - **the engine:** a failed backup after DONE is a P2; the day's backup is copied; a missing copy folder is a P2, and the backup stands;
+  - **run-day:**
+    - retention after DONE, then the pump;
+    - nothing deleted after an unfinished day, though the pump still runs;
+    - a delete that fails is a P3;
+    - `disk_low` once a day, not in a dry run, and not at exactly 2 GiB;
+    - the copy folder named on paper only, and a simulated day applying no retention;
+  - **retention:**
+    - the rule: 60 days exactly, epoch 0, an epoch's start, an epoch begun lately, a replay made lately, simulated and replayed days ignoring the epoch, links;
+    - the survey's exact names, and the last change of simulated and replayed days (not of recordings);
+    - junctions and symlinks;
+    - failures collected, and an entry outside its rule's folder or not matching its name left alone;
+    - the epoch read from the journal;
+    - the command's dry run and `--apply`;
+  - **doctor's `backup.copy`,** and the config's local-folder rule;
+  - **the disk** (`test_disk.py`): one threshold for doctor and run-day, free space read from the nearest folder that exists, binary units, shares and this PC's own disk.
+- **A mutation check** (as P5.5's and P6.2's): 53 mutants plus the identity control. They cover the retention rule, the survey and its deletes, pruning and the copy folder, the checked copy, the engine's and run-day's wiring, doctor's `backup.copy`, the config's local-folder rule, the epoch's start, and the disk helpers.
+  - **Results:** all 53 are caught, and the identity control survives.
+  - **Tests strengthened while planning the mutants, before any ran:**
+    - an entry outside its rule's folder now exists, so a missing re-check would delete it;
+    - the LLM artifacts' epoch protection, and a simulated day's last change, are asserted;
+    - a simulated day must apply no retention;
+    - `disk_low` is checked at exactly 2 GiB;
+    - `quick_check`'s own faults are checked on real files, not only through a replaced check.
+  - **The last of these found a defect:** `check_copy` raised on a copy too broken to read, instead of returning the problem. A backup still failed safely as a P2, but the check now reports "unreadable".
+- **Spec updates:** A§2, §3 (16:30), §4.8, §4.11, §9 and §11; RISK §9 (disk, backups) and §11 (`backup_failed`, `disk_low`, `retention_failed`); CLAUDE.md's commands; `settings.example.yaml` (`backup_copy_dir: null`); PLAN.
+- **Verified:** 1878 tests pass, and the symlink test skips; ruff, its formatter and mypy are clean. The goldens (A+B, Book A, G3, G4b) and the daily report are unchanged.
+
 ## Open questions to resolve during the build (record answers as new entries)
 
 - **Q1 (P1.2):** Is Alpaca's `movers` (top market movers) endpoint available on the free plan? If not, use the IEX snapshot gap scan. **Partly answered: D-024** (the 09:00 scan uses snapshots either way); doctor's `data.movers` check records availability once keys exist. **Answered by doctor on 2026-10-10: available** (`data.movers` PASS; the screener returned 10 gainers).

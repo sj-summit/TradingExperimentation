@@ -23,6 +23,7 @@ from trader.data.ws import StreamError
 from trader.execution.sim_broker import SimBroker
 from trader.llm.claude_cli import ClaudeBinaryError, ClaudeCliTransport
 from trader.llm.replay import LLM_FILE, RecordingTransport
+from trader.memory.incidents import record_incident
 from trader.memory.journal import Journal
 from trader.memory.reviews import DailyReviewWork
 from trader.orchestrator import live
@@ -53,6 +54,12 @@ class FakeRest:
 
     async def __aexit__(self, *exc: object) -> None:
         return None
+
+
+@pytest.fixture(autouse=True)
+def roomy_disk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """run-day raises disk_low under 2 GiB free (D-084): these tests never read the real disk."""
+    monkeypatch.setattr(live, "free_bytes", lambda _path: 100 * 1024**3)
 
 
 @pytest.fixture
@@ -479,6 +486,136 @@ async def test_run_day_keeps_the_pc_awake_while_the_day_runs(
     assert power_calls == []  # a dry run only looks
     await run_day(repo, RunOptions(books=("A",)), print, clock=offline)
     assert power_calls == [0x80000001, 0x80000000]  # held, then cleared
+
+
+class FinishedDays:
+    """Stands in for DayOrchestrator: a day that ends in ``state`` after raising a P2, as a
+    backup that fails after DONE does."""
+
+    def __init__(self, state: str = "DONE") -> None:
+        self.state = state
+
+    def __call__(self, deps: Any) -> Any:
+        state = self.state
+
+        class Day:
+            async def run(self) -> DayOutcome:
+                await record_incident(deps.journal, at=deps.clock.now(), severity="P2",
+                                      component="orchestrator", code="backup_failed",
+                                      message="the database backup failed (test)")  # fmt: skip
+                return DayOutcome(deps.clock.now().date(), state)
+
+        return Day()
+
+
+def make_files(root: Path, *paths: str) -> None:
+    for rel in paths:
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x", encoding="utf-8")
+
+
+async def _alerts(repo: Path) -> list[tuple[str, bool]]:
+    journal = await Journal.open(repo / "runtime" / "trader.db")
+    rows = await journal.fetch_all("SELECT code, alerted_at FROM incidents ORDER BY id")
+    await journal.aclose()
+    return [(r["code"], r["alerted_at"] is not None) for r in rows]
+
+
+async def test_after_done_retention_runs_then_alerts_go_out(
+    repo: Path, offline: SimClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Friday's backup_failed, raised after DONE, doesn't wait for Monday's engine to push it
+    (D-084)."""
+    monkeypatch.setattr(live, "DayOrchestrator", FinishedDays())
+    make_files(
+        repo / "runtime",
+        "logs/2026-08-13.jsonl",  # 61 days before 2026-10-13
+        "logs/2026-08-14.jsonl",  # 60
+        "recordings/2026-08-01/boot.json",  # epoch 0 keeps it
+        "llm/2026-08-01/20260801-vet-01-1.input.json",  # and these
+    )
+    lines: list[str] = []
+    await run_day(repo, RunOptions(books=("A",)), lines.append, clock=offline)
+    assert not (repo / "runtime/logs/2026-08-13.jsonl").exists()
+    assert (repo / "runtime/logs/2026-08-14.jsonl").is_file()
+    assert (repo / "runtime/recordings/2026-08-01/boot.json").is_file()
+    assert (repo / "runtime/llm/2026-08-01/20260801-vet-01-1.input.json").is_file()
+    assert "retention: deleted 1 (1 B)" in lines
+    assert await _alerts(repo) == [("backup_failed", True)]
+
+
+async def test_a_day_that_did_not_finish_keeps_everything_but_still_alerts(
+    repo: Path, offline: SimClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(live, "DayOrchestrator", FinishedDays("REPORT"))
+    make_files(repo / "runtime", "logs/2026-08-13.jsonl")
+    lines: list[str] = []
+    await run_day(repo, RunOptions(books=("A",)), lines.append, clock=offline)
+    assert (repo / "runtime/logs/2026-08-13.jsonl").is_file()
+    assert not any(line.startswith("retention") for line in lines)
+    assert await _alerts(repo) == [("backup_failed", True)]
+
+
+async def test_a_retention_that_fails_is_a_p3(
+    repo: Path, offline: SimClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from trader.ops import retention
+
+    def stuck(_entry: object) -> None:
+        raise PermissionError(13, "The process cannot access the file")
+
+    monkeypatch.setattr(live, "DayOrchestrator", Orchestrators())
+    monkeypatch.setattr(retention, "_remove", stuck)
+    make_files(repo / "runtime", "logs/2026-08-13.jsonl")
+    lines: list[str] = []
+    await run_day(repo, RunOptions(books=("A",)), lines.append, clock=offline)
+    journal = await Journal.open(repo / "runtime" / "trader.db")
+    rows = await journal.fetch_all("SELECT severity, code, message FROM incidents")
+    await journal.aclose()
+    assert [(r["severity"], r["code"]) for r in rows] == [("P3", "retention_failed")]
+    assert "runtime/logs/2026-08-13.jsonl" in rows[0]["message"]
+    assert "retention: 1 could not be deleted (see the log)" in lines
+
+
+async def test_a_low_disk_is_a_p2_before_the_engine_starts(
+    repo: Path, offline: SimClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    days = Orchestrators()
+    monkeypatch.setattr(live, "DayOrchestrator", days)
+    monkeypatch.setattr(live, "free_bytes", lambda _path: 2 * 1024**3)
+    lines: list[str] = []
+    await run_day(repo, RunOptions(books=("A",)), lines.append, clock=offline)
+    assert await _alerts(repo) == []  # 2 GiB is enough
+    monkeypatch.setattr(live, "free_bytes", lambda _path: 1024**3 + 1024**3 // 2)
+    await run_day(repo, RunOptions(books=("A",), dry_run=True), lines.append, clock=offline)
+    assert await _alerts(repo) == []  # a dry run only looks
+    await run_day(repo, RunOptions(books=("A",)), lines.append, clock=offline)
+    await run_day(repo, RunOptions(books=("A",)), lines.append, clock=offline)  # once a day
+    journal = await Journal.open(repo / "runtime" / "trader.db")
+    rows = await journal.fetch_all("SELECT severity, code, message FROM incidents")
+    await journal.aclose()
+    assert [(r["severity"], r["code"]) for r in rows] == [("P2", "disk_low")]
+    assert rows[0]["message"].startswith("only 1.5 GiB free on the disk holding the journal")
+    assert str(repo) not in rows[0]["message"]  # pushed: no local paths
+    assert any("1.5 GiB free" in line for line in lines)
+
+
+async def test_paper_names_the_backup_copy_folder_and_a_simulated_day_never_does(
+    repo: Path, offline: SimClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    days = Orchestrators()
+    monkeypatch.setattr(live, "DayOrchestrator", days)
+    await run_day(repo, RunOptions(books=("A",)), print, clock=offline)
+    assert days.deps[-1].paths.backup_copy is None  # not set
+    copies = repo / "onedrive" / "trader"
+    set_yaml(repo / "config" / "settings.yaml", "storage.backup_copy_dir", str(copies))
+    await run_day(repo, RunOptions(books=("A",)), print, clock=offline)
+    assert days.deps[-1].paths.backup_copy == copies
+    make_files(repo / "runtime", "logs/2026-08-13.jsonl")
+    await run_day(repo, RunOptions(books=("A",), sim=True), print, clock=offline)
+    assert days.deps[-1].paths.backup_copy is None  # its own day's copy would take the name
+    assert (repo / "runtime/logs/2026-08-13.jsonl").is_file()  # nor does it apply retention
 
 
 def test_the_engine_reads_the_watchdog_once_the_schedule_runs_one(repo: Path) -> None:

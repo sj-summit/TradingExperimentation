@@ -75,6 +75,8 @@ This is paper trading only until the human completes the go-live gate in `docs/P
 | The OS schedule (Windows Task Scheduler): `show` changes nothing; `install` and `check` are HUMAN GATE G6a | `uv run trader schedule show` / `install` / `check` / `uninstall` |
 | The Saturday job: `lessons evaluate --promote`, then `report weekly` | `uv run trader weekly-job` |
 | The watchdog, once: the scheduler runs it every minute from 09:25 to 16:05 ET | `uv run trader watchdog` |
+| A checked backup of the journal now (`--to` an existing folder instead) | `uv run trader backup [--to DIR]` |
+| What retention would delete under `runtime/`; only `--apply` deletes (run-day applies it after each finished day) | `uv run trader retention [--apply]` |
 | Emergency stop | `uv run trader halt --flatten --book all` |
 
 ## Repo map (target; details in ARCHITECTURE.md §2)

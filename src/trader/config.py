@@ -13,6 +13,7 @@ from typing import Annotated, Literal
 
 import yaml
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -242,6 +243,17 @@ class FeesConfig(_Model):
     finra_taf_max_per_trade: Dec = Field(ge=0)
 
 
+def _local_folder(path: Path | None) -> Path | None:
+    """The backup copy folder must be on this PC (a OneDrive or USB folder): the scheduled tasks
+    run under S4U, which reaches no network share (D-080, D-084)."""
+    if path is not None and str(path).replace("/", "\\").startswith("\\\\"):
+        raise ValueError(
+            "must be a local folder, such as a OneDrive or USB one: the scheduled tasks can't "
+            "reach a network share"
+        )
+    return path
+
+
 class StorageConfig(_Model):
     db_path: Path
     logs_dir: Path
@@ -250,6 +262,8 @@ class StorageConfig(_Model):
     llm_artifacts_dir: Path
     retention_days: StrictInt = Field(gt=0)
     db_backups_keep: StrictInt = Field(gt=0)
+    # each day's checked backup is copied here too, off this disk; optional (D-084)
+    backup_copy_dir: Annotated[Path | None, AfterValidator(_local_folder)] = None
 
 
 class LiveConfig(_Model):

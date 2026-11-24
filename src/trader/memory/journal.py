@@ -12,10 +12,13 @@ can't depend on the operating system's scheduling.
 
 import asyncio
 import hashlib
+import os
 import re
 import sqlite3
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -28,6 +31,7 @@ from trader.core.clock import fmt_iso, parse_et_iso
 
 MIGRATIONS_PACKAGE = "trader.memory.migrations"
 _MIGRATION_NAME = re.compile(r"(\d{4})_[a-z0-9_]+\.sql")
+SIDE_FILES = ("-wal", "-shm", "-journal")  # what SQLite may keep beside a database file
 
 SqlParams = Sequence[Any] | Mapping[str, Any]
 
@@ -38,6 +42,11 @@ class MigrationError(RuntimeError):
 
 class JournalClosedError(RuntimeError):
     """A write was submitted after ``Journal.aclose()``."""
+
+
+class BackupError(RuntimeError):
+    """A backup copy failed its check (or couldn't be copied as made). The copy it would have
+    replaced stays."""
 
 
 # ---------------------------------------------------------------- migrations
@@ -131,6 +140,67 @@ def open_database(path: Path) -> sqlite3.Connection:
         conn.close()
         raise
     return conn
+
+
+# ---------------------------------------------------------------- backups (D-084)
+
+
+def side_files(path: Path) -> list[Path]:
+    return [path.with_name(path.name + suffix) for suffix in SIDE_FILES]
+
+
+def write_backup(source: sqlite3.Connection, dest: Path) -> None:
+    """A checked, self-contained copy of ``source``'s database at ``dest`` (P6.3; D-084).
+
+    - SQLite's online backup goes into a uniquely named ``.partial`` beside ``dest``: a
+      consistent snapshot while writes go on.
+    - The copy leaves WAL mode: a plain backup keeps the journal's WAL flag, so whoever opens it
+      later gets ``-wal`` and ``-shm`` files beside it.
+    - ``check_copy`` must find nothing wrong with it.
+    - Only then does it take ``dest``'s name, once any ``-wal``, ``-shm`` or ``-journal`` file
+      beside ``dest`` is gone: SQLite applies a ``-wal`` it finds beside a database, even one
+      another file of the same name left there.
+
+    Anything that fails leaves ``dest`` as it was, with no ``.partial`` behind.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = dest.with_name(f"{dest.name}.{uuid.uuid4().hex[:12]}.partial")
+    try:
+        target = sqlite3.connect(partial)
+        try:
+            source.backup(target)
+            target.execute("PRAGMA journal_mode = DELETE")
+        finally:
+            target.close()
+        problems = check_copy(partial)
+        if problems:
+            raise BackupError("the copy failed its check: " + "; ".join(problems[:3]))
+        for side in side_files(dest):
+            side.unlink(missing_ok=True)
+        os.replace(partial, dest)
+    except BaseException:
+        for left in (partial, *side_files(partial)):
+            with suppress(OSError):
+                left.unlink(missing_ok=True)
+        raise
+
+
+def check_copy(path: Path) -> list[str]:
+    """What is wrong with a backup copy; empty when it is sound. It must be self-contained (in
+    rollback-journal mode, with nothing beside it once read) and pass ``quick_check``."""
+    conn = sqlite3.connect(path)
+    try:
+        mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        found = [str(row[0]) for row in conn.execute("PRAGMA quick_check").fetchall()]
+    except sqlite3.DatabaseError as exc:  # too broken to check at all
+        return [f"unreadable ({exc})"]
+    finally:
+        conn.close()
+    problems = [] if mode == "delete" else [f"journal_mode {mode}"]
+    if found != ["ok"]:
+        problems += found
+    problems += [f"{side.name} left beside it" for side in side_files(path) if side.exists()]
+    return problems
 
 
 # ---------------------------------------------------------------- value conversion
@@ -256,19 +326,10 @@ class Journal:
         return await self._on_reader(snapshot)
 
     async def backup(self, dest: Path) -> None:
-        """Copy the whole database to ``dest`` (SQLite's online backup, from the reader: a
-        consistent snapshot while writes go on)."""
+        """Copy the whole database to ``dest``, checked and self-contained (``write_backup``),
+        from the reader: a consistent snapshot while writes go on."""
         conn = self._live(self._read_conn)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-
-        def copy() -> None:
-            target = sqlite3.connect(dest)
-            try:
-                conn.backup(target)
-            finally:
-                target.close()
-
-        await self._on_reader(copy)
+        await self._on_reader(lambda: write_backup(conn, dest))
 
     async def _on_reader[T](self, fn: Callable[[], T]) -> T:
         if self.inline:

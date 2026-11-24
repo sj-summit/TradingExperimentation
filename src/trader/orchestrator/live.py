@@ -79,7 +79,10 @@ from trader.memory.incidents import record_incident
 from trader.memory.journal import Journal
 from trader.memory.reviews import DailyReviewWork
 from trader.memory.unattended import note_human
-from trader.notify import notifier_from_config
+from trader.notify import Notifier, notifier_from_config, pump_alerts
+from trader.ops import retention
+from trader.ops.backup import backups_dir
+from trader.ops.disk import MIN_FREE_BYTES, free_bytes, size_text
 from trader.ops.power import keep_awake
 from trader.ops.schedule_cmds import installed
 from trader.orchestrator.day import DayDeps, DayOrchestrator, DayPaths
@@ -155,7 +158,7 @@ def folders(cfg: AppConfig, day: date, *, sim: bool) -> Folders:
             logs=cfg.path(storage.logs_dir),
             recordings=cfg.path(storage.recordings_dir),
             reports=cfg.path(storage.reports_dir),
-            backups=db.parent / "backups",
+            backups=backups_dir(db),
             heartbeat=heartbeat_path(db),
             lock=db.parent / LOCK_NAME,
             llm_sandbox=cfg.path(cfg.settings.llm.sandbox_dir),
@@ -203,6 +206,7 @@ async def run_day(root: Path, opts: RunOptions, echo: Echo, *, clock: Clock | No
             return
         if not (opts.sim or opts.dry_run):
             await _note_start(journal, clock, today, scheduled=opts.scheduled, books=books)
+            await _check_disk(journal, clock, where, echo)
         if opts.sim:
             await _copy_universe(cfg.path(cfg.settings.storage.db_path), where.db, today, journal)
         recorder = None if opts.dry_run else Recorder(where.recordings, today)
@@ -263,6 +267,7 @@ async def run_day(root: Path, opts: RunOptions, echo: Echo, *, clock: Clock | No
                 heartbeat=where.heartbeat,
                 reports_dir=where.reports,
                 backups_dir=where.backups,
+                backup_copy=None if opts.sim else _backup_copy(cfg),
             ),
             recorder=recorder,
             ensure_universe=_universe_builder(cfg, rest, journal, calendar, recorder),
@@ -285,9 +290,80 @@ async def run_day(root: Path, opts: RunOptions, echo: Echo, *, clock: Clock | No
         )
         with keep_awake():  # the PC mustn't sleep while a session runs (RISK.md section 9)
             outcome = await orchestrator.run()
-        echo(
-            f"run-day {outcome.day}: {outcome.state}{' - ' + outcome.note if outcome.note else ''}"
-        )
+            note = f" - {outcome.note}" if outcome.note else ""
+            echo(f"run-day {outcome.day}: {outcome.state}{note}")
+            if not opts.sim and outcome.state == "DONE":
+                await _retention(cfg, journal, clock, echo)
+            # the backup after DONE may have raised a P2 that the engine's pump never saw: a
+            # Friday's would wait for Monday's engine (D-084)
+            await _last_pump(journal, deps.notifier, clock)
+
+
+def _backup_copy(cfg: AppConfig) -> Path | None:
+    folder = cfg.settings.storage.backup_copy_dir
+    return None if folder is None else cfg.path(folder)
+
+
+async def _check_disk(journal: Journal, clock: Clock, where: Folders, echo: Echo) -> None:
+    """A P2 disk_low before the engine starts, under doctor's threshold: a full disk stops the
+    journal, the recordings and the backup (D-084). Once a day."""
+    free = free_bytes(where.db.parent)
+    if free >= MIN_FREE_BYTES:
+        return
+    now = clock.now()
+    raised = await journal.fetch_one(
+        "SELECT 1 FROM incidents WHERE code = 'disk_low' AND ts LIKE ?",
+        (f"{now.date().isoformat()}T%",),
+    )
+    if raised is not None:
+        return
+    message = (
+        f"only {size_text(free)} free on the disk holding the journal (doctor wants "
+        f"{size_text(MIN_FREE_BYTES)}): free some space; `trader retention` shows what it would "
+        "delete"
+    )
+    echo(message)
+    await record_incident(journal, at=now, severity="P2", component="orchestrator",
+                          code="disk_low", message=message)  # fmt: skip
+
+
+async def _retention(cfg: AppConfig, journal: Journal, clock: Clock, echo: Echo) -> None:
+    """Retention after a DONE paper day (D-084): what fails to go is a P3, never a failed run."""
+    try:
+        plan = await retention.plan_retention(cfg, journal, clock.now().date())
+        done = await asyncio.to_thread(retention.apply, plan)
+    except Exception:
+        log.exception("retention failed")
+        echo("retention failed: see the log")
+        return
+    if done.removed:
+        echo(f"retention: deleted {len(done.removed)} ({size_text(done.freed)})")
+    if not done.failed:
+        if not done.removed:
+            echo("retention: nothing to delete")
+        return
+    failed = retention.failures(done, cfg.root)
+    for line in failed:
+        log.warning("retention could not delete", entry=line)
+    echo(f"retention: {len(failed)} could not be deleted (see the log)")
+    await record_incident(
+        journal,
+        at=clock.now(),
+        severity="P3",
+        component="orchestrator",
+        code="retention_failed",
+        message=f"retention could not delete {len(failed)}: " + "; ".join(failed[:3]),
+    )
+
+
+async def _last_pump(journal: Journal, notifier: Notifier, clock: Clock) -> None:
+    try:
+        sent, failed = await pump_alerts(journal, notifier, clock)
+    except Exception:
+        log.exception("the last alert pump failed")
+        return
+    if sent or failed:
+        log.info("alerts pumped after the day", sent=sent, failed=failed)
 
 
 def _watchdog_status(root: Path, where: Folders) -> Callable[[], datetime | None] | None:

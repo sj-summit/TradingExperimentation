@@ -47,10 +47,11 @@ from trader.execution.reconcile import Reconciler
 from trader.execution.records import Records, read_book_day
 from trader.execution.service import ExecutionService, FlattenResult, TradingDay
 from trader.memory.incidents import Severity, record_incident
-from trader.memory.journal import Journal
+from trader.memory.journal import BackupError, Journal
 from trader.memory.regime import RegimeTags, ensure_regime, load_regime, signal_features
 from trader.memory.shadow import ShadowParams, compute_shadow
 from trader.notify import Notifier, pump_alerts
+from trader.ops.backup import reason, take_backup
 from trader.orchestrator.capabilities import CURRENT, FEES, SHADOW_TAPE, SKEW_HOURLY
 from trader.orchestrator.eod import (
     BookClose,
@@ -126,6 +127,9 @@ class DayPaths:
     heartbeat: Path
     reports_dir: Path
     backups_dir: Path
+    # storage.backup_copy_dir, from a live paper day only: a replay's copy would take the name of
+    # the real day's (D-084)
+    backup_copy: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -1213,15 +1217,39 @@ class DayOrchestrator:
         await mark_step(self._journal, self.day, "report", self._clock.now(), str(md.name))
 
     async def _backup(self) -> None:
-        """SQLite's online backup, keeping ``db_backups_keep`` copies (A§3 16:30)."""
-        backups = self._d.paths.backups_dir
+        """A checked backup of the journal, ``db_backups_keep`` kept, and its copy in the folder
+        run-day names (A§3 16:30; D-084). A failure is a P2 ``backup_failed``: the day's work
+        stands either way, and run-day pushes it before it exits."""
+        d = self._d
         try:
-            await self._journal.backup(backups / f"trader-{self.day.isoformat()}.db")
-            keep = self._d.settings.storage.db_backups_keep
-            for old in sorted(backups.glob("trader-*.db"))[:-keep]:
-                old.unlink()
-        except (OSError, sqlite3.Error) as exc:  # best effort, before or after DONE
+            taken = await take_backup(
+                self._journal,
+                folder=d.paths.backups_dir,
+                day=self.day,
+                keep=d.settings.storage.db_backups_keep,
+                copy_dir=d.paths.backup_copy,
+            )
+        except (OSError, sqlite3.Error, BackupError) as exc:  # before or after DONE
             log.warning("database backup failed", error=f"{type(exc).__name__}: {exc}")
+            await self._backup_failed(
+                f"the database backup failed ({reason(exc)}): the previous backups are kept"
+            )
+            return
+        for problem in (*taken.pruned.problems, *taken.copy_pruned.problems):
+            log.warning("an old backup was not pruned", problem=problem)
+        if taken.copy_error is not None:
+            log.warning("the backup was not copied", folder=str(d.paths.backup_copy),
+                        error=taken.copy_error)  # fmt: skip
+            await self._backup_failed(
+                f"the backup was taken, but not copied to storage.backup_copy_dir: "
+                f"{taken.copy_error}"
+            )
+
+    async def _backup_failed(self, message: str) -> None:
+        try:
+            await self._incident("P2", "backup_failed", message)
+        except Exception:  # after DONE nothing may raise out of the day
+            log.exception("backup_failed was not journaled", message=message)
 
     # ---------------------------------------------------------------- helpers
 

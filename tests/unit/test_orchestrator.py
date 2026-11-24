@@ -3,6 +3,7 @@
 import json
 import sqlite3
 from collections.abc import AsyncIterator, Iterable, Sequence
+from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -360,11 +361,11 @@ async def test_boot_books_the_overnight_charge_before_e(tmp_path: Path) -> None:
     await run.close()
 
 
-async def test_a_failed_backup_after_done_is_only_logged(
+async def test_a_failed_backup_after_done_is_a_p2(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The backup runs after DONE (D-055); SQLite refusing it must not turn the day into a
-    traceback (review)."""
+    traceback (review). It is a P2, which run-day pushes before it exits (D-084)."""
     run = await DayRun(tmp_path, standard_day()).open()
 
     async def refused(target: Path) -> None:
@@ -374,7 +375,45 @@ async def test_a_failed_backup_after_done_is_only_logged(
     outcome = await run.run()
     assert outcome is not None
     assert outcome.state == "DONE"
+    assert await run.incidents() == [("P2", "backup_failed")]
+    (row,) = await run.rows("SELECT message FROM incidents")
+    assert "readonly database (test)" in row["message"]
+    assert "the previous backups are kept" in row["message"]
+    await run.close()
+
+
+async def test_the_day_s_backup_is_copied_to_the_folder_run_day_names(tmp_path: Path) -> None:
+    """Run-day names storage.backup_copy_dir's folder (DayPaths.backup_copy): a OneDrive or USB
+    folder, off this disk. A replay never names one (D-084)."""
+    run = await DayRun(tmp_path, standard_day()).open()
+    copies = tmp_path / "onedrive"
+    copies.mkdir()
+    deps = run.deps()
+    outcome = await run.run(run.deps(paths=replace(deps.paths, backup_copy=copies)))
+    assert outcome is not None
+    assert outcome.state == "DONE"
+    backup = tmp_path / "backups" / "trader-2026-10-13.db"
+    assert (copies / "trader-2026-10-13.db").read_bytes() == backup.read_bytes()
     assert await run.incidents() == []
+    await run.close()
+
+
+async def test_a_copy_folder_that_is_missing_is_a_p2_and_the_backup_stands(
+    tmp_path: Path,
+) -> None:
+    run = await DayRun(tmp_path, standard_day()).open()
+    deps = run.deps()
+    unplugged = tmp_path / "usb" / "trader"
+    outcome = await run.run(run.deps(paths=replace(deps.paths, backup_copy=unplugged)))
+    assert outcome is not None
+    assert outcome.state == "DONE"
+    assert await run.incidents() == [("P2", "backup_failed")]
+    (row,) = await run.rows("SELECT message FROM incidents")
+    assert "storage.backup_copy_dir" in row["message"]
+    assert "is its drive connected?" in row["message"]
+    assert str(tmp_path) not in row["message"]  # pushed: no local paths
+    assert (tmp_path / "backups" / "trader-2026-10-13.db").is_file()
+    assert not unplugged.exists()
     await run.close()
 
 

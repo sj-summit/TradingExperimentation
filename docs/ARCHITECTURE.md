@@ -68,10 +68,10 @@ ai-day-trader/
 │   ├── memory/     journal.py migrations/0001_init.sql stats.py epochs.py shadow.py lessons.py regime.py playbook.py reviews.py verdict_view.py unattended.py
 │   ├── orchestrator/ day.py plan.py tasks.py eod.py inputs.py llm_jobs.py evidence.py packs.py ports.py live.py replay.py heartbeat.py watchdog.py
 │   ├── reports/    daily.py weekly.py evaluation.py render.py   (no templates: html.escape, D-046)
-│   ├── ops/        scheduler.py schedule_cmds.py scheduled.py power.py   (Windows Task Scheduler, the scheduled-job wrapper, keeping the PC awake; Phase 6, D-080, D-081)
+│   ├── ops/        scheduler.py schedule_cmds.py scheduled.py power.py containment.py backup.py retention.py disk.py   (Windows Task Scheduler, the scheduled-job wrapper, keeping the PC awake, claude children in a job object, backups, retention, disk space; Phase 6, D-080 to D-084)
 │   └── notify.py
 ├── tests/       unit/ integration/ fixtures/ (calendars, bars, news, llm envelopes, recorded day)
-└── runtime/     (gitignored) trader.db logs/ (scheduled/) recordings/ llm/ claude-config/ llm_sandbox/ llm_canary/ playbook.md heartbeat.json KILL schedule/ schedule.json
+└── runtime/     (gitignored) trader.db backups/ logs/ (scheduled/) recordings/ llm/ claude-config/ llm_sandbox/ llm_canary/ sim/ replay/ playbook.md heartbeat.json KILL schedule/ schedule.json
 ```
 
 ---
@@ -102,7 +102,7 @@ Times are config defaults. On **early-close days**:
 | 16:05 | EOD per book: reconcile; final decisions; trades; fees (`fees_v1`, D-055); daily stats; breakers (cash check, with its residual stored and a P3 `cash_drift` past half the tolerance; drawdown; losing streak) | A, B | each step marked in `day_runs`, so a restart skips it (D-048) |
 | 16:12 | Shadow outcomes (SIP 1-min bars; the 15:55 bar is > 15 min old from about 16:11; retry for up to 5 min); each ambiguous trigger minute read from the SIP trade tape, one request each (capability `shadow_tape`, D-057); a minute the tape can't settle is counted as stopped, with a P3 `shadow_tape_unresolved`. On a review day SPY's bars come in the same request, for each outcome's `spy_move_pct` (capability `review_v1`, D-071) | — | STRATEGY.md §7.2 |
 | 16:15 | Claude post-close review → signal reviews, process issues, notes, lesson proposals (each to its own table) | B | after the shadow job; the cutoff is the report − 1 min (16:29), and no attempt starts after the cutoff − 120 s; once a day (a `review` step in `day_runs`); else `daily_reviews.status = missing` (or `invalid`) with why, and the report says so. The content is `memory/reviews.py`'s (D-071); a day recorded before it replays without a review (capability `review_v1`) |
-| 16:30 | Reports (MD and HTML), notifications, recordings finalized; DONE, then the DB backup (D-055) | — | then exit |
+| 16:30 | Reports (MD and HTML), notifications, recordings finalized; DONE, then the DB backup, checked and self-contained, and its copy in `storage.backup_copy_dir` if set (D-055, D-084); a failed one is a P2 `backup_failed`. Then, in a paper run, retention (P3 `retention_failed` for what won't go), and one more alert pump, so an alert raised after DONE goes out before the weekend | — | then exit |
 
 ### Late start and partial days
 
@@ -319,6 +319,7 @@ class LLMResult(Generic[T]):
 ### 4.8 memory
 
 - **`journal.py`:** a single-writer SQLite repository (WAL mode). Writes go through one asyncio task and queue. Migrations live in `migrations/*.sql`.
+  - **`Journal.backup`** (D-084): SQLite's online backup into a `.partial` beside the target, switched out of WAL mode, then opened again: it must read `journal_mode` delete, pass `quick_check` and leave no file beside it. Only then does it replace the target, once any `-wal`, `-shm` or `-journal` file left beside the target is deleted, since SQLite would apply that `-wal` to the new file. A failure leaves the old copy.
 - **`shadow.py`:** STRATEGY.md §7.2.
 - **`regime.py`:** computes EOD tags:
   - `regime_spy_trend` = `up`/`down`, from SPY close vs its 20-day SMA;
@@ -418,7 +419,7 @@ class LLMResult(Generic[T]):
 
 | Command | Purpose | Gate |
 |---|---|---|
-| `doctor [--quick]` | Environment, config, auth (Alpaca A/B, warning when an account may short; `claude auth status`), clock, CLI version, disk, the PC's sleep settings and wake timers (`machine.sleep`), notifications (`notify`), token age | — |
+| `doctor [--quick]` | Environment, config, auth (Alpaca A/B, warning when an account may short; `claude auth status`), clock, CLI version, disk, the backup copy folder (`backup.copy`: local, there, writable; SKIP when unset), the PC's sleep settings and wake timers (`machine.sleep`), notifications (`notify`), token age | — |
 | `universe build [--date]` / `universe or-baseline` | Daily features, OR baselines | — |
 | `stream --symbols … --minutes N` | Dev: print live bars | — |
 | `run-day [--books A\|B\|A,B] [--sim] [--dry-run] [--no-llm]` | The full day; `--no-llm` keeps Book B off for the day | HUMAN GATE until Phase 6 |
@@ -435,6 +436,8 @@ class LLMResult(Generic[T]):
 | `smoke llm [--role …] [--schema-mode …] [--tools-flag …] [--no-canary] [--canary-control] [--kill-test]` | A call per role on packs of fictional issuers, the isolation canary, the stop path (D-066) | HUMAN GATE (uses subscription) |
 | `schedule show\|install\|uninstall\|check\|probe [--logon s4u\|interactive] [--with-universe]` | Windows Task Scheduler entries (D-080). `show` changes nothing. `install` refuses without notifications or in a zone that doesn't keep ET's DST, then asks for `INSTALL`. `check` runs `probe` (doctor, then a test push) as a one-off task under the installed account, then deletes it | `install`, `check`: HUMAN GATE G6a |
 | `weekly-job` | The Saturday job: `lessons evaluate --promote`, then `report weekly` (each runs even if the other fails) | — |
+| `backup [--to DIR]` | A checked backup of the journal now, as today's in `runtime/backups` (`db_backups_keep` kept) and copied to `storage.backup_copy_dir` if set; exits 1 if the copy failed. `--to` writes it into an existing folder instead and prunes nothing there (D-084) | — |
+| `retention [--apply]` | Lists what retention deletes under `runtime/` (logs, simulated and replayed days, and recordings and LLM artifacts from before the current epoch); only `--apply` deletes. Run-day applies it after each finished paper day (D-084) | — |
 
 ---
 
@@ -867,6 +870,7 @@ Per-role contents:
 ## 9. Configuration and secrets
 
 - **`config/settings.yaml`:** operational settings — modes, books, data feed, strategy parameters, schedule, LLM roles, news/EDGAR, notifications, fees, storage.
+  - **`storage.backup_copy_dir`** (optional, default none; D-084): a folder on this PC but off its disk, such as a OneDrive or USB one, that gets a copy of each backup. A network share is refused at load: the scheduled tasks run under S4U, which reaches none. The folder must exist; a missing one is a drive not connected, and is never made.
 - **`config/risk.yaml`:** risk defaults (RISK.md §2).
 - Both are validated by pydantic models in `config.py`. Unknown keys are an error, and `caps.py` is enforced at load.
 - **`.env` (from `config/env.example`) holds secrets only:**
@@ -899,6 +903,7 @@ Per-role contents:
 - **Scheduled jobs:** each one's output, its children's included, goes to `runtime/logs/scheduled/<job>-<date>.log`, between a start line and an `exit N` line (D-080).
 - **Incidents:** the `incidents` table, with alerts per RISK.md §11.
 - **Reports:** `runtime/reports/YYYY-MM-DD.{md,html}` and `weekly-YYYY-WW.{md,html}`.
+- **Backups and retention** (D-084): `runtime/backups/trader-YYYY-MM-DD.db`, `db_backups_keep` of them, each checked and self-contained. Logs, and simulated and replayed days, are kept `retention_days`; recordings and LLM artifacts also through the current epoch, so epoch 0 keeps them all. Reports stay.
 
 ---
 

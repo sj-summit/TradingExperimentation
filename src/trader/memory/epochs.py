@@ -16,7 +16,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
-from trader.core.clock import fmt_iso
+from trader.core.clock import fmt_iso, parse_et_iso
 
 DECISION = re.compile(r"D-\d{3,}")
 HASHED = ("settings", "risk", "events")
@@ -42,6 +42,15 @@ class EpochRow:
 def current_epoch(conn: sqlite3.Connection) -> int:
     row = conn.execute("SELECT value FROM meta WHERE key = 'eval_epoch'").fetchone()
     return int(row[0]) if row is not None else 0
+
+
+def current_epoch_start(conn: sqlite3.Connection) -> datetime | None:
+    """When the current epoch began: None for epoch 0, the build, which has no start (and for an
+    epoch with no row, which can't happen: retention then keeps everything, D-084)."""
+    row = conn.execute(
+        "SELECT started_at FROM epochs WHERE epoch = ?", (current_epoch(conn),)
+    ).fetchone()
+    return None if row is None or row[0] is None else parse_et_iso(str(row[0]))
 
 
 def epochs(conn: sqlite3.Connection) -> list[EpochRow]:

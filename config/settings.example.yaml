@@ -154,6 +154,7 @@ storage:
   llm_artifacts_dir: runtime/llm
   retention_days: 60
   db_backups_keep: 30
+  backup_copy_dir: null          # optional: a local folder off this disk (OneDrive, USB) for a copy of each backup; it must exist
 
 live:                            # used only in Phase 7, human-configured
   size_multiplier: 0.5

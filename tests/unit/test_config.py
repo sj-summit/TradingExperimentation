@@ -43,6 +43,19 @@ def test_decimals_are_exact(repo: Path) -> None:
     assert cfg.settings.fees.sec_fee_per_million_sold == Decimal("20.60")
 
 
+def test_the_backup_copy_folder_is_optional(repo: Path) -> None:
+    assert load_config(repo).settings.storage.backup_copy_dir is None
+    set_yaml(repo / SETTINGS, "storage.backup_copy_dir", "D:/trader-backups")
+    assert load_config(repo).settings.storage.backup_copy_dir == Path("D:/trader-backups")
+
+
+@pytest.mark.parametrize("share", [r"\\nas\backups", "//nas/backups"])
+def test_a_backup_copy_folder_on_a_network_share_is_refused(repo: Path, share: str) -> None:
+    """The scheduled tasks run under S4U, which reaches no network share (D-080)."""
+    set_yaml(repo / SETTINGS, "storage.backup_copy_dir", share)
+    assert has(problems_of(repo), "settings.storage.backup_copy_dir:", "local folder")
+
+
 def test_missing_settings_file_points_to_example(repo: Path) -> None:
     (repo / SETTINGS).unlink()
     assert has(problems_of(repo), "settings.example.yaml")

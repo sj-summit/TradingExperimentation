@@ -223,6 +223,7 @@ def test_everything_green(green: Path) -> None:
         "runtime.dirs": "PASS",
         "journal": "PASS",
         "disk": "PASS",
+        "backup.copy": "SKIP",  # optional (D-084)
         "machine.sleep": "PASS",
         "notify": "PASS",
         "claude.version": "PASS",
@@ -495,6 +496,42 @@ def test_sandbox_must_be_empty(green: Path) -> None:
 
 def test_low_disk_warns(green: Path) -> None:
     assert check(run_doctor(green, make_deps(free_bytes=10**9)), "disk").status == "WARN"
+
+
+def test_the_backup_copy_folder_is_skipped_until_set(green: Path) -> None:
+    result = check(run_doctor(green, make_deps()), "backup.copy")
+    assert result.status == "SKIP"
+    assert "storage.backup_copy_dir" in result.detail
+
+
+def test_the_backup_copy_folder_must_be_there_and_take_a_file(green: Path) -> None:
+    """Under the scheduler this runs as the task's account (`schedule check`'s probe), which
+    proves the folder is reachable where the backups are made (G6a)."""
+    copies = green / "onedrive" / "trader"
+    set_yaml(green / "config" / "settings.yaml", "storage.backup_copy_dir", str(copies))
+    missing = check(run_doctor(green, make_deps()), "backup.copy")
+    assert missing.status == "FAIL"
+    assert "doesn't exist" in missing.detail
+    assert not copies.exists()  # never made: a missing folder is a drive not connected
+    copies.mkdir(parents=True)
+    (copies / "trader-2026-10-12.db").write_bytes(b"x")
+    found = check(run_doctor(green, make_deps()), "backup.copy")
+    assert found.status == "PASS"
+    assert "writable" in found.detail
+    assert "1 backup there" in found.detail
+    assert [p.name for p in copies.iterdir()] == ["trader-2026-10-12.db"]  # the probe went
+
+
+def test_a_backup_copy_folder_on_a_network_drive_fails(
+    green: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copies = green / "mapped"
+    copies.mkdir()
+    set_yaml(green / "config" / "settings.yaml", "storage.backup_copy_dir", str(copies))
+    monkeypatch.setattr("trader.ops.disk.is_network_drive", lambda _path: True)
+    result = check(run_doctor(green, make_deps()), "backup.copy")
+    assert result.status == "FAIL"
+    assert "network drive" in result.detail
 
 
 def test_empty_events_file_warns(repo: Path) -> None:

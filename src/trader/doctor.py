@@ -51,6 +51,8 @@ from trader.llm.claude_cli import (
     resolve_claude,
 )
 from trader.memory.journal import open_database
+from trader.ops import disk
+from trader.ops.backup import BACKUP
 from trader.ops.power import SleepSettings, sleep_settings
 
 Status = Literal["PASS", "WARN", "FAIL", "SKIP"]
@@ -61,7 +63,7 @@ MAX_CLOCK_SKEW_S = 2.0  # RISK.md §9
 TOKEN_LIFETIME_DAYS = 365  # `claude setup-token` issues a one-year token
 TOKEN_WARN_DAYS = 30  # RISK.md §9
 EVENTS_HORIZON_DAYS = 14  # ARCHITECTURE.md §9
-MIN_FREE_DISK_BYTES = 2 * 1024**3
+MIN_FREE_DISK_BYTES = disk.MIN_FREE_BYTES  # run-day's disk_low shares it (D-084)
 SUBPROCESS_TIMEOUT_S = 30.0
 ALPACA_TIMEOUT_S = 10.0
 SIP_LOOKBACK_DAYS = 14
@@ -184,6 +186,7 @@ def run_doctor(root: Path, deps: DoctorDeps, *, quick: bool = False) -> list[Che
     add("runtime.dirs", lambda: _runtime_dirs(cfg))
     add("journal", lambda: _journal(cfg))
     add("disk", lambda: _disk(root, deps))
+    add("backup.copy", lambda: _backup_copy(cfg))
     add("machine.sleep", lambda: _sleep(deps))
     add("notify", lambda: _notify(cfg))
     if not cfg.settings.llm.enabled:
@@ -464,6 +467,30 @@ def _disk(root: Path, deps: DoctorDeps) -> Result:
     free = deps.free_bytes(root)
     detail = f"{free / 1024**3:.1f} GB free"
     return ("PASS", detail) if free >= MIN_FREE_DISK_BYTES else ("WARN", f"only {detail}")
+
+
+def _backup_copy(cfg: AppConfig) -> Result:
+    """``storage.backup_copy_dir``: a local folder that exists and takes a file. Under the
+    scheduler (``schedule check``'s probe) this proves the task's account reaches it (D-084)."""
+    folder = cfg.settings.storage.backup_copy_dir
+    if folder is None:
+        return "SKIP", "storage.backup_copy_dir is not set: the backups stay on this disk only"
+    path = cfg.path(folder)
+    if disk.is_network_drive(path):
+        return "FAIL", (
+            f"{path} is on a network drive, which the scheduled tasks (S4U) can't reach: use a "
+            "local folder, such as a OneDrive or USB one"
+        )
+    if not path.is_dir():
+        return "FAIL", f"{path} doesn't exist: create it, or connect its drive"
+    probe = path / ".doctor-write-probe"
+    try:
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        return "FAIL", f"{path} is not writable ({exc.strerror or type(exc).__name__})"
+    held = sum(1 for p in path.iterdir() if BACKUP.fullmatch(p.name))
+    return "PASS", f"{path}: writable; {held} backup{'' if held == 1 else 's'} there"
 
 
 WAKE_TIMERS = {0: "off", 1: "on", 2: "important ones only"}
